@@ -165,6 +165,47 @@ TEST(ResolverScoring, CycleWrapsAroundOne) {
     EXPECT_EQ(scored.best, 0);
 }
 
+TEST(ResolverSides, PicksTheHalfWhoseBestNodeIsCloser) {
+    // пять узлов: -40, -20, 0, +20, +40; плюсовая половина описывает слои заметно лучше
+    const std::array<float, 5> yaw{ -40.0f, -20.0f, 0.0f, 20.0f, 40.0f };
+    const std::array<float, 5> error{ 1.0f, 0.9f, 0.5f, 0.2f, 0.4f };
+
+    const auto sides = hvh::resolver::scoreSides(error.data(), yaw.data(), 5, 0.0f, 5.0f, 2);
+    EXPECT_FLOAT_EQ(sides.side, 1.0f);
+    EXPECT_EQ(sides.plus, 3);
+    EXPECT_EQ(sides.minus, 1);
+    EXPECT_FLOAT_EQ(sides.margin, (0.9f - 0.2f) / 2.0f);
+}
+
+TEST(ResolverSides, DeadzoneNodesBelongToNeitherHalf) {
+    const std::array<float, 3> yaw{ -2.0f, 0.0f, 2.0f };
+    const std::array<float, 3> error{ 0.1f, 0.2f, 0.3f };
+
+    const auto sides = hvh::resolver::scoreSides(error.data(), yaw.data(), 3, 0.0f, 5.0f, 1);
+    EXPECT_FLOAT_EQ(sides.side, 0.0f);   // сравнивать не с чем — сторону не выдумываем
+    EXPECT_EQ(sides.plus, -1);
+    EXPECT_EQ(sides.minus, -1);
+}
+
+TEST(ResolverSides, NoSignalsMeansNoSide) {
+    const std::array<float, 2> yaw{ -30.0f, 30.0f };
+    const std::array<float, 2> error{ 0.0f, 1.0f };
+
+    const auto sides = hvh::resolver::scoreSides(error.data(), yaw.data(), 2, 0.0f, 5.0f, 0);
+    EXPECT_FLOAT_EQ(sides.side, 0.0f);
+}
+
+TEST(ResolverSides, SideIsMeasuredAroundTheEyeYawNotZero) {
+    // взгляд на 170°, узлы по обе стороны от него — переход через 180° не должен ломать знак
+    const std::array<float, 2> yaw{ -170.0f, 140.0f };   // +20° и -30° от взгляда
+    const std::array<float, 2> error{ 0.3f, 0.1f };
+
+    const auto sides = hvh::resolver::scoreSides(error.data(), yaw.data(), 2, 170.0f, 5.0f, 1);
+    EXPECT_EQ(sides.plus, 0);
+    EXPECT_EQ(sides.minus, 1);
+    EXPECT_FLOAT_EQ(sides.side, -1.0f);
+}
+
 TEST(ResolverScoring, SecondBestIgnoresCandidatesWithTheSameAngle) {
     const std::array<LayerValues, layerCount> left{ { { 0.10f, 0.20f, 1.0f, 7 }, { 0.0f, 0.0f, 0.0f, 0 }, { 1.0f, 0.5f, 1.0f, 9 } } };
     const std::array<LayerValues, layerCount> right{ { { 0.90f, 0.80f, 1.0f, 7 }, { 0.0f, 0.0f, 0.0f, 0 }, { 1.0f, 0.5f, 1.0f, 9 } } };

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <iterator>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -55,6 +56,10 @@ struct PlayerState {
     bool tracked = false;
     float lastSimulationTime = 0.0f;
     float lastEyeYaw = 0.0f;
+    float lastLby = 0.0f;
+    float lastLbyChange = -1.0f;    // simtime, когда LBY в прошлый раз сдвинулся
+    bool haveLby = false;
+    csgo::Vector lastOrigin{};
     std::uint8_t chokeHistory = 0;
 
     bool valid = false;
@@ -106,9 +111,9 @@ void consoleWarn(const Memory& memory, const char* text) noexcept
 
 // Где резольвер по слоям останавливается — сводка раз в 20 с только в лог-файл (в консоль не пишем).
 // По логам ни разу не было выстрела в режиме «слои», а предупреждений тоже нет — значит, выходит молча.
-enum Exit { ExitNoAnimstate, ExitNoLayers, ExitFewLayers, ExitLayout, ExitInsane, ExitUnavailable, ExitSilent, ExitLowConfidence, ExitCarried, ExitValid, ExitCount };
+enum Exit { ExitNoAnimstate, ExitNoLayers, ExitFewLayers, ExitLayout, ExitInsane, ExitUnavailable, ExitSilent, ExitLowConfidence, ExitCarried, ExitLby, ExitValid, ExitCount };
 constexpr const char* exitNames[]{ "нет animstate", "нет слоёв", "слоёв меньше 13", "раскладка не та", "слои-мусор",
-    "сервер не шлёт слои", "слои молчат", "низкая уверенность", "доведён от прошлого", "угол найден" };
+    "сервер не шлёт слои", "слои молчат", "низкая уверенность", "доведён от прошлого", "ноги по LBY", "угол найден" };
 std::array<int, ExitCount> exits{};
 float lastSummary = 0.0f;
 
@@ -329,14 +334,30 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     const float updateDelta = state.tracked
         ? std::clamp(entity.simulationTime() - state.lastSimulationTime, interval, 0.25f) : interval;
 
+    // Враг не чокает — клиент считает его анимацию в такт с сервером, перебирать нечего:
+    // хватит проверить то, что уже есть (и LBY рядом). Десинка без чока не бывает.
+    const bool desyncing = !state.tracked || state.chokeHistory != 0;
+
+    // Серверный ориентир: m_flLowerBodyYawTarget. Пока враг стоит, сервер раз в 1.1 с (и сразу, если
+    // взгляд ушёл больше чем на 35°) ставит LBY равным его настоящему взгляду, а клиентский animstate
+    // в тот же момент доворачивает ноги ровно на LBY. Значит, на обновлении, где LBY сдвинулся,
+    // угол ног известен точно — это надёжнее любого сравнения слоёв, и такие находки нужно брать
+    // без разбора кандидатов (у стоящего врага слои всё равно молчат — это самый частый выход).
+    // У БЕГУЩЕГО врага сервер гонит LBS за взглядом каждый тик, и «сдвинулся LBY» там не значит
+    // ничего: ноги у него и так едут за движением. Поэтому проверяем не скорость (m_vecVelocity у
+    // чужих оценочная и у стоящего в чоке врёт), а сам признак флика стоящего: LBY перед этим
+    // держался на месте не меньше 0.4 с, и сам игрок с прошлого обновления никуда не уехал.
+    const float lby = entity.lby();
+    const bool lbyMoved = state.haveLby && std::abs(normalizeYaw(lby - state.lastLby)) > 0.5f;
+    const bool lbyWasStable = state.lastLbyChange > 0.0f && entity.simulationTime() - state.lastLbyChange > 0.4f;
+    const bool inPlace = state.tracked && (entity.origin() - state.lastOrigin).squareLength() < 2.0f * 2.0f;
+    const bool lbyAnchor = lbyMoved && lbyWasStable && inPlace && std::isfinite(lby);
+
     // Углы ног ДО обновления: сетка от взгляда на ±максимальный десинк, LBY (сервер ставит его
     // настоящим углом ног, когда враг стоит) и продолжение нашей прошлой догадки.
     std::array<float, MAX_CANDIDATES> candidates{};
     int candidateCount = 0;
-    // Враг не чокает — клиент считает его анимацию в такт с сервером, перебирать нечего:
-    // хватит проверить то, что уже есть (и LBY рядом). Десинка без чока не бывает.
-    const bool desyncing = !state.tracked || state.chokeHistory != 0;
-    const int half = desyncing && maxDesync > 1.0f ? std::clamp(steps / 2, 1, 10) : 0;
+    const int half = desyncing && maxDesync > 1.0f && !lbyAnchor ? std::clamp(steps / 2, 1, 10) : 0;
     for (int i = -half; i <= half && candidateCount < MAX_CANDIDATES; ++i)
         candidates[candidateCount++] = normalizeYaw(eyeYaw + maxDesync * static_cast<float>(i) / static_cast<float>(std::max(half, 1)));
     const auto addCandidate = [&](float yaw) {
@@ -367,14 +388,33 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     const std::byte* base = state.haveShadow ? state.shadow : backupState;
     const Layers& baseLayers = state.haveShadow ? state.shadowLayers : backupLayers;
 
-    for (int c = 0; c < candidateCount; ++c) {
-        resultYaw[c] = simulate(animstate, layers, memory, base, baseLayers, candidates[c], eyeYaw, pitch, updateDelta);
-        std::copy(layers, layers + count, simulated.begin() + static_cast<std::size_t>(c) * count);
+    ScoreResult scored;
+    if (!lbyAnchor) {
+        for (int c = 0; c < candidateCount; ++c) {
+            resultYaw[c] = simulate(animstate, layers, memory, base, baseLayers, candidates[c], eyeYaw, pitch, updateDelta);
+            std::copy(layers, layers + count, simulated.begin() + static_cast<std::size_t>(c) * count);
+        }
+        scored = scoreCandidates(simulated.data(), candidateCount, net.items.data(), count, resultYaw.data(), error.data());
     }
 
-    const auto scored = scoreCandidates(simulated.data(), candidateCount, net.items.data(), count, resultYaw.data(), error.data());
-
-    if (scored.signals == 0) {
+    if (lbyAnchor) {
+        // Ноги на сервере сейчас ровно на LBY: прогоняем анимацию с этим углом — и тень, и ответ.
+        const float anchored = simulate(animstate, layers, memory, base, baseLayers, lby, eyeYaw, pitch, updateDelta);
+        std::memcpy(state.shadow, animstate, STATE_SIZE);
+        captureLayers(entity, state.shadowLayers);
+        state.haveShadow = true;
+        state.footYaw = anchored;
+        state.eyeYaw = eyeYaw;
+        state.delta = normalizeYaw(anchored - eyeYaw);
+        state.error = 0.0f;
+        state.signals = 0;
+        state.candidates = 1;
+        state.confidence = 1.0f;
+        state.valid = true;
+        state.lastFoundTime = entity.simulationTime();
+        state.foundRatio = std::clamp(state.delta / std::max(state.maxDesync, 1.0f), -1.0f, 1.0f);
+        countExit(ExitLby);
+    } else if (scored.signals == 0) {
         // Слои ни на что не отреагировали — нового угла нет. Тень двигаем от прошлого угла ног: прогон
         // анимации тот же, что у сервера, так что если раньше угол был найден, то и сейчас тень с ним
         // совпадает — отдаём её (иначе резольвер терял угол на каждом «молчащем» обновлении,
@@ -405,25 +445,103 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
             countExit(ExitSilent);
         }
     } else {
+        float bestYaw = resultYaw[scored.best];
+        float bestError = error[scored.best];
+
+        // Грубая сетка шагает через maxDesync/half (обычно ~6°), а настоящий угол ног на сервере —
+        // любое значение между узлами. Второй проход добирает половинные шаги вокруг лучшего узла.
+        // Ошибку проб считаем по нормировке ГРУБОЙ сетки: у своего, узкого набора разброс полей мал,
+        // и шум выглядел бы как сигнал — проба «побеждала» бы просто из-за мягкого масштаба.
+        static constexpr float probeOffsets[]{ -0.5f, -0.25f, 0.25f, 0.5f };
+        float probeYaw[std::size(probeOffsets)]{};
+        float probeError[std::size(probeOffsets)]{};
+        int probeCount = 0;
+        if (half > 0 && candidateCount > 2 && scored.confidence >= 0.1f) {
+            Calibration calibration;
+            if (buildCalibration(simulated.data(), candidateCount, net.items.data(), count, calibration) > 0) {
+                const float step = maxDesync / static_cast<float>(std::max(half, 1));
+                for (const float offset : probeOffsets) {
+                    const float wanted = normalizeYaw(resultYaw[scored.best] + offset * step);
+                    // движок сам обрезает угол по десинку — берём то, что реально получилось
+                    const float landed = simulate(animstate, layers, memory, base, baseLayers, wanted, eyeYaw, pitch, updateDelta);
+                    if (std::abs(normalizeYaw(landed - resultYaw[scored.best])) < 0.5f)
+                        continue;   // проба схлопнулась с уже проверенным узлом
+                    bool duplicate = false;
+                    for (int p = 0; p < probeCount; ++p)
+                        duplicate = duplicate || std::abs(normalizeYaw(landed - probeYaw[p])) < 0.5f;
+                    if (duplicate)
+                        continue;
+                    const float probeScore = scoreAgainst(layers, count, net.items.data(), calibration);
+                    probeYaw[probeCount] = landed;
+                    probeError[probeCount] = probeScore;
+                    ++probeCount;
+                    if (probeScore < bestError) {
+                        bestError = probeScore;
+                        bestYaw = landed;
+                    }
+                }
+            }
+        }
+
+        // Сторона важнее точного узла: соседние узлы сетки отличаются на 5-6° и дают почти одинаковую
+        // ошибку, поэтому «отрыв от второго» почти всегда мал, а настоящий вопрос — ноги вправо или влево.
+        const float deadzone = std::max(3.0f, maxDesync * 0.15f);
+        const auto sides = scoreSides(error.data(), resultYaw.data(), candidateCount, eyeYaw, deadzone, scored.signals);
+
+        // Угол почти по взгляду у чокающего врага неправдоподобен: десинка без чока не бывает, а чок
+        // без десинка бессмыслен. Такой «ноль» — обычно победа шума: движок доворачивает к взгляду все
+        // кандидаты сразу, их слои почти совпадают, и выигрывает случайный. Берём лучший узел той
+        // половины, которая в целом описывает сетевые слои лучше — сторона там решается десятком узлов.
+        // По логам 29.10 именно такие находки уводили точку мимо тела: дельта -4.9° при максимуме 46°.
+        if (desyncing && maxDesync > 10.0f && sides.side != 0.0f
+            && std::abs(normalizeYaw(bestYaw - eyeYaw)) < deadzone) {
+            const int rescue = sides.side > 0.0f ? sides.plus : sides.minus;
+            bestYaw = resultYaw[rescue];
+            bestError = error[rescue];
+        }
+
+        // Второй по ошибке угол, заметно отличающийся от найденного: по нему — уверенность.
+        // Уточнённые пробы входят наравне с узлами сетки.
+        float secondError = 1e9f;
+        for (int c = 0; c < candidateCount; ++c) {
+            if (std::abs(std::remainder(resultYaw[c] - bestYaw, 360.0f)) < 2.0f)
+                continue;
+            secondError = std::min(secondError, error[c]);
+        }
+        for (int p = 0; p < probeCount; ++p) {
+            if (std::abs(std::remainder(probeYaw[p] - bestYaw, 360.0f)) < 2.0f)
+                continue;
+            secondError = std::min(secondError, probeError[p]);
+        }
+
+        const float signals = static_cast<float>(std::max(scored.signals, 1));
         state.signals = scored.signals;
-        state.candidates = candidateCount;
-        state.footYaw = resultYaw[scored.best];
+        state.candidates = candidateCount + probeCount;
+        state.footYaw = bestYaw;
         state.eyeYaw = eyeYaw;
-        state.delta = normalizeYaw(state.footYaw - eyeYaw);
-        state.error = scored.error;
-        state.confidence = scored.confidence;
-        // Кандидаты не разошлись — считать угол найденным нельзя, кроме случая, когда он и так
-        // почти равен взгляду (там ошибиться нечем)
-        state.valid = state.confidence > 0.05f || std::abs(state.delta) < 5.0f;
+        state.delta = normalizeYaw(bestYaw - eyeYaw);
+        state.error = bestError / signals;
+        const float margin = secondError < 1e8f ? (secondError - bestError) / signals : 0.0f;
+        const float nodeConfidence = std::clamp(margin / (state.error + margin + 0.02f), 0.0f, 1.0f);
+        // Уверенность меряем тем, что потом спрашивает рейджбот (сторону десинка), а не точностью узла:
+        // sideCertain, sideScale и перебивка голосованием — все три про сторону.
+        const float sideConfidence = std::clamp(sides.margin / (state.error + sides.margin + 0.02f), 0.0f, 1.0f);
+        // Один сигнал — это одно поле одного слоя: на нём легко выиграть случайно, и по логам 29.10
+        // так было почти всегда (13 разборов из 14), причём с «уверенностью» до 97%.
+        const float signalTrust = scored.signals >= 3 ? 1.0f : scored.signals == 2 ? 0.85f : 0.6f;
+        state.confidence = signalTrust * (sides.side != 0.0f ? sideConfidence : nodeConfidence);
+        // Кандидаты не разошлись — считать угол найденным нельзя. Исключение только для врага, который
+        // не чокает: у него ноги и правда смотрят почти туда же, куда взгляд, и ошибиться нечем.
+        state.valid = state.confidence > 0.05f || (!desyncing && std::abs(state.delta) < 5.0f);
         if (state.valid) {
             state.lastFoundTime = entity.simulationTime();
             state.foundRatio = std::clamp(state.delta / std::max(state.maxDesync, 1.0f), -1.0f, 1.0f);
         }
         countExit(state.valid ? ExitValid : ExitLowConfidence);
 
-        // Тень: состояние после лучшего кандидата — с него поедет следующее обновление,
-        // чтобы наша история анимации шла в ногу с серверной
-        simulate(animstate, layers, memory, base, baseLayers, candidates[scored.best], eyeYaw, pitch, updateDelta);
+        // Тень: состояние после найденного угла (с учётом уточнения) — с него поедет следующее
+        // обновление, чтобы наша история анимации шла в ногу с серверной
+        simulate(animstate, layers, memory, base, baseLayers, bestYaw, eyeYaw, pitch, updateDelta);
         std::memcpy(state.shadow, animstate, STATE_SIZE);
         captureLayers(entity, state.shadowLayers);
         state.haveShadow = true;
@@ -451,7 +569,11 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     const_cast<csgo::Vector&>(entity.getAbsAngle()) = backupAbsAngles;
     entity.angRotation() = backupRotation;
 
-    if (state.carried) {
+    if (lbyAnchor) {
+        std::snprintf(state.status, sizeof(state.status),
+            "ноги по LBY (сервер сам показал угол у стоящего): дельта %+.1f° (макс %.0f°), режим %s",
+            state.delta, state.maxDesync, modeNames[std::clamp(state.mode, 0, ModeCount - 1)]);
+    } else if (state.carried) {
         std::snprintf(state.status, sizeof(state.status),
             "слои молчат, угол доведён от прошлого: дельта %+.1f° (макс %.0f°), уверенность %.0f%%, режим %s",
             state.delta, state.maxDesync, state.confidence * 100.0f, modeNames[std::clamp(state.mode, 0, ModeCount - 1)]);
@@ -540,6 +662,12 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
 
         state.lastSimulationTime = simulationTime;
         state.lastEyeYaw = entity.eyeAngles().y;
+        const float currentLby = entity.lby();
+        if (!state.haveLby || std::abs(normalizeYaw(currentLby - state.lastLby)) > 0.5f)
+            state.lastLbyChange = simulationTime;
+        state.lastLby = currentLby;
+        state.haveLby = true;
+        state.lastOrigin = entity.origin();
         state.tracked = true;
         state.haveAfterClient = false;
     }

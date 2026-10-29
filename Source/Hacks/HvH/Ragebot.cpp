@@ -128,6 +128,17 @@ struct ResolverState {
     // по этой статистике выбираем, куда бить, вместо «всегда голова»
     std::uint8_t headHits = 0, headShots = 0;
     std::uint8_t bodyHits = 0, bodyShots = 0;
+    // Голосование стороны десинка: находки слоёв, доказанные импакты, попадания и промахи.
+    // Перевес затухает (~6 с), чтобы старые свидетельства не держали сторону вечно.
+    float sideVote = 0.0f;
+    float sideVoteAt = 0.0f;
+    // Как часто фаза джиттера меняется за обновление: 1 — каждый апдейт, 0.5 — раз в два.
+    // По ней предсказываем, где враг будет к моменту, когда сервер обработает наш выстрел.
+    std::uint8_t phaseChangeBits = 0;
+    std::uint8_t phaseChangeCount = 0;
+    // Совпадает ли фристенд-догадка с настоящей стороной: у части читов она систематически обратная
+    std::uint8_t guessSideBits = 0;
+    std::uint8_t guessSideCount = 0;
 };
 std::array<ResolverState, 65> resolverStates{};
 
@@ -158,6 +169,8 @@ std::array<int, 65> resolverMode{};  // режим на текущем тике,
 {
     return std::popcount(static_cast<std::uint8_t>(state.jitterHistory & 0x0F)) >= 2;
 }
+
+void addSideVote(ResolverState& state, float side, float weight, float realtime) noexcept;
 
 void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, int userId, float interval, float realtime) noexcept
 {
@@ -190,15 +203,26 @@ void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, in
         const float delta = std::remainder(eyeYaw - state.lastEyeYaw, 360.0f);
         const bool jitter = std::abs(delta) > 25.0f && std::abs(state.lastYawDelta) > 25.0f && (delta > 0.0f) != (state.lastYawDelta > 0.0f);
         state.jitterHistory = static_cast<std::uint8_t>((state.jitterHistory << 1) | (jitter ? 1 : 0));
-        if (std::abs(delta) > 25.0f)
-            state.jitterPhase = delta > 0.0f ? 1.0f : -1.0f;
+        // смена фазы за обновление: по этой доле предсказываем сторону к моменту выстрела на сервере
+        if (state.phaseChangeCount < 8)
+            ++state.phaseChangeCount;
+        if (std::abs(delta) > 25.0f) {
+            const float phase = delta > 0.0f ? 1.0f : -1.0f;
+            state.phaseChangeBits = static_cast<std::uint8_t>((state.phaseChangeBits << 1) | (phase != state.jitterPhase ? 1 : 0));
+            state.jitterPhase = phase;
+        } else {
+            state.phaseChangeBits = static_cast<std::uint8_t>(state.phaseChangeBits << 1);
+        }
         state.lastYawDelta = delta;
     }
 
     // резольвер разбирает обновление раньше (NET_UPDATE), так что находка на этом simtime уже есть
     float foundAt = 0.0f, ratio = 0.0f;
+    // Находку с низкой уверенностью в память не берём: «память слоёв» попадала 37% против 62% у самих
+    // слоёв именно потому, что в неё затекали находки на одном случайном сигнале.
+    const float foundConfidence = hvh::resolver::confidence(index);
     if (hvh::resolver::lastFound(index, foundAt, ratio) && foundAt == simulationTime && foundAt != state.learnedFoundAt
-        && std::abs(ratio) > 0.3f) {
+        && std::abs(ratio) > 0.3f && foundConfidence >= 0.25f) {
         const bool positive = ratio > 0.0f;
         // соседние обновления одного эпизода — не новые свидетельства, иначе «совпадений» будет 100%
         if (realtime - state.learnedAt > 0.25f) {
@@ -215,6 +239,8 @@ void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, in
         state.learnedAt = realtime;
         state.memoryRatio = ratio;
         state.memoryMisses = 0;
+        // находка по анимации — сильное свидетельство стороны, но ровно настолько, насколько она уверенная
+        addSideVote(state, ratio, 1.5f + 2.5f * foundConfidence, realtime);
     }
     state.lastSimulationTime = simulationTime;
     state.lastEyeYaw = eyeYaw;
@@ -236,7 +262,10 @@ void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, in
     const float age = realtime - state.learnedAt;
     const bool steady = state.sameSideCount >= 2 && agreement(state.sameSideBits, state.sameSideCount) >= 0.7f;
     const bool flips = state.sameSideCount >= 2 && agreement(state.sameSideBits, state.sameSideCount) < 0.5f;
-    if (flips || age > (steady ? 10.0f : 3.0f))
+    // Сроки были 3 и 10 с — слишком щедро: по логам 29.10 «память слоёв» попадала 27-37%, то есть
+    // ХУЖЕ фристенд-догадки (35%). Протухшая сторона вреднее отсутствия стороны, потому что ещё и
+    // отключает перебор. Держим память столько, сколько враг реально держит одну сторону.
+    if (flips || age > (steady ? 4.0f : 1.5f))
         return 0.0f;
     return state.memoryRatio;
 }
@@ -250,17 +279,60 @@ void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, in
     return agree >= 0.7f ? 1.0f : agree <= 0.3f ? -1.0f : 0.0f;
 }
 
+// ---------- голосование стороны десинка ----------
+// Одно свидетельство ничего не решает, но находка слоёв, доказанный импакт и попадание вместе
+// дают устойчивую сторону. Перевес затухает: враг мог сменить настройки или сторону.
+void addSideVote(ResolverState& state, float side, float weight, float realtime) noexcept
+{
+    if (std::abs(side) < 0.05f || weight == 0.0f)
+        return;
+    if (state.sideVoteAt > 0.0f)
+        state.sideVote *= std::exp(-(realtime - state.sideVoteAt) / 6.0f);
+    state.sideVote += side > 0.0f ? weight : -weight;
+    state.sideVoteAt = realtime;
+}
+
+[[nodiscard]] float voteSide(const ResolverState& state, float realtime, float threshold = 1.5f) noexcept
+{
+    if (state.sideVoteAt <= 0.0f)
+        return 0.0f;
+    const float vote = state.sideVote * std::exp(-(realtime - state.sideVoteAt) / 6.0f);
+    return std::abs(vote) >= threshold ? (vote > 0.0f ? 1.0f : -1.0f) : 0.0f;
+}
+
+// Фристенд-догадка: у части читов открытая сторона систематически противоположна настоящей —
+// если попадания/импакты говорят об этом, догадку переворачиваем для этого игрока.
+[[nodiscard]] float guessSide(const ResolverState& state) noexcept
+{
+    if (state.guessSideCount >= 4 && agreement(state.guessSideBits, state.guessSideCount) <= 0.25f)
+        return -state.guessedSide;
+    return state.guessedSide;
+}
+
+// Сколько раз фаза джиттера меняется за одно обновление (по последним 8 обновлениям)
+[[nodiscard]] float phaseChangeRatio(const ResolverState& state) noexcept
+{
+    return state.phaseChangeCount >= 4 ? agreement(state.phaseChangeBits, state.phaseChangeCount) : 1.0f;
+}
+
 [[nodiscard]] int bestMode(const ResolverState& state) noexcept
 {
     // «без поворота» не перебираем: по логам 29.10 — 1 попадание из 12, на HvH десинкают все,
-    // а он выигрывал счёт просто потому, что остальные режимы набрали промахов
+    // а он выигрывал счёт просто потому, что остальные режимы набрали промахов.
+    // Половинные режимы туда же: «угадано low» 1 из 9, «обратно low» 1 из 4 — величину десинка
+    // теперь даёт память слоёв (ratio), гадать её вслепую смысла нет.
     int best = 0;
     for (int mode = 1; mode < ModeCount; ++mode) {
-        if (mode == NoResolve)
+        if (mode == NoResolve || mode == GuessLow || mode == OppositeLow)
             continue;
         if (state.score[mode] > state.score[best])
             best = mode;
     }
+    // «Обратно» по логам 29.10 попадает 26% против 50% у «угадано», и 7 его промахов из 11 — это
+    // prediction error, а не сторона. То есть счёт ему натекает с чужих промахов (пинг, стена,
+    // смерть), а не с доказанной стороны. Зеркалить стоит только с запасом в два очка.
+    if (best == Opposite && state.score[Opposite] < state.score[Guess] + 2)
+        best = Guess;
     return best;
 }
 
@@ -289,6 +361,7 @@ struct LagRecord {
     bool resolved = false;          // bones собраны под угол ног от резольвера по слоям анимации
     bool remembered = false;        // ...или под сторону из памяти прошлых находок (слои молчат)
     float resolvedYaw = 0.0f;
+    float maxDesync = 0.0f;         // предел десинка из animstate врага на этот simtime (0 — считать по скорости)
     csgo::matrix3x4 bones[RECORD_BONES];
     csgo::matrix3x4 plus[RECORD_BONES];
     csgo::matrix3x4 minus[RECORD_BONES];
@@ -534,6 +607,8 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
     record.resolved = false;
     record.remembered = false;
     record.resolvedYaw = 0.0f;
+    // предел десинка из animstate врага: у бегущих/присевших он свой, и «58°» на глаз уводит точку мимо
+    record.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
     if (rebuild) {
         // максимальный десинк — по формуле самого клиента из animstate врага, а не на глаз
         const float animMax = entity.getMaxDesyncAngle();
@@ -545,7 +620,8 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
         const bool useMemory = remembered != 0.0f;
         const float yaw = haveResolved ? hvh::resolver::footYaw(index) : record.eyeAngles.y + remembered * maxDesync;
         record.rebuilt = rebuildDesyncVariants(entity, memory, record, maxDesync,
-            haveResolved || useMemory ? yaw : 0.0f, haveResolved || useMemory, config.rage.safePoint != 0);
+            haveResolved || useMemory ? yaw : 0.0f, haveResolved || useMemory,
+            config.rage.safePoint != 0 || config.rage.resolverSafeWhenUnsure);
         record.remembered = useMemory && record.resolved;
     }
 }
@@ -700,6 +776,7 @@ struct ShotRecord {
     bool edgePoint = false;  // мультипоинт (край), а не центр хитбокса
     bool safe = false;
     float side = 0.0f;       // резольвер: +1/-1, ±0.5 — low delta, 0 — без поправки
+    float guessedSide = 0.0f; // что в момент выстрела давала фристенд-догадка (проверяем её на попаданиях)
     int damage = 0;
     int mode = -1;
     RecordKind kind = RecordKind::Live;
@@ -902,13 +979,14 @@ PredictionCheck checkPrediction(const ShotRecord& shot, int index) noexcept
     return check;
 }
 
-// По импакту видно, на какой стороне десинка стояла модель на сервере: луч, которым мы стреляли,
-// проходит сквозь один крайний скелет и не проходит сквозь другой. Если это противоположная сторона —
-// сторона угадана неверно, и это доказано геометрией, а не «наверное, резольвер».
+// По геометрии выстрела видно, на какой стороне десинка стояла модель на сервере: луч, которым мы
+// стреляли, проходит сквозь один крайний скелет и не проходит сквозь другой. Если это промах —
+// модель была на другой стороне; если попадание — на этой. Доказательство геометрией, а не «наверное».
+// bulletLanded: пуля заведомо дошла до цели (попадание) — тогда импакт для проверки не обязателен.
 // Возвращает +1/-1 (сторона, где действительно была модель) или 0, если доказать нельзя.
-float provenSideFromImpact(int index, const ShotRecord& shot) noexcept
+float provenSideFromShot(int index, const ShotRecord& shot, bool bulletLanded) noexcept
 {
-    if (!shot.haveImpact || !shot.set || std::abs(shot.side) < 0.05f || !logMemory)
+    if ((!bulletLanded && !shot.haveImpact) || !shot.set || !logMemory)
         return 0.0f;
     const auto& list = records[index];
     if (list.count == 0)
@@ -987,7 +1065,7 @@ bool logMiss(int index, float shotTime, float& provenSide) noexcept
         reason = "десинк/лагкомп (пуля прошла через точку, резольвер не применялся)";
     }
     if (resolverFault)
-        provenSide = provenSideFromImpact(index, shot);
+        provenSide = provenSideFromShot(index, shot, false);
     char text[640];
     std::snprintf(text, sizeof(text), "[ECLIPSE] промах по %s: %s | %s%s, сторона %s (%s)%s, урон %d%s | %s",
         playerName(index).c_str(), reason, shot.isHead ? "голова" : "тело", shot.edgePoint ? " (край)" : " (центр)", sideText(shot.side),
@@ -1388,7 +1466,7 @@ bool buildDesyncVariants(bool isBot, const LagRecord& record, const csgo::matrix
     const float eyeYaw = record.eyeAngles.y;
     const float clientYaw = record.absYaw;
     const auto& pivot = record.origin;
-    const float maxDesync = deltaScale * maxDesyncFor(record.velocity);
+    const float maxDesync = deltaScale * (record.maxDesync > 1.0f ? record.maxDesync : maxDesyncFor(record.velocity));
 
     // На сервере на полный угол повёрнуты ноги и таз (feet yaw), а позвоночник закручен обратно к взгляду
     // (body_yaw), поэтому чем выше кость, тем меньше её доворот: ступни — 100%, голова — ~35%.
@@ -1415,16 +1493,29 @@ float guessDesyncSide(const csgo::EngineTrace& engineTrace, const csgo::Vector& 
     constexpr int headBone = 8;
     const auto headPlus = plus[headBone].origin();
     const auto headMinus = minus[headBone].origin();
+    // помимо головы смотрим грудь: по одному хитбоксу «открыто/закрыто» решается случайно
+    int chestBone = 3;
+    float chestDistance = 1e9f;
+    const float chestZ = headPlus.z - 28.0f;
+    for (int bone = 1; bone < headBone; ++bone) {
+        const float distance = std::abs(plus[bone].origin().z - chestZ);
+        if (distance < chestDistance) {
+            chestDistance = distance;
+            chestBone = bone;
+        }
+    }
+    const auto chestPlus = plus[chestBone].origin();
+    const auto chestMinus = minus[chestBone].origin();
     const auto exposed = [&](const csgo::Vector& point) {
         // только стены (MASK_SOLID_BRUSHONLY): игроки луч не загораживают
         csgo::Trace trace;
         engineTrace.traceRay({ eye, point }, 0x1400B, { localPlayer.get().getPOD() }, trace);
         return trace.fraction > 0.97f;
     };
-    const bool plusExposed = exposed(headPlus);
-    const bool minusExposed = exposed(headMinus);
-    if (plusExposed != minusExposed)
-        return plusExposed ? -1.0f : 1.0f;
+    const int plusScore = (exposed(headPlus) ? 1 : 0) + (exposed(chestPlus) ? 1 : 0);
+    const int minusScore = (exposed(headMinus) ? 1 : 0) + (exposed(chestMinus) ? 1 : 0);
+    if (plusScore != minusScore)
+        return plusScore < minusScore ? 1.0f : -1.0f;   // настоящая сторона — та, что спрятана
     return (headPlus - eye).squareLength() > (headMinus - eye).squareLength() ? 1.0f : -1.0f;
 }
 
@@ -1475,12 +1566,37 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
             std::uint8_t& hits = shots[victimIndex].isHead ? state.headHits : state.bodyHits;
             hits = static_cast<std::uint8_t>(std::min<int>(hits + 1, 250));
         }
+        // Попадание — тоже доказательство стороны, если луч проходит только сквозь один крайний скелет:
+        // модель на сервере могла стоять лишь там. Это сильнее, чем «попали — значит сторона верна»:
+        // в тело мы попадаем при любой стороне, а геометрия луча различает стороны.
+        if (logMemory) {
+            if (const float proven = provenSideFromShot(victimIndex, shots[victimIndex], true); proven != 0.0f) {
+                addSideVote(state, proven, 3.0f, logMemory->globalVars->realtime);
+                if (!isJittering(state)) {
+                    state.bruteSide = proven;
+                    state.bruteUntil = logMemory->globalVars->realtime + 2.0f;
+                }
+                if (std::abs(shots[victimIndex].guessedSide) > 0.05f) {
+                    const bool same = (proven > 0.0f) == (shots[victimIndex].guessedSide > 0.0f);
+                    state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
+                    state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
+                }
+            }
+        }
         // джиттер: учим, совпадает ли сторона попадания с фазой взгляда. Находок по слоям мало,
         // а попаданий больше — связь фазы и стороны так выучивается быстрее
         if (isJittering(state) && std::abs(shots[victimIndex].side) > 0.05f) {
             const bool samePhase = (shots[victimIndex].side > 0.0f) == (state.jitterPhase > 0.0f);
             state.jitterSideBits = static_cast<std::uint8_t>((state.jitterSideBits << 1) | (samePhase ? 1 : 0));
             state.jitterSideCount = static_cast<std::uint8_t>(std::min<int>(state.jitterSideCount + 1, 8));
+        }
+        if (logMemory)
+            addSideVote(state, shots[victimIndex].side, 2.0f, logMemory->globalVars->realtime);
+        // попадание подтверждает и фристенд-догадку (или показывает, что она у этого игрока обратная)
+        if (!isJittering(state) && std::abs(shots[victimIndex].side) > 0.05f && std::abs(shots[victimIndex].guessedSide) > 0.05f) {
+            const bool same = (shots[victimIndex].side > 0.0f) == (shots[victimIndex].guessedSide > 0.0f);
+            state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
+            state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
         }
     }
     pendingShot[victimIndex] = 0.0f;
@@ -1620,11 +1736,18 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     // и переносим голос на режим, который её выбирает
                     state.bruteSide = provenSide;
                     state.bruteUntil = memory.globalVars->realtime + 2.0f;
+                    addSideVote(state, provenSide, 4.0f, memory.globalVars->realtime);
                     if (std::abs(used) > 0.05f && (used > 0.0f) != (provenSide > 0.0f)) {
                         const int better = mode == Guess ? Opposite
                             : mode == Opposite ? Guess
                             : mode == GuessLow ? OppositeLow : GuessLow;
                         state.score[better] = std::min(state.score[better] + 1, 8);
+                    }
+                    // и проверяем фристенд-догадку: импакт знает сторону точно
+                    if (std::abs(shots[i].guessedSide) > 0.05f) {
+                        const bool same = (provenSide > 0.0f) == (shots[i].guessedSide > 0.0f);
+                        state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
+                        state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
                     }
                 } else if (std::abs(used) > 0.05f) {
                     // доказать нечем — перебираем зеркальную сторону, пока не попадём
@@ -1866,6 +1989,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 liveRecord.breakingLagComp = false;
                 liveRecord.rebuilt = false;
                 liveRecord.resolved = false;
+                liveRecord.remembered = false;
+                liveRecord.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
                 candidates[candidateCount++] = { &liveRecord, RecordKind::Live, 0, 0 };
             }
         }
@@ -1885,15 +2010,25 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         const float deltaScale = mode == GuessLow || mode == OppositeLow ? 0.5f : 1.0f;
         // Память слоёв знает не только сторону, но и величину десинка (доля от максимума): у многих
         // врагов ноги повёрнуты не на полный угол, и «полный» скелет уводил точку мимо тела.
+        const float realtimeNow = memory.globalVars->realtime;
+        // Голосование по свидетельствам: чуть перевесило — сторона известна, сильно перевесило —
+        // оно перекрывает даже одиночную находку по слоям (та могла быть на разошедшейся тени анимации).
+        const float votedSide = voteSide(state, realtimeNow);
+        const float strongVotedSide = voteSide(state, realtimeNow, 3.0f);
         float memorySide = 0.0f;
         float variantScale = deltaScale;
         if (mode >= 0 && !isJittering(state)) {
-            const float ratio = rememberedRatio(state, memory.globalVars->realtime);
+            const float ratio = rememberedRatio(state, realtimeNow);
             if (std::abs(ratio) > 0.3f) {
                 memorySide = ratio > 0.0f ? 1.0f : -1.0f;
                 variantScale = std::clamp(std::abs(ratio), 0.35f, 1.0f);
             }
+            // голосование по всем свидетельствам перекрывает одиночную находку
+            if (votedSide != 0.0f)
+                memorySide = votedSide;
         }
+        // доля смен фазы джиттера за обновление: 1 — каждый апдейт, 0.5 — раз в два
+        const float phaseRatio = phaseChangeRatio(state);
 
         for (int c = 0; c < candidateCount; ++c) {
             const auto& record = *candidates[c].record;
@@ -1903,6 +2038,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             std::copy(record.bones, record.bones + RECORD_BONES, bones);
             const bool layerResolved = rage.resolver && record.resolved;
             bool variants = false;
+            bool layerOverridden = false;
             float side = 0.0f;
             if (layerResolved) {
                 // крайние скелеты собраны только при включённых безопасных точках
@@ -1910,18 +2046,29 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     std::copy(record.plus, record.plus + RECORD_BONES, plusBones);
                     std::copy(record.minus, record.minus + RECORD_BONES, minusBones);
                     variants = true;
+                    // Находка слоёв могла быть на разошедшейся тени анимации. Если голосование уверенно
+                    // показывает обратную сторону (её доказали попадания/импакты, а не догадка), берём
+                    // скелет этой стороны, а величину — из находки: десинк не всегда на полный угол.
+                    const float layerDelta = std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f);
+                    const bool shaky = record.remembered || hvh::resolver::confidence(i) < 0.5f;
+                    if (shaky && strongVotedSide != 0.0f && std::abs(layerDelta) > 1.0f
+                        && ((layerDelta > 0.0f ? 1.0f : -1.0f) != strongVotedSide)) {
+                        const auto* chosen = strongVotedSide > 0.0f ? record.plus : record.minus;
+                        std::copy(chosen, chosen + RECORD_BONES, bones);
+                        layerOverridden = true;
+                    }
                 }
             } else if (rage.resolver && mode >= 0 && buildDesyncVariants(isBot[i], record, record.bones, plusBones, minusBones, variantScale)) {
                 variants = true;
                 if (pendingShot[i] == 0.0f || state.guessedSide == 0.0f)
                     state.guessedSide = guessDesyncSide(engineInterfaces.engineTrace(), eye, plusBones, minusBones);
                 // у джиттеров десинк обычно переключается вместе с yaw — берём фазу джиттера вместо фристенда
-                // если сервер увидит нечётное число обновлений сверх нашей записи — фаза уже перещёлкнулась
-                const bool flipped = candidates[c].updatesAhead % 2 == 1;
+                // сколько раз фаза перещёлкнется, пока сервер дойдёт до нашей записи: по выученной доле смен
+                const bool flipped = std::lround(static_cast<float>(candidates[c].updatesAhead) * phaseRatio) % 2 != 0;
                 const float relation = jitterRelation(state);
                 const float phase = (flipped ? -state.jitterPhase : state.jitterPhase) * (relation < 0.0f ? -1.0f : 1.0f);
-                // сторона: память слоёв (находка по анимации) точнее фристенд-догадки, джиттер — по фазе
-                const float base = isJittering(state) ? phase : (memorySide != 0.0f ? memorySide : state.guessedSide);
+                // сторона: голосование/память слоёв точнее фристенд-догадки, джиттер — по фазе
+                const float base = isJittering(state) ? phase : (memorySide != 0.0f ? memorySide : guessSide(state));
                 if (mode == Guess || mode == GuessLow)
                     side = base;
                 else if (mode == Opposite || mode == OppositeLow)
@@ -1941,12 +2088,17 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 if (layerResolved)
                     sideCertain = !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
                 else if (variants)
-                    sideCertain = mode >= 0 && state.score[std::clamp(mode, 0, ModeCount - 1)] >= 0;
+                    sideCertain = mode >= 0 && (state.score[std::clamp(mode, 0, ModeCount - 1)] >= 0 || voteSide(state, realtimeNow) != 0.0f);
             }
             const bool sideUncertain = variants && !sideCertain;
             const bool safeBySetting = rage.safePoint == 2 || (rage.safePoint == 1 && misses[i] > 0);
-            const bool desyncSafe = !cheapScan && variants && (safeBySetting || (rage.resolverSafeWhenUnsure && sideUncertain));
             const bool predictedRecord = candidates[c].kind == RecordKind::Ahead || candidates[c].kind == RecordKind::Extrapolated;
+            // Предсказанная запись + неизвестная сторона — это две догадки подряд, и по логам 29.10
+            // так выходит 29% попаданий («вперёд» + «угадано», 188 выстрелов) против 78% у «свежая» + «слои».
+            // В такой связке точки, общие для обеих сторон, требуем, а не предпочитаем; если под них
+            // не набирается мин. урон, ниже всё равно идёт второй проход без требования.
+            const bool desyncSafe = !cheapScan && variants
+                && (safeBySetting || ((rage.resolverSafeWhenUnsure || predictedRecord) && sideUncertain));
             // на предсказанной записи сторону десинка проверить нечем (взгляд за 300 мс уходит на 60°) —
             // точки, общие для обеих сторон, предпочитаем там всегда, без требования (см. steady ниже)
             const bool preferDesyncSafe = predictedRecord && !cheapScan && variants;
@@ -2104,11 +2256,19 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     }
                 }
             };
-            scanPoints(desyncSafe, false);
+            // Голова — капсула радиусом ~5 юнитов, и промах по ней стоит всего размена. По логам 29.10
+            // прицельная стрельба в голову дала 0 попаданий из 29, причём 19 попыток были по
+            // предсказанной записи; тело в тех же условиях попадало 47%. Берём голову только когда
+            // сняты обе неизвестности: момент настоящий (не предсказанный) и сторона десинка доказана
+            // слоями с хорошей уверенностью — либо враг вовсе не десинкает. Все 5 состоявшихся
+            // хедшотов за вечер прилетели именно так, и 4 из них убили сразу.
+            const bool headAllowed = isBot[i] || (!predictedRecord
+                && (mode < 0 || (layerResolved && !record.remembered && hvh::resolver::confidence(i) >= 0.5f)));
+            scanPoints(desyncSafe, !headAllowed);
             // Сторона не доказана, а общих для обеих сторон точек под мин. урон нет — лучше стрелять
             // по угаданной стороне, чем не стрелять вовсе. Настройка safePoint при этом уважается.
             if (desyncSafe && !safeBySetting && bestHead.damage <= 0.0f && bestBody.damage <= 0.0f)
-                scanPoints(false, false);
+                scanPoints(false, !headAllowed);
             const bool safeOnly = desyncSafe && (bestHead.damage > 0.0f || bestBody.damage > 0.0f);
             if (sureHead.damage > 0.0f || sureBody.damage > 0.0f) {
                 bestHead = sureHead;
@@ -2285,6 +2445,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.edgePoint = best.point.edge;
     shot.safe = best.safe;
     shot.side = resolverOffset[best.index];
+    shot.guessedSide = resolverStates[best.index].guessedSide;
     shot.damage = static_cast<int>(best.point.damage);
     shot.mode = resolverMode[best.index];
     shot.kind = best.kind;
