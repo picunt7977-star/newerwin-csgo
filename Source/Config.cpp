@@ -31,6 +31,7 @@
 #include "Hacks/Sound.h"
 #include "Hacks/Visuals.h"
 #include "Hacks/Misc.h"
+#include "Hacks/HvH/HvhConfig.h"
 #include <Config/LoadConfigurator.h>
 #include <Config/ResetConfigurator.h>
 #include <Config/SaveConfigurator.h>
@@ -320,6 +321,7 @@ void Config::load(const OtherInterfaces& interfaces, const Memory& memory, const
     LoadConfigurator soundConfigurator{ j["Sound"] };
     features.sound.configure(soundConfigurator);
     features.misc.fromJson(j["Misc"]);
+    hvh::fromJson(j["HvH"]);
 }
 
 static void to_json(json& j, const ColorToggleRounding& o, const ColorToggleRounding& dummy = {})
@@ -518,6 +520,7 @@ void Config::save(const OtherInterfaces& interfaces, const Memory& memory, size_
     j["Sound"] = soundConfigurator.getJson();
     j["Visuals"] = features.visuals.toJson();
     j["Misc"] = features.misc.toJson();
+    j["HvH"] = hvh::toJson();
     j["Style"] = style;
     j["Inventory Changer"] = toJson(interfaces, memory, features.inventoryChanger);
 
@@ -565,6 +568,7 @@ void Config::reset(const OtherInterfaces& interfaces, const Memory& memory) noex
     features.inventoryChanger.reset(memory);
     features.sound.configure(configurator);
     features.misc.resetConfig();
+    hvh::resetConfig();
 }
 
 void Config::listConfigs() noexcept

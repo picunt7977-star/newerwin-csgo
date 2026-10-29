@@ -131,7 +131,7 @@ void Chams::applyChams(const std::array<ChamsLayer, 7>& chams, int health, csgo:
         if (!cham.enabled || !cham.ignorez)
             continue;
 
-        const auto material = materials.getMaterial(cham.material);
+        const auto material = materials.getMaterial(cham.material, true);
         if (material.getPOD() == nullptr)
             continue;
         

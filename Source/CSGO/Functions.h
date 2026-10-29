@@ -63,6 +63,11 @@ struct EntityPOD;
 using IsOtherEnemy = bool (THISCALL_CONV*)(EntityPOD* player1, EntityPOD* player2);
 using SetAbsOrigin = void (THISCALL_CONV*)(EntityPOD* entity, const Vector& origin);
 
+struct AnimState;
+// CCSGOPlayerAnimState::Update: ноги/слои анимации считаются из animstate, force пропускает
+// проверку «в этом кадре уже считали»
+using UpdateAnimationState = void (THISCALL_CONV*)(AnimState* state, bool force, float eyeYaw, float pitch);
+
 struct ItemSystemPOD;
 using GetItemSystem = ItemSystemPOD* (CDECL_CONV*)();
 

@@ -8,6 +8,8 @@ struct ReturnAddress {
 
     bool operator==(const ReturnAddress&) const = default;
 
+    [[nodiscard]] const void* get() const noexcept { return returnAddress; }
+
 private:
     const void* returnAddress;
 };

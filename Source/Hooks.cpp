@@ -30,6 +30,7 @@
 #include "EventListener.h"
 #include "GameData.h"
 #include "GUI.h"
+#include "Hacks/HvH/Tickbase.h"
 #include "Hooks.h"
 #include "Memory.h"
 
@@ -169,6 +170,7 @@ void Hooks::uninstall(Misc& misc, Glow& glow, Visuals& visuals, inventory_change
     surfaceHooks.forceUninstall();
 
     Netvars::restore();
+    hvh::tickbase::uninstall();
 
     glow.clearCustomObjects();
     inventoryChanger.reset(memory);

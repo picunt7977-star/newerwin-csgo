@@ -55,7 +55,14 @@ struct LinuxClientPatternFinder {
 
     [[nodiscard]] ReturnAddress cameraThink() const noexcept
     {
-        return finder("0F 1F 80 ? ? ? ? 85 C0 75 5C"_pat).add(6).as<ReturnAddress>();
+        return finder("0F 1F 80 ? ? ? ? 85 C0 75 5C"_pat).as<ReturnAddress>();
+    }
+
+    // CAM_Think девиртуализирует sv_cheats->GetInt(): если в vtable не оригинал (а там наш хук),
+    // вызов идёт из запасной ветки `call rdx` (0x95c7a8 в текущем билде) — адрес возврата на 6 байт раньше этого паттерна
+    [[nodiscard]] ReturnAddress cameraThinkHooked() const noexcept
+    {
+        return finder("4C 89 FF FF D2 E9 ? ? ? ? 66 0F 1F 44 00 00 49 8B 04 24 4C 89 E7 FF 90"_pat).add(-6).as<ReturnAddress>();
     }
 
     [[nodiscard]] csgo::KeyValuesFindKey keyValuesFindKey() const noexcept
@@ -205,7 +212,8 @@ struct LinuxClientPatternFinder {
 
     [[nodiscard]] csgo::UiComponentInventoryPOD** uiComponentInventory() const noexcept
     {
-        return finder("4C 89 3D ? ? ? ? 4C 89 FF EB 9D 0F 1F 44 00 00"_pat).add(3).abs().as<csgo::UiComponentInventoryPOD**>();
+        // new CUiComponent_Inventory (0x5a8 байт) → глобальный указатель; старый паттерн не находится в билде 10.2026
+        return finder("BF A8 05 00 00 E8 ? ? ? ? 48 89 C7 49 89 C7 E8 ? ? ? ? 4C 89 3D"_pat).add(24).abs().as<csgo::UiComponentInventoryPOD**>();
     }
 
     [[nodiscard]] csgo::SetItemSessionPropertyValue setItemSessionPropertyValue() const noexcept
@@ -286,6 +294,35 @@ struct LinuxClientPatternFinder {
     [[nodiscard]] csgo::EquipWearable equipWearable() const noexcept
     {
         return finder("55 48 8D 15 ? ? ? ? 48 89 E5 41 56 41 55 41 54 49 89 F4 53 48 8B 07"_pat).as<csgo::EquipWearable>();
+    }
+
+    // C_BaseAnimating::InvalidateBoneCache: из её байтов достаём офсеты m_flLastBoneSetupTime,
+    // m_iMostRecentModelBoneCounter и адрес g_iModelBoneCounter (сама функция ещё и закрыта флагом)
+    [[nodiscard]] const std::byte* invalidateBoneCache() const noexcept
+    {
+        return finder("80 3D ? ? ? ? 00 55 48 89 E5 74 ? 48 8B 05 ? ? ? ? C7 87 ? ? ? ? FF FF 7F FF 48 83 E8 01 48 89 87"_pat).as<const std::byte*>();
+    }
+
+    // CCSGOPlayerAnimState::Update(this, bool force, float eyeYaw, float pitch) — клиент 13546
+    [[nodiscard]] csgo::UpdateAnimationState updateAnimationState() const noexcept
+    {
+        return finder("48 8B 47 68 48 85 C0 74 ? 55 48 8D 0D ? ? ? ? 48 89 E5 41 56 41 89 F6"_pat).as<csgo::UpdateAnimationState>();
+    }
+
+    // C_BaseAnimatingOverlay::GetAnimOverlay: mov ecx,[rdi+size]; ... mov rdi,[rdi+m_AnimOverlay] — офсет CUtlVector слоёв.
+    // Из recv-таблицы его не взять: у RecvPropUtlVector смещение лежит не в самом prop (там 0)
+    [[nodiscard]] int animOverlayOffset() const noexcept
+    {
+        const auto displacement = finder("55 8B 8F ? ? ? ? 48 89 E5 85 C9 74 ? 84 D2 48 8B BF"_pat).add(19).as<const std::int32_t*>();
+        return displacement ? *displacement : 0;
+    }
+
+    // Из вызова Update в C_CSPlayer::UpdateClientSideAnimation достаём офсет m_pPlayerAnimState:
+    // mov rdi,[rbx+off]; xor esi,esi; movss xmm0,[rax+4]; movss xmm1,[rbp-0x24]; call Update
+    [[nodiscard]] int animStateOffset() const noexcept
+    {
+        const auto displacement = finder("48 8B BB ? ? ? ? 31 F6 F3 0F 10 40 04 F3 0F 10 4D DC E8"_pat).add(3).as<const std::int32_t*>();
+        return displacement ? *displacement : 0;
     }
 
     [[nodiscard]] int* predictionRandomSeed() const noexcept

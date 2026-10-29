@@ -332,3 +332,6 @@ ASALocalRun/
 
 # Local History for Visual Studio
 .localhistory/
+# ECLIPSE: сборка и логи не нужны в репозитории
+/build/
+/logs/

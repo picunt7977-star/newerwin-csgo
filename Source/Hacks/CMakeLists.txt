@@ -9,4 +9,14 @@ target_sources(OsirisOBJ PRIVATE
   StreamProofESP.cpp
   Triggerbot.cpp
   Visuals.cpp
+  HvH/AntiAim.cpp
+  HvH/Autowall.cpp
+  HvH/GrenadePrediction.cpp
+  HvH/HvhConfig.cpp
+  HvH/HvhGui.cpp
+  HvH/ModelPreview.cpp
+  HvH/Movement.cpp
+  HvH/Ragebot.cpp
+  HvH/Resolver.cpp
+  HvH/Tickbase.cpp
 )

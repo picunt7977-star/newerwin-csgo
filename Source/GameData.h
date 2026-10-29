@@ -142,6 +142,9 @@ struct PlayerData : BaseData {
     csgo::Vector origin;
     std::string activeWeapon;
     std::vector<std::pair<csgo::Vector, csgo::Vector>> bones;
+    // поза скелета относительно origin прошлого кадра — для сглаживания джиттера вражеского AA
+    std::vector<std::pair<csgo::Vector, csgo::Vector>> smoothedPose;
+    float smoothedAt = 0.0f;
 };
 
 struct WeaponData : BaseData {

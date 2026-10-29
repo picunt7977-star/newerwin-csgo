@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <CSGO/KeyValues.h>
 #include <CSGO/MaterialSystem.h>
 #include "ChamsMaterial.h"
@@ -11,9 +13,13 @@ struct ChamsMaterialFactory {
     {
     }
 
-    [[nodiscard]] csgo::MaterialPOD* operator()(ChamsMaterial material)
+    [[nodiscard]] csgo::MaterialPOD* operator()(ChamsMaterial material, bool ignorez = false)
     {
-        return materialSystem.createMaterial(toString(material).data(), createMaterialKeyValues(material).getPOD());
+        // для прохода «сквозь стены» — отдельный экземпляр со своим именем
+        std::string name{ toString(material) };
+        if (ignorez)
+            name += "_xqz";
+        return materialSystem.createMaterial(name.c_str(), createMaterialKeyValues(material).getPOD());
     }
 
 private:

@@ -1,3 +1,4 @@
+#include "Hacks/HvH/HvhConfig.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -414,12 +415,37 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
     name = entity.getPlayerName(interfaces, memory);
 
     dormant = entity.getNetworkable().isDormant();
-    if (dormant)
+    if (dormant) {
+        // сервер перестал присылать игрока, но звуки шагов/выстрелов с координатами всё ещё приходят:
+        // переносим ESP туда и продлеваем показ
+        const int index = entity.getNetworkable().index();
+        for (int i = 0; i < memory.activeChannels->count; ++i) {
+            const auto& channel = memory.channels[memory.activeChannels->list[i]];
+            if (channel.soundSource != index || (channel.origin.x == 0.0f && channel.origin.y == 0.0f))
+                continue;
+            const auto shift = channel.origin - origin;
+            origin = channel.origin;
+            coordinateFrame.translate(shift);
+            headMins += shift;
+            headMaxs += shift;
+            for (auto& [parent, child] : bones) {
+                parent += shift;
+                child += shift;
+            }
+            if (alive)
+                lastContactTime = memory.globalVars->realtime;
+            break;
+        }
         return;
+    }
 
     team = entity.getTeamNumber();
     static_cast<BaseData&>(*this) = { entity };
     origin = entity.getAbsOrigin();
+    // Коробка игрока (SOLID_BBOX) в мире не вращается — она выровнена по осям. toWorldTransform же
+    // повёрнут по углу модели, который крутит вражеский AA: рамка ESP от этого дёргалась шириной.
+    // Берём только перенос в origin.
+    coordinateFrame = csgo::matrix3x4::translation(origin);
     inViewFrustum = !engineInterfaces.getEngine().cullBox(obbMins + origin, obbMaxs + origin);
     alive = entity.isAlive();
     lastContactTime = alive ? memory.globalVars->realtime : 0.0f;
@@ -477,6 +503,30 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
             continue;
 
         bones.emplace_back(boneMatrices[i].origin(), boneMatrices[bone->parent].origin());
+    }
+
+    // Джиттер AA разворачивает модель каждые пару тиков — скелет ESP прыгал вместе с ней. Сглаживаем
+    // позу относительно origin (сам игрок не отстаёт), большой скачок позы (телепорт, смена модели) — сразу.
+    {
+        const float now = memory.globalVars->realtime;
+        const float dt = std::clamp(now - smoothedAt, 0.0f, 0.1f);
+        const float alpha = 1.0f - std::exp(-dt / 0.04f);
+        const bool reset = smoothedPose.size() != bones.size() || now - smoothedAt > 0.25f;
+        if (reset)
+            smoothedPose.resize(bones.size());
+        for (std::size_t i = 0; i < bones.size(); ++i) {
+            const auto first = bones[i].first - origin;
+            const auto second = bones[i].second - origin;
+            auto& pose = smoothedPose[i];
+            if (reset || (first - pose.first).length() > 40.0f) {
+                pose = { first, second };
+            } else {
+                pose.first += (first - pose.first) * alpha;
+                pose.second += (second - pose.second) * alpha;
+            }
+            bones[i] = { pose.first + origin, pose.second + origin };
+        }
+        smoothedAt = now;
     }
 
     const auto set = studioModel->getHitboxSet(entity.hitboxSet());
@@ -547,8 +597,10 @@ ImTextureID PlayerData::getAvatarTexture() const noexcept
 
 float PlayerData::fadingAlpha(const Memory& memory) const noexcept
 {
-    constexpr float fadeTime = 1.50f;
-    return std::clamp(1.0f - (memory.globalVars->realtime - lastContactTime - 0.25f) / fadeTime, 0.0f, 1.0f);
+    // игрок ушёл из PVS: держим ESP на последней известной позиции, гаснет за последнюю секунду
+    const float hold = std::max(hvh::config.view.dormantTime - 1.0f, 0.0f);
+    const float alpha = std::clamp(1.0f - (memory.globalVars->realtime - lastContactTime - 0.25f - hold) / 1.0f, 0.0f, 1.0f);
+    return dormant ? alpha * 0.6f : alpha;
 }
 
 WeaponData::WeaponData(const OtherInterfaces& interfaces, const csgo::Entity& entity) noexcept : BaseData{ entity }

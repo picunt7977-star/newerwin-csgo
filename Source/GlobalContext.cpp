@@ -1,3 +1,8 @@
+#include "Hacks/HvH/GrenadePrediction.h"
+#include "Hacks/HvH/Movement.h"
+#include "Hacks/HvH/Ragebot.h"
+#include "Hacks/HvH/HvhGui.h"
+#include "Hacks/HvH/Tickbase.h"
 #include "GlobalContext.h"
 
 #if IS_WIN32()
@@ -123,6 +128,10 @@ void GlobalContext::renderFrame()
         features->visuals.hitMarker(nullptr, ImGui::GetBackgroundDrawList());
         features->visuals.drawMolotovHull(ImGui::GetBackgroundDrawList());
         features->misc.watermark();
+        hvh::gui::drawIndicators(ImGui::GetBackgroundDrawList());
+        hvh::movement::draw(ImGui::GetBackgroundDrawList());
+        hvh::ragebot::drawLogs(ImGui::GetBackgroundDrawList());
+        hvh::grenade::draw(ImGui::GetBackgroundDrawList());
 
         features->aimbot.updateInput(*config);
         features->visuals.updateInput();
@@ -131,6 +140,7 @@ void GlobalContext::renderFrame()
         Triggerbot::updateInput(*config);
         features->chams.updateInput();
         features->glow.updateInput();
+        hvh::gui::updateInput();
 
         gui->handleToggle(features->misc, getOtherInterfaces());
 
@@ -183,4 +193,7 @@ void GlobalContext::initialize()
 
     gui.emplace();
     hooks->install();
+#if IS_LINUX()
+    hvh::tickbase::install(engineDll.getCodeSection().raw());
+#endif
 }

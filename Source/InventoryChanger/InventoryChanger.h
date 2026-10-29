@@ -97,6 +97,10 @@ public:
     void reset(const Memory& memory);
 
     void drawGUI(const Memory& memory, bool contentOnly);
+    // скинченджер: оружие слева, сетка скинов с иконками справа, клик — выдать и надеть
+    void drawSkinChanger(const Memory& memory);
+    // предпросмотр в меню: модель выбранного агента
+    void updatePreviewAgent(const Memory& memory);
 
     void run(const Memory& memory, csgo::FrameStage frameStage) noexcept;
     void scheduleHudUpdate() noexcept;

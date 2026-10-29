@@ -2,6 +2,8 @@
 
 #include <Utils/Pad.h>
 
+#include "Vector.h"
+
 namespace csgo
 {
 
@@ -9,7 +11,10 @@ struct ViewSetup {
     PAD(172);
     void* csm;
     float fov;
-    PAD(32);
+    float fovViewmodel;
+    Vector origin;
+    Vector angles;
+    float nearZ;
     float farZ;
 };
 

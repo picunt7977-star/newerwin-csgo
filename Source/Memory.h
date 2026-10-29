@@ -1,11 +1,13 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
 
 #include "CSGO/Constants/DllNames.h"
+#include "CSGO/AnimState.h"
 #include "CSGO/Functions.h"
 #include "CSGO/ItemSchema.h"
 #include "CSGO/LocalPlayer.h"
@@ -99,6 +101,8 @@ public:
     csgo::ConColorMsg conColorMsg;
     csgo::EquipWearable equipWearable;
     int* predictionRandomSeed;
+    const std::byte* invalidateBoneCache;
+    csgo::UpdateAnimationState updateAnimationState;
     csgo::MoveData* moveData;
     csgo::WeaponSystem weaponSystem;
     csgo::GetEventDescriptor getEventDescriptor;
@@ -160,6 +164,8 @@ inline Memory::Memory(const ClientPatternFinder& clientPatternFinder, const Engi
     drawScreenEffectMaterial{ clientPatternFinder.drawScreenEffectMaterial() },
     equipWearable{ clientPatternFinder.equipWearable() },
     predictionRandomSeed{ clientPatternFinder.predictionRandomSeed() },
+    invalidateBoneCache{ clientPatternFinder.invalidateBoneCache() },
+    updateAnimationState{ clientPatternFinder.updateAnimationState() },
     moveData{ clientPatternFinder.moveData() },
     weaponSystem{ csgo::WeaponSystem::from(retSpoofGadgets.client, clientPatternFinder.weaponSystem()) },
     getEventDescriptor{ enginePatternFinder.getEventDescriptor() },
@@ -181,6 +187,15 @@ inline Memory::Memory(const ClientPatternFinder& clientPatternFinder, const Engi
     , shouldDrawFogReturnAddress{ clientPatternFinder.shouldDrawFog() }
 #endif
 {
+#if IS_LINUX()
+    // Офсет animstate берём только из разобранного кода: если паттерн не нашёлся (игра обновилась),
+    // лучше выключить всё, что читает animstate, чем лезть по старому офсету в чужую память.
+    const int animState = clientPatternFinder.animStateOffset();
+    csgo::animStateOffset = animState > 0x100 && animState < 0x20000 ? animState : 0;
+    const int animOverlay = clientPatternFinder.animOverlayOffset();
+    csgo::animOverlayOffset = animOverlay > 0x100 && animOverlay < 0x20000 ? animOverlay : 0;
+#endif
+
     const DynamicLibrary tier0{ csgo::TIER0_DLL };
     debugMsg = tier0.getFunctionAddress("Msg").template as<decltype(debugMsg)>();
 

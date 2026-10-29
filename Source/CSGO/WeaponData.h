@@ -53,7 +53,9 @@ struct WeaponInfo {
     PAD(WIN32_LINUX(15, 23));
     float maxSpeed;
     float maxSpeedAlt;
-    PAD(100);
+    float spread;           // разброс оружия (GetSpread), Alt — во втором режиме (скоуп)
+    float spreadAlt;
+    PAD(92);
     float recoilMagnitude;
     float recoilMagnitudeAlt;
     PAD(16);

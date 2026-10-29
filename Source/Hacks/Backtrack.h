@@ -52,8 +52,8 @@ public:
         configurator("Time limit", timeLimit).def(200);
     }
 
-private:
     float getLerp() noexcept;
+private:
 
     struct Cvars {
         csgo::ConVar updateRate;

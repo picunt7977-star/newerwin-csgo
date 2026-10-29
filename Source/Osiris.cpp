@@ -15,9 +15,15 @@
 
 #if IS_LINUX()
 #include <signal.h>
+#include <chrono>
+#include <cstdio>
+#include <thread>
+#include <dlfcn.h>
 #endif
 
 #include "GlobalContext.h"
+#include "InsecureGate.h"
+#include "CSGO/Constants/DllNames.h"
 #include "Hooks.h"
 
 namespace
@@ -55,6 +61,10 @@ BOOL APIENTRY DllEntryPoint(HMODULE moduleHandle, DWORD reason, LPVOID reserved)
         return FALSE;
 
     if (reason == DLL_PROCESS_ATTACH) {
+        if (!insecure_gate::allowed()) {
+            MessageBoxA(nullptr, "Запусти CS:GO с параметром -insecure", "csgo-hvh", MB_OK);
+            return FALSE;
+        }
         std::setlocale(LC_CTYPE, ".utf8");
         initializeGlobalContext(moduleHandle);
     }
@@ -78,9 +88,41 @@ void WindowsPlatformApi::debugBreak() noexcept
 
 #elif IS_LINUX()
 
+static bool isLoaded(const char* lib) noexcept
+{
+    if (void* handle = ::dlopen(lib, RTLD_NOW | RTLD_NOLOAD)) {
+        ::dlclose(handle);
+        return true;
+    }
+    return false;
+}
+
 void __attribute__((constructor)) DllEntryPoint()
 {
-    initializeGlobalContext();
+    if (!insecure_gate::isGameProcess())
+        return;
+
+    if (!insecure_gate::allowed()) {
+        std::fputs("[csgo-hvh] нет -insecure в параметрах запуска, чит не загружен\n", stderr);
+        return;
+    }
+
+    // Загружены уже в главное меню (gdb) — стартуем сразу
+    if (isLoaded("libSDL2-2.0.so.0") && isLoaded(csgo::CLIENT_DLL)) {
+        initializeGlobalContext();
+        return;
+    }
+
+    // LD_PRELOAD: игра ещё не подгрузила модули, ждём client и SDL
+    std::thread{ [] {
+        // panorama грузится после инициализации client — к этому моменту ClientMode и интерфейсы уже живы
+        while (!isLoaded("libSDL2-2.0.so.0") || !isLoaded(csgo::CLIENT_DLL)
+               || !(isLoaded("panorama_client.so") || isLoaded("panorama_gl_client.so")))
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        // даём движку дойти до меню, сам init произойдёт в хуке SDL_PollEvent на главном потоке
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        initializeGlobalContext();
+    } }.detach();
 }
 
 void* LinuxPlatformApi::dlopen(const char* file, int mode) noexcept

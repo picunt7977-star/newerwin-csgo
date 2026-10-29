@@ -1014,7 +1014,8 @@ static void generateReportString(StringBuilder& builder)
 
 void Misc::runReportbot() noexcept
 {
-    if (!miscConfig.reportbot.enabled)
+    // репортбот выключен насовсем: жалобы уходят на живых игроков
+    if (true)
         return;
 
     if (!localPlayer)
@@ -1523,31 +1524,6 @@ void Misc::drawGUI(Visuals& visuals, inventory_changer::InventoryChanger& invent
     }
     ImGui::PopID();
 
-    ImGui::Checkbox("Reportbot", &miscConfig.reportbot.enabled);
-    ImGui::SameLine();
-    ImGui::PushID("Reportbot");
-
-    if (ImGui::Button("..."))
-        ImGui::OpenPopup("");
-
-    if (ImGui::BeginPopup("")) {
-        ImGui::PushItemWidth(80.0f);
-        ImGui::Combo("Target", &miscConfig.reportbot.target, "Enemies\0Allies\0All\0");
-        ImGui::InputInt("Delay (s)", &miscConfig.reportbot.delay);
-        miscConfig.reportbot.delay = (std::max)(miscConfig.reportbot.delay, 1);
-        ImGui::InputInt("Rounds", &miscConfig.reportbot.rounds);
-        miscConfig.reportbot.rounds = (std::max)(miscConfig.reportbot.rounds, 1);
-        ImGui::PopItemWidth();
-        ImGui::Checkbox("Abusive Communications", &miscConfig.reportbot.textAbuse);
-        ImGui::Checkbox("Griefing", &miscConfig.reportbot.griefing);
-        ImGui::Checkbox("Wall Hacking", &miscConfig.reportbot.wallhack);
-        ImGui::Checkbox("Aim Hacking", &miscConfig.reportbot.aimbot);
-        ImGui::Checkbox("Other Hacking", &miscConfig.reportbot.other);
-        if (ImGui::Button("Reset"))
-            Misc::resetReportbot();
-        ImGui::EndPopup();
-    }
-    ImGui::PopID();
 
     if (ImGui::Button("Unhook"))
         unhook = true;

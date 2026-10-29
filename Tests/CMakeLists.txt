@@ -13,6 +13,7 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(Tests GlobalContextInstance.cpp HelpersTests.cpp SortFilterTests.cpp)
 add_subdirectory(HelpersTests)
+add_subdirectory(HvH)
 add_subdirectory(InventoryChanger)
 add_subdirectory(MemoryAllocation)
 add_subdirectory(MemorySearchTests)

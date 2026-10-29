@@ -531,7 +531,7 @@ void StreamProofESP::render(const Memory& memory, Config& config) noexcept
         renderProjectileEsp(memory, config, projectile, config.streamProofESP.projectiles["All"], config.streamProofESP.projectiles[projectile.name], projectile.name);
 
     for (const auto& player : GameData::players()) {
-        if ((player.dormant && player.fadingAlpha(memory) == 0.0f) || !player.alive || !player.inViewFrustum)
+        if ((player.dormant && player.fadingAlpha(memory) == 0.0f) || !player.alive || (!player.inViewFrustum && !player.dormant))
             continue;
 
         auto& playerConfig = player.enemy ? config.streamProofESP.enemies : config.streamProofESP.allies;

@@ -110,6 +110,7 @@ private:
     PostProcessingDisabler postProcessingDisabler;
     ScopeOverlayRemover scopeOverlayRemover;
     ReturnAddress cameraThink;
+    ReturnAddress cameraThinkHooked;
     BulletTracers bulletTracers;
 
 #if IS_WIN32()

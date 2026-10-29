@@ -1,3 +1,4 @@
+#include "HvH/HvhConfig.h"
 #include <array>
 #include <cstring>
 #include <string_view>
@@ -46,7 +47,7 @@ struct VisualsConfig {
     KeyBindToggle zoomKey;
     bool thirdperson{ false };
     KeyBindToggle thirdpersonKey;
-    int thirdpersonDistance{ 0 };
+    int thirdpersonDistance{ 150 };
     int viewmodelFov{ 0 };
     int fov{ 0 };
     int farZ{ 0 };
@@ -118,7 +119,8 @@ Visuals::Visuals(const Memory& memory, OtherInterfaces interfaces, ClientInterfa
     postProcessingDisabler{ clientPatternFinder.disablePostProcessing() },
     scopeOverlayRemover{ clientPatternFinder.scopeDust(), clientPatternFinder.scopeArc(), clientPatternFinder.vignette() },
     bulletTracers{ csgo::ViewRenderBeams::from(retSpoofGadgets->client, clientPatternFinder.viewRenderBeams()), clientInterfaces.getEntityList(), engineInterfaces.getEngine(), memory.globalVars },
-    cameraThink{ clientPatternFinder.cameraThink() }
+    cameraThink{ clientPatternFinder.cameraThink() },
+    cameraThinkHooked{ clientPatternFinder.cameraThinkHooked() }
 #if IS_WIN32()
     , maxFlashAlphaProxy{ retSpoofGadgets->client, clientPatternFinder.maxFlashAlphaProxy() }
 #endif
@@ -215,7 +217,12 @@ void Visuals::thirdperson() noexcept
         return;
 
     memory.input->isCameraInThirdPerson = (!visualsConfig.thirdpersonKey.isSet() || visualsConfig.thirdpersonKey.isToggled()) && localPlayer && localPlayer.get().isAlive();
-    memory.input->cameraOffset.z = static_cast<float>(visualsConfig.thirdpersonDistance); 
+    if (static const bool debug = std::getenv("ECLIPSE_DEBUG"); debug) {
+        static int frame = 0;
+        if (++frame % 300 == 1)
+            std::fprintf(stderr, "[eclipse] thirdperson: input=%p flag=%d alive=%d cameraThink=%p\n", static_cast<void*>(memory.input), memory.input->isCameraInThirdPerson, localPlayer && localPlayer.get().isAlive(), *reinterpret_cast<const void* const*>(&cameraThink));
+    }
+    memory.input->cameraOffset.z = static_cast<float>(visualsConfig.thirdpersonDistance > 0 ? visualsConfig.thirdpersonDistance : 150);
 }
 
 void Visuals::removeVisualRecoil(csgo::FrameStage stage) noexcept
@@ -242,13 +249,15 @@ void Visuals::removeVisualRecoil(csgo::FrameStage stage) noexcept
     }
 }
 
+[[nodiscard]] static bool hideScope() noexcept;
+
 void Visuals::removeBlur(csgo::FrameStage stage) noexcept
 {
     if (stage != csgo::FrameStage::RENDER_START && stage != csgo::FrameStage::RENDER_END)
         return;
 
     static auto blur = csgo::Material::from(retSpoofGadgets->client, interfaces.getMaterialSystem().findMaterial("dev/scope_bluroverlay"));
-    blur.setMaterialVarFlag(MaterialVarFlag::NO_DRAW, stage == csgo::FrameStage::RENDER_START && noBlur);
+    blur.setMaterialVarFlag(MaterialVarFlag::NO_DRAW, stage == csgo::FrameStage::RENDER_START && (noBlur || hideScope()));
 }
 
 void Visuals::updateBrightness() noexcept
@@ -524,20 +533,28 @@ void Visuals::drawMolotovHull(ImDrawList* drawList) noexcept
     }
 }
 
+[[nodiscard]] static bool hideScope() noexcept
+{
+    return hvh::config.view.removeScopeZoom && localPlayer && localPlayer.get().isAlive() && localPlayer.get().isScoped();
+}
+
 void Visuals::setDrawColorHook(ReturnAddress hookReturnAddress, int& alpha) const noexcept
 {
-    scopeOverlayRemover.setDrawColorHook(hookReturnAddress, alpha);
+    if (hideScope())
+        scopeOverlayRemover.hideWholeScope(hookReturnAddress, alpha);
+    else
+        scopeOverlayRemover.setDrawColorHook(hookReturnAddress, alpha);
 }
 
 void Visuals::updateColorCorrectionWeightsHook() const noexcept
 {
     colorCorrection.run(memory.clientMode);
-    scopeOverlayRemover.updateColorCorrectionWeightsHook();
+    scopeOverlayRemover.updateColorCorrectionWeightsHook(hideScope());
 }
 
 bool Visuals::svCheatsGetBoolHook(ReturnAddress hookReturnAddress) const noexcept
 {
-    return visualsConfig.thirdperson && hookReturnAddress == cameraThink;
+    return visualsConfig.thirdperson && (hookReturnAddress == cameraThink || hookReturnAddress == cameraThinkHooked);
 }
 
 bool Visuals::renderSmokeOverlayHook() const noexcept

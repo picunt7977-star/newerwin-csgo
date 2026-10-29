@@ -3,6 +3,7 @@
 #include <functional>
 #include <string>
 
+#include "AnimationLayer.h"
 #include "AnimState.h"
 #include "Vector.h"
 #include "VirtualMethod.h"
@@ -113,6 +114,7 @@ struct Entity : GameClass<Entity, EntityPOD> {
     VIRTUAL_METHOD_V(CollideablePOD*, getCollideable, 3, (), ())
 
     VIRTUAL_METHOD(const Vector&, getAbsOrigin, WIN32_LINUX(10, 12), (), ())
+    VIRTUAL_METHOD(const Vector&, getAbsAngle, WIN32_LINUX(11, 13), (), ())
     VIRTUAL_METHOD(void, setModelIndex, WIN32_LINUX(75, 111), (int index), (index))
     VIRTUAL_METHOD(bool, getAttachment, WIN32_LINUX(84, 122), (int index, Vector& origin), (index, &origin))
     VIRTUAL_METHOD(Team, getTeamNumber, WIN32_LINUX(88, 128), (), ())
@@ -185,11 +187,32 @@ struct Entity : GameClass<Entity, EntityPOD> {
 
     AnimState* getAnimstate() const noexcept
     {
-#if IS_WIN32()
-        return *reinterpret_cast<AnimState**>(getThis() + 0x3914);
-#else
-        return nullptr;
-#endif
+        if (animStateOffset <= 0)
+            return nullptr;
+        return *reinterpret_cast<AnimState**>(getThis() + animStateOffset);
+    }
+
+    // m_AnimOverlay: сетевые слои анимации, CUtlVector<CAnimationLayer>. Офсет — из GetAnimOverlay
+    // (linux) или recv-таблицы, без запасного значения: лезть по чужому офсету дороже, чем остаться без слоёв.
+    [[nodiscard]] AnimationLayerVector* animOverlayVector() const noexcept
+    {
+        // на linux офсет из кода игры: в recv-таблице у CUtlVector смещение 0, и слоёв «не было» никогда
+        const auto offset = animOverlayOffset > 0 ? animOverlayOffset : WIN32_LINUX(Netvars::get(fnv::hash("CCSPlayer->m_AnimOverlay")), 0);
+        if (!offset)
+            return nullptr;
+        return reinterpret_cast<AnimationLayerVector*>(getThis() + offset);
+    }
+
+    [[nodiscard]] AnimationLayer* animOverlays() const noexcept
+    {
+        const auto vector = animOverlayVector();
+        return vector ? vector->memory : nullptr;
+    }
+
+    [[nodiscard]] int animOverlayCount() const noexcept
+    {
+        const auto vector = animOverlayVector();
+        return vector ? vector->size : 0;
     }
 
     float getMaxDesyncAngle() const noexcept;
@@ -215,9 +238,11 @@ struct Entity : GameClass<Entity, EntityPOD> {
 
     NETVAR2(body, "CBaseAnimating", "m_nBody", int)
     NETVAR2(hitboxSet, "CBaseAnimating", "m_nHitboxSet", int)
+    NETVAR2(poseParameters, "CBaseAnimating", "m_flPoseParameter", float[24])
 
     NETVAR2(modelIndex, "CBaseEntity", "m_nModelIndex", unsigned)
     NETVAR2(origin, "CBaseEntity", "m_vecOrigin", Vector)
+    NETVAR2(angRotation, "CBaseEntity", "m_angRotation", Vector)
     NETVAR_OFFSET2(moveType, "CBaseEntity", "m_nRenderMode", 1, MoveType)
     NETVAR2(simulationTime, "CBaseEntity", "m_flSimulationTime", float)
     NETVAR2(ownerEntity, "CBaseEntity", "m_hOwnerEntity", int)
@@ -236,6 +261,8 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(aimPunchAngle, "CBasePlayer", "m_aimPunchAngle", Vector)
     NETVAR2(viewPunchAngle, "CBasePlayer", "m_viewPunchAngle", Vector)
     NETVAR2(velocity, "CBasePlayer", "m_vecVelocity[0]", Vector)
+    NETVAR2(viewOffset, "CBasePlayer", "m_vecViewOffset[0]", Vector)
+    NETVAR_OFFSET2(renderAngles, "CBasePlayer", "deadflag", 4, Vector)
     NETVAR2(lastPlaceName, "CBasePlayer", "m_szLastPlaceName", char[18])
 
     NETVAR2(armor, "CCSPlayer", "m_ArmorValue", int)
@@ -255,6 +282,10 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(waitForNoAttack, "CCSPlayer", "m_bWaitForNoAttack", bool)
     NETVAR2(playerPatchIndices, "CCSPlayer", "m_vecPlayerPatchEconIndices", int[5])
 
+    NETVAR2(pinPulled, "CBaseCSGrenade", "m_bPinPulled", bool)
+    NETVAR2(throwStrength, "CBaseCSGrenade", "m_flThrowStrength", float)
+    NETVAR2(throwTime, "CBaseCSGrenade", "m_fThrowTime", float)
+
     NETVAR2(viewModelIndex, "CBaseCombatWeapon", "m_iViewModelIndex", int)
     NETVAR2(worldModelIndex, "CBaseCombatWeapon", "m_iWorldModelIndex", int)
     NETVAR2(worldDroppedModelIndex, "CBaseCombatWeapon", "m_iWorldDroppedModelIndex", int)
@@ -262,6 +293,12 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(clip, "CBaseCombatWeapon", "m_iClip1", int)
     NETVAR2(reserveAmmoCount, "CBaseCombatWeapon", "m_iPrimaryReserveAmmoCount", int)
     NETVAR2(nextPrimaryAttack, "CBaseCombatWeapon", "m_flNextPrimaryAttack", float)
+    // CS-оружие: режим (1 — второй, у снайперок в скоупе), время последнего выстрела, индекс отдачи
+    NETVAR2(weaponMode, "CWeaponCSBase", "m_weaponMode", int)
+    NETVAR2(lastShotTime, "CWeaponCSBase", "m_fLastShotTime", float)
+    NETVAR2(recoilIndex, "CWeaponCSBase", "m_iRecoilIndex", int)
+    // револьвер: когда барабан взведётся и зажатый ЛКМ станет выстрелом
+    NETVAR2(postponeFireReadyTime, "CWeaponCSBase", "m_flPostponeFireReadyTime", float)
 
     NETVAR2(nextAttack, "CBaseCombatCharacter", "m_flNextAttack", float)
 
@@ -274,6 +311,10 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(econItemView, "CBaseAttributableItem", "m_Item", EconItemViewPOD)
     NETVAR2(originalOwnerXuidLow, "CBaseAttributableItem", "m_OriginalOwnerXuidLow", std::uint32_t)
     NETVAR2(originalOwnerXuidHigh, "CBaseAttributableItem", "m_OriginalOwnerXuidHigh", std::uint32_t)
+    NETVAR2(fallbackPaintKit, "CBaseAttributableItem", "m_nFallbackPaintKit", int)
+    NETVAR2(fallbackSeed, "CBaseAttributableItem", "m_nFallbackSeed", int)
+    NETVAR2(fallbackWear, "CBaseAttributableItem", "m_flFallbackWear", float)
+    NETVAR2(fallbackStatTrak, "CBaseAttributableItem", "m_nFallbackStatTrak", int)
 
     NETVAR2(owner, "CBaseViewModel", "m_hOwner", int)
     NETVAR2(weapon, "CBaseViewModel", "m_hWeapon", int)

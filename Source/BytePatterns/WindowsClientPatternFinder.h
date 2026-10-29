@@ -63,6 +63,11 @@ struct WindowsClientPatternFinder {
         return finder("85 C0 75 30 38 87"_pat).as<ReturnAddress>();
     }
 
+    [[nodiscard]] ReturnAddress cameraThinkHooked() const noexcept
+    {
+        return cameraThink();
+    }
+
     [[nodiscard]] csgo::KeyValuesFindKey keyValuesFindKey() const noexcept
     {
         return finder("E8 ? ? ? ? F7 45"_pat).add(1).abs().as<csgo::KeyValuesFindKey>();
@@ -296,6 +301,22 @@ struct WindowsClientPatternFinder {
     [[nodiscard]] csgo::EquipWearable equipWearable() const noexcept
     {
         return finder("55 8B EC 83 EC 10 53 8B 5D 08 57 8B F9"_pat).as<csgo::EquipWearable>();
+    }
+
+    // пересборка анимации рейджбота сделана только под Linux
+    [[nodiscard]] const std::byte* invalidateBoneCache() const noexcept
+    {
+        return nullptr;
+    }
+
+    [[nodiscard]] csgo::UpdateAnimationState updateAnimationState() const noexcept
+    {
+        return nullptr;
+    }
+
+    [[nodiscard]] int animStateOffset() const noexcept
+    {
+        return 0;
     }
 
     [[nodiscard]] int* predictionRandomSeed() const noexcept

@@ -74,6 +74,8 @@
 #include "WeaponNames.h"
 
 #include <SortFilter.h>
+#include <Hacks/HvH/HvhConfig.h>
+#include <Hacks/HvH/ModelPreview.h>
 
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/OtherInterfaces.h>
@@ -311,6 +313,235 @@ static void applyWeapons(const inventory_changer::InventoryChanger& inventoryCha
         weapon.itemIDHigh() = std::uint32_t(static_cast<csgo::ItemId>(*itemID) >> 32);
         weapon.itemIDLow() = std::uint32_t(static_cast<csgo::ItemId>(*itemID) & 0xFFFFFFFF);
     }
+}
+
+// ---------- свой скинченджер на fallback-полях: игре не нужен инвентарь/GC (в legacy-версии его нет) ----------
+
+static const char* displayModelOf(const Memory& memory, WeaponId id, bool world) noexcept
+{
+    const auto def = csgo::ItemSchema::from(retSpoofGadgets->client, memory.itemSystem().getItemSchema()).getItemDefinitionInterface(id);
+    if (!def)
+        return nullptr;
+    const auto definition = csgo::EconItemDefinition::from(retSpoofGadgets->client, def);
+    return world ? definition.getWorldDisplayModel() : definition.getPlayerDisplayModel();
+}
+
+static int modelIndexOf(const EngineInterfaces& engineInterfaces, const Memory& memory, WeaponId id, bool world) noexcept
+{
+    const auto model = displayModelOf(memory, id, world);
+    return model ? engineInterfaces.getModelInfo().getModelIndex(model) : -1;
+}
+
+// Модель ставим только если она реально другая. Повторная запись того же modelIndex каждый кадр
+// заставляет движок заново собирать материалы предмета, а для ножа — ругаться в консоль
+// «Failed to set custom material ... no matching material name found on model w_knife_default_ct.mdl»:
+// custom material ножа (knife_bayonet и т.п.) не подходит к дефолтной модели, которая ещё стоит.
+static bool setModelIfChanged(const csgo::Entity& entity, const EngineInterfaces& engineInterfaces,
+    const Memory& memory, WeaponId id, bool world) noexcept
+{
+    const int index = modelIndexOf(engineInterfaces, memory, id, world);
+    if (index == -1)
+        return false;
+    if (static_cast<int>(entity.modelIndex()) != index)
+        entity.setModelIndex(index);
+    return true;
+}
+
+static void writeFallback(const csgo::Entity& item, const hvh::SkinEntry& skin, int accountID) noexcept
+{
+    // itemIDHigh = -1: игра не ищет предмет в инвентаре и берёт скин из fallback-полей
+    item.itemIDHigh() = 0xFFFFFFFF;
+    item.accountID() = accountID;
+    item.fallbackPaintKit() = skin.paintKit;
+    item.fallbackSeed() = skin.seed;
+    item.fallbackWear() = std::max(skin.wear, 0.0001f);
+    item.fallbackStatTrak() = skin.statTrak;
+}
+
+[[nodiscard]] static int localAccountID(const EngineInterfaces& engineInterfaces, const csgo::Entity& local) noexcept
+{
+    return static_cast<int>(local.getSteamId(engineInterfaces.getEngine()) & 0xFFFFFFFF);
+}
+
+// Оружие, у которого сменился скин: материал со скином игра строит только при создании оружия,
+// поэтому сбрасываем ему материалы и прогоняем «создание» заново (как у перчаток). Делаем в RENDER_START.
+struct AppliedSkin {
+    WeaponId definition{};
+    int paintKit = 0;
+    int seed = 0;
+    float wear = 0.0f;
+    int statTrak = -1;
+    bool operator==(const AppliedSkin&) const = default;
+};
+static std::unordered_map<int, AppliedSkin> appliedSkins;  // по хэндлу оружия
+static std::vector<int> weaponsToRefresh;
+
+static void refreshWeaponMaterials(const ClientInterfaces& clientInterfaces) noexcept
+{
+    for (const int handle : weaponsToRefresh) {
+        const auto weapon = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(handle));
+        if (weapon.getPOD() == nullptr)
+            continue;
+        // FIXME: как и у перчаток Osiris — старые материалы не освобождаются
+        weapon.econItemView().visualDataProcessors().size = 0;
+        weapon.econItemView().customMaterials().size = 0;
+        weapon.getNetworkable().postDataUpdate(0);
+        weapon.getNetworkable().onDataChanged(0);
+    }
+    weaponsToRefresh.clear();
+}
+
+static void applyFallbackWeapons(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, const csgo::Entity& local) noexcept
+{
+    const auto& skins = hvh::config.skins;
+    const int accountID = localAccountID(engineInterfaces, local);
+
+    for (auto& weapons = local.weapons(); auto weaponHandle : weapons) {
+        if (weaponHandle == -1)
+            break;
+
+        const auto weapon = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(weaponHandle));
+        if (weapon.getPOD() == nullptr)
+            continue;
+
+        auto& definitionIndex = weapon.itemDefinitionIndex();
+        const bool knife = Helpers::isKnife(definitionIndex);
+        if (knife && skins.knife != 0) {
+            const auto knifeID = static_cast<WeaponId>(skins.knife);
+            if (definitionIndex != knifeID) {
+                // Сначала мировая модель (это мировой entity оружия, не вьюмодель). Если модели нет —
+                // нож не трогаем: иначе движок оставит дефолтный w_knife_default_ct и будет каждый кадр
+                // ругаться на custom material нового ножа.
+                const int index = modelIndexOf(engineInterfaces, memory, knifeID, true);
+                if (index == -1)
+                    continue;
+                definitionIndex = knifeID;
+                if (static_cast<int>(weapon.modelIndex()) != index) {
+                    weapon.setModelIndex(index);
+                    weapon.getNetworkable().preDataUpdate(0);
+                }
+            }
+            weapon.entityQuality() = 3;
+        }
+
+        const auto it = skins.weapons.find(static_cast<int>(definitionIndex));
+        const bool hasSkin = it != skins.weapons.end() && it->second.paintKit > 0;
+        if (hasSkin)
+            writeFallback(weapon, it->second, accountID);
+        else if (knife && skins.knife != 0)
+            writeFallback(weapon, {}, accountID);  // нож без раскраски («ванильный»)
+
+        if (hasSkin && !knife)
+            weapon.entityQuality() = it->second.statTrak >= 0 ? 9 : 0;
+
+        // скин поменялся (или оружие новое) — перестроить материал
+        if (hasSkin || (knife && skins.knife != 0)) {
+            const auto& skin = hasSkin ? it->second : hvh::SkinEntry{};
+            const AppliedSkin wanted{ definitionIndex, skin.paintKit, skin.seed, skin.wear, skin.statTrak };
+            if (auto& applied = appliedSkins[weaponHandle]; !(applied == wanted)) {
+                applied = wanted;
+                weaponsToRefresh.push_back(weaponHandle);
+            }
+        }
+    }
+
+    if (skins.knife == 0)
+        return;
+
+    // модель ножа в руках и в мире
+    const auto viewModel = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(local.viewModel()));
+    if (viewModel.getPOD() == nullptr)
+        return;
+    const auto viewModelWeapon = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(viewModel.weapon()));
+    if (viewModelWeapon.getPOD() == nullptr || !Helpers::isKnife(viewModelWeapon.itemDefinitionIndex()))
+        return;
+    // только при смене модели: та же запись каждый кадр пересобирает материалы и спамит консоль
+    setModelIfChanged(viewModel, engineInterfaces, memory, viewModelWeapon.itemDefinitionIndex(), false);
+    const auto worldModel = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(viewModelWeapon.weaponWorldModel()));
+    if (worldModel.getPOD() == nullptr)
+        return;
+    setModelIfChanged(worldModel, engineInterfaces, memory, viewModelWeapon.itemDefinitionIndex(), true);
+}
+
+static void applyFallbackGloves(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, const csgo::Entity& local) noexcept
+{
+    const auto& skins = hvh::config.skins;
+    if (skins.gloves == 0 || !local.isAlive())
+        return;
+
+    const auto gloveID = static_cast<WeaponId>(skins.gloves);
+    const auto it = skins.weapons.find(skins.gloves);
+    const auto skin = it != skins.weapons.end() ? it->second : hvh::SkinEntry{};
+
+    const auto wearables = local.wearables();
+    static int gloveHandle = 0;
+
+    auto glovePtr = clientInterfaces.getEntityList().getEntityFromHandle(wearables[0]);
+    if (!glovePtr)
+        glovePtr = clientInterfaces.getEntityList().getEntityFromHandle(gloveHandle);
+    if (!glovePtr) {
+#if IS_WIN32()
+        glovePtr = createGloves(clientInterfaces, memory.memAlloc);
+#else
+        constexpr auto NUM_ENT_ENTRIES = 8192;
+        glovePtr = createGlove(clientInterfaces, NUM_ENT_ENTRIES - 1, -1);
+#endif
+    }
+    if (!glovePtr)
+        return;
+
+    const auto glove = csgo::Entity::from(retSpoofGadgets->client, glovePtr);
+    wearables[0] = gloveHandle = glove.handle();
+    glove.entityQuality() = 3;
+    local.body() = 1;
+
+    bool dataUpdated = false;
+    if (auto& definitionIndex = glove.itemDefinitionIndex(); definitionIndex != gloveID) {
+        definitionIndex = gloveID;
+        if (const int index = modelIndexOf(engineInterfaces, memory, gloveID, true); index != -1)
+            glove.setModelIndex(index);
+        dataUpdated = true;
+    }
+    if (glove.itemIDHigh() != 0xFFFFFFFF || glove.fallbackPaintKit() != skin.paintKit || glove.fallbackSeed() != skin.seed || glove.fallbackWear() != std::max(skin.wear, 0.0001f))
+        dataUpdated = true;
+    writeFallback(glove, skin, localAccountID(engineInterfaces, local));
+
+    glove.initialized() = true;
+    memory.equipWearable(glove.getPOD(), local.getPOD());
+
+    if (dataUpdated) {
+        // FIXME: как и у Osiris — старые материалы не освобождаются
+        glove.econItemView().visualDataProcessors().size = 0;
+        glove.econItemView().customMaterials().size = 0;
+        glove.getNetworkable().postDataUpdate(0);
+        glove.getNetworkable().onDataChanged(0);
+    }
+}
+
+static void applyFallbackAgent(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, const csgo::Entity& local) noexcept
+{
+    const auto team = local.getTeamNumber();
+    const int agent = team == csgo::Team::TT ? hvh::config.skins.agentT : team == csgo::Team::CT ? hvh::config.skins.agentCT : 0;
+    if (agent == 0)
+        return;
+    const int index = modelIndexOf(engineInterfaces, memory, static_cast<WeaponId>(agent), false);
+    if (index == -1)
+        return;
+    local.setModelIndex(index);
+    if (const auto ragdoll = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(local.ragdoll())); ragdoll.getPOD() != nullptr)
+        ragdoll.setModelIndex(index);
+}
+
+// для предпросмотра в меню: модель выбранного агента (вне игры — за T, если выбран)
+static void previewAgent(const EngineInterfaces& engineInterfaces, const Memory& memory) noexcept
+{
+    const auto& skins = hvh::config.skins;
+    int agent = skins.agentT != 0 ? skins.agentT : skins.agentCT;
+    if (engineInterfaces.getEngine().isInGame() && localPlayer)
+        agent = localPlayer.get().getTeamNumber() == csgo::Team::CT ? skins.agentCT : skins.agentT;
+
+    const char* model = agent != 0 ? displayModelOf(memory, static_cast<WeaponId>(agent), false) : nullptr;
+    hvh::preview::setMenuModel(model ? model : "");
 }
 
 static void onPostDataUpdateStart(const inventory_changer::InventoryChanger& inventoryChanger, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory, int localHandle) noexcept
@@ -1118,6 +1349,20 @@ void InventoryChanger::run(const Memory& memory, csgo::FrameStage stage) noexcep
     if (localPlayer)
         localPlayerHandle = localPlayer.get().handle();
 
+    if (!localPlayer) {
+        appliedSkins.clear();
+        weaponsToRefresh.clear();
+    }
+    if (localPlayer) {
+        if (stage == csgo::FrameStage::NET_UPDATE_POSTDATAUPDATE_START) {
+            applyFallbackWeapons(engineInterfaces, clientInterfaces, memory, localPlayer.get());
+            applyFallbackAgent(engineInterfaces, clientInterfaces, memory, localPlayer.get());
+        } else if (stage == csgo::FrameStage::RENDER_START) {
+            refreshWeaponMaterials(clientInterfaces);
+            applyFallbackGloves(engineInterfaces, clientInterfaces, memory, localPlayer.get());
+            applyFallbackAgent(engineInterfaces, clientInterfaces, memory, localPlayer.get());
+        }
+    }
     if (stage == csgo::FrameStage::NET_UPDATE_POSTDATAUPDATE_START) {
         onPostDataUpdateStart(*this, engineInterfaces, clientInterfaces, otherInterfaces, memory, localPlayerHandle);
         if (hudUpdateRequired && localPlayer && !localPlayer.get().getNetworkable().isDormant())
@@ -1461,7 +1706,7 @@ void InventoryChanger::fixKnifeAnimation(const csgo::Entity& viewModelWeapon, lo
     if (!Helpers::isKnife(viewModelWeapon.itemDefinitionIndex()))
         return;
 
-    if (const auto optionalItem = getItemFromLoadout(backend.getLoadout(), localPlayer.get().getTeamNumber(), 0); !optionalItem.has_value())
+    if (const auto optionalItem = getItemFromLoadout(backend.getLoadout(), localPlayer.get().getTeamNumber(), 0); !optionalItem.has_value() && hvh::config.skins.knife == 0)
         return;
 
     sequence = remapKnifeAnim(viewModelWeapon.itemDefinitionIndex(), sequence, randomGenerator);
@@ -1482,6 +1727,249 @@ void InventoryChanger::placePickEmPick(csgo::Tournament tournament, std::uint16_
 
     const auto tournamentTeam = getGameItemLookup().getStorage().getStickerKit(*sticker).tournamentTeam;
     backend.getPickEmHandler().pickSticker(backend::PickEm::PickPosition{ tournament, group, indexInGroup }, tournamentTeam);
+}
+
+}
+
+namespace inventory_changer
+{
+
+void InventoryChanger::updatePreviewAgent(const Memory& memory)
+{
+    previewAgent(engineInterfaces, memory);
+}
+
+void InventoryChanger::drawSkinChanger(const Memory& memory)
+{
+    using inventory_changer::game_items::Item;
+    const auto& storage = getGameItemLookup().getStorage();
+    const auto& weaponNames = inventory_changer::WeaponNames::instance(otherInterfaces, memory);
+
+    // оружие, у которого есть скины: ножи, перчатки, остальное — по алфавиту
+    struct WeaponEntry {
+        WeaponId id;
+        std::string name;
+        int group;
+    };
+    static std::vector<WeaponEntry> weapons;
+    if (weapons.empty()) {
+        std::vector<WeaponId> seen;
+        for (const auto& item : storage.getItems()) {
+            if (!item.isSkin() && !item.isGloves())
+                continue;
+            if (std::ranges::find(seen, item.getWeaponID()) != seen.end())
+                continue;
+            seen.push_back(item.getWeaponID());
+            weapons.push_back({ item.getWeaponID(), std::string{ weaponNames.getWeaponName(item.getWeaponID()) }, item.isGloves() ? 1 : Helpers::isKnife(item.getWeaponID()) ? 0 : 2 });
+        }
+        std::ranges::sort(weapons, [](const WeaponEntry& a, const WeaponEntry& b) { return a.group != b.group ? a.group < b.group : a.name < b.name; });
+    }
+    if (weapons.empty()) {
+        ImGui::TextUnformatted("Список предметов ещё не загружен");
+        return;
+    }
+
+    static WeaponId selected = weapons.front().id;
+    static auto agentsTab = csgo::Team::None; // None — показываем скины оружия
+    static std::string filter;
+
+    // команда агента — по пути модели (ctm_* = спецназ, tm_* = террористы)
+    const auto agentTeam = [&memory](const Item& gameItem) {
+        static std::unordered_map<const Item*, csgo::Team> cache;
+        if (const auto cached = cache.find(&gameItem); cached != cache.end())
+            return cached->second;
+        auto team = csgo::Team::None;
+        if (const char* model = displayModelOf(memory, gameItem.getWeaponID(), false))
+            team = std::string_view{ model }.find("/ctm_") != std::string_view::npos ? csgo::Team::CT : csgo::Team::TT;
+        cache.emplace(&gameItem, team);
+        return team;
+    };
+
+    auto& skins = hvh::config.skins;
+    const auto fullUpdate = [this] {
+        otherInterfaces.getCvar().findVar(csgo::cl_fullupdate)->changeCallback();
+    };
+
+    const auto isEquipped = [&](const Item& gameItem) {
+        const int id = static_cast<int>(gameItem.getWeaponID());
+        if (gameItem.isAgent())
+            return skins.agentT == id || skins.agentCT == id;
+        if (Helpers::isKnife(gameItem.getWeaponID()) && skins.knife != id)
+            return false;
+        if (gameItem.isGloves() && skins.gloves != id)
+            return false;
+        const auto it = skins.weapons.find(id);
+        return it != skins.weapons.end() && it->second.paintKit == storage.getPaintKit(gameItem).id;
+    };
+
+    const auto equip = [&](const Item& gameItem) {
+        const int id = static_cast<int>(gameItem.getWeaponID());
+        if (gameItem.isAgent()) {
+            (agentTeam(gameItem) == csgo::Team::CT ? skins.agentCT : skins.agentT) = id;
+            return;
+        }
+        skins.weapons[id].paintKit = storage.getPaintKit(gameItem).id;
+        if (Helpers::isKnife(gameItem.getWeaponID()))
+            skins.knife = id;
+        else if (gameItem.isGloves())
+            skins.gloves = id;
+        fullUpdate();
+    };
+
+    const auto avail = ImGui::GetContentRegionAvail();
+
+    // слева — оружие
+    ImGui::BeginChild("##weapons", { 190.0f, avail.y }, false);
+    static constexpr const char* groupNames[]{ "НОЖИ", "ПЕРЧАТКИ", "ОРУЖИЕ" };
+    int lastGroup = -1;
+    for (const auto& weapon : weapons) {
+        if (weapon.group != lastGroup) {
+            if (lastGroup != -1)
+                ImGui::Dummy({ 0.0f, 4.0f });
+            ImGui::TextDisabled("%s", groupNames[weapon.group]);
+            lastGroup = weapon.group;
+        }
+        ImGui::PushID(static_cast<int>(weapon.id));
+        if (ImGui::Selectable(weapon.name.c_str(), agentsTab == csgo::Team::None && selected == weapon.id)) {
+            selected = weapon.id;
+            agentsTab = csgo::Team::None;
+        }
+        ImGui::PopID();
+    }
+    ImGui::Dummy({ 0.0f, 4.0f });
+    ImGui::TextDisabled("АГЕНТЫ");
+    if (ImGui::Selectable("Террористы", agentsTab == csgo::Team::TT))
+        agentsTab = csgo::Team::TT;
+    if (ImGui::Selectable("Спецназ", agentsTab == csgo::Team::CT))
+        agentsTab = csgo::Team::CT;
+    ImGui::EndChild();
+
+    ImGui::SameLine(0.0f, 10.0f);
+
+    // справа — сетка скинов выбранного оружия (у агентов ещё и модель)
+    constexpr float agentPreviewWidth = 220.0f;
+    static int hoveredAgent = 0;
+    const int previewAgentID = hoveredAgent;
+    hoveredAgent = 0;
+    ImGui::BeginChild("##skins", { agentsTab != csgo::Team::None ? ImGui::GetContentRegionAvail().x - agentPreviewWidth - 10.0f : 0.0f, avail.y }, false);
+
+    // настройки выбранного: износ, сид, StatTrak, сброс
+    if (agentsTab == csgo::Team::None) {
+        const int id = static_cast<int>(selected);
+        auto& entry = skins.weapons[id];
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderFloat("Износ", &entry.wear, 0.0001f, 1.0f, "%.4f");
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            fullUpdate();
+        ImGui::SameLine(0.0f, 14.0f);
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::InputInt("Сид", &entry.seed, 0, 0, ImGuiInputTextFlags_EnterReturnsTrue))
+            fullUpdate();
+        ImGui::SameLine(0.0f, 14.0f);
+        bool statTrak = entry.statTrak >= 0;
+        if (ImGui::Checkbox("StatTrak", &statTrak)) {
+            entry.statTrak = statTrak ? 1337 : -1;
+            fullUpdate();
+        }
+        ImGui::SameLine(0.0f, 14.0f);
+        if (ImGui::Button("Сбросить")) {
+            skins.weapons.erase(id);
+            if (skins.knife == id)
+                skins.knife = 0;
+            if (skins.gloves == id)
+                skins.gloves = 0;
+            fullUpdate();
+        }
+    } else {
+        int& agent = agentsTab == csgo::Team::CT ? skins.agentCT : skins.agentT;
+        ImGui::TextDisabled(agent ? "Агент появится после респавна" : "Агент стандартный");
+        ImGui::SameLine(0.0f, 14.0f);
+        if (ImGui::Button("Сбросить"))
+            agent = 0;
+    }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##filter", "поиск скина…", &filter);
+    const std::wstring filterUpper{ Helpers::ToUpperConverter{}.toUpper(Helpers::toWideString(filter)) };
+
+    const ImVec2 cell{ 150.0f, 128.0f };
+    constexpr float spacing = 8.0f;
+    const int columns = std::max(1, static_cast<int>((ImGui::GetContentRegionAvail().x + spacing) / (cell.x + spacing)));
+
+    constexpr auto rarityColor = [](EconRarity rarity) noexcept {
+        constexpr auto colors = std::to_array<ImU32>({
+            IM_COL32(106,  97,  85, 255), IM_COL32(176, 195, 217, 255), IM_COL32( 94, 152, 217, 255), IM_COL32( 75, 105, 255, 255),
+            IM_COL32(136,  71, 255, 255), IM_COL32(211,  44, 230, 255), IM_COL32(235,  75,  75, 255), IM_COL32(228, 174,  57, 255)
+        });
+        return colors[static_cast<std::size_t>(rarity) < colors.size() ? static_cast<std::size_t>(rarity) : 0];
+    };
+
+    int index = 0;
+    for (const auto& item : storage.getItems()) {
+        if (agentsTab != csgo::Team::None) {
+            if (!item.isAgent() || agentTeam(item) != agentsTab)
+                continue;
+        } else if (item.getWeaponID() != selected || (!item.isSkin() && !item.isGloves())) {
+            continue;
+        }
+        const auto name = getItemName(storage, item);
+        if (!filterUpper.empty() && name.forSearch.find(filterUpper) == std::wstring_view::npos)
+            continue;
+
+        if (index % columns != 0)
+            ImGui::SameLine(0.0f, spacing);
+        ImGui::PushID(&item);
+        const auto pos = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("##cell", cell);
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+
+        auto* d = ImGui::GetWindowDrawList();
+        const bool equipped = isEquipped(item);
+        const ImVec2 max{ pos.x + cell.x, pos.y + cell.y };
+        d->AddRectFilled(pos, max, hovered ? IM_COL32(36, 41, 54, 255) : IM_COL32(24, 28, 37, 255), 8.0f);
+        d->AddRectFilled({ pos.x + 8.0f, max.y - 4.0f }, { max.x - 8.0f, max.y - 2.0f }, rarityColor(item.getRarity()), 1.0f);
+        if (equipped)
+            d->AddRect(pos, max, IM_COL32(77, 163, 255, 255), 8.0f, ImDrawFlags_None, 2.0f);
+
+        if (const auto icon = getItemIconTexture(otherInterfaces, item.getIconPath()))
+            d->AddImage(icon, { pos.x + 10.0f, pos.y + 6.0f }, { max.x - 10.0f, pos.y + 6.0f + (cell.x - 20.0f) * 0.75f });
+
+        // название — обрезаем по ширине ячейки
+        const std::string_view display = name.forDisplay;
+        const ImVec4 clip{ pos.x + 6.0f, pos.y, max.x - 6.0f, max.y };
+        d->AddText(nullptr, 0.0f, { pos.x + 8.0f, max.y - 24.0f }, equipped ? IM_COL32(255, 255, 255, 255) : IM_COL32(190, 196, 210, 255), display.data(), display.data() + display.size(), 0.0f, &clip);
+
+        if (clicked)
+            equip(item);
+        if (hovered && item.isAgent())
+            hoveredAgent = static_cast<int>(item.getWeaponID());
+        if (hovered)
+            ImGui::SetTooltip("%.*s\n%s", static_cast<int>(display.size()), display.data(), item.isAgent() ? "клик — надеть агента" : "клик — надеть");
+        ++index;
+    }
+    if (index == 0)
+        ImGui::TextDisabled("Ничего не найдено");
+    ImGui::EndChild();
+
+    if (agentsTab == csgo::Team::None)
+        return;
+
+    ImGui::SameLine(0.0f, 10.0f);
+    ImGui::BeginChild("##agentPreview", { 0.0f, avail.y }, false);
+    const int shown = previewAgentID ? previewAgentID : agentsTab == csgo::Team::CT ? skins.agentCT : skins.agentT;
+    const char* model = shown ? displayModelOf(memory, static_cast<WeaponId>(shown), false) : nullptr;
+    hvh::preview::setMenuModel(model ? model : (agentsTab == csgo::Team::CT ? "models/player/custom_player/legacy/ctm_sas.mdl" : ""));
+    hvh::preview::captureMenu(true);
+    const auto pos = ImGui::GetCursorScreenPos();
+    const auto size = ImGui::GetContentRegionAvail();
+    auto* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRectFilled(pos, { pos.x + size.x, pos.y + size.y }, IM_COL32(18, 21, 28, 255), 8.0f);
+    ImVec2 boundsMin, boundsMax;
+    if (!hvh::preview::draw(drawList, { pos.x + 8.0f, pos.y + 12.0f }, { pos.x + size.x - 8.0f, pos.y + size.y - 12.0f }, 0, 0, boundsMin, boundsMax, true))
+        drawList->AddText({ pos.x + 12.0f, pos.y + 12.0f }, IM_COL32(150, 156, 170, 255), "Загрузка модели…");
+    ImGui::InvisibleButton("##agentRotate", size);
+    ImGui::EndChild();
 }
 
 }
