@@ -2088,7 +2088,11 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 if (layerResolved)
                     sideCertain = !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
                 else if (variants)
-                    sideCertain = mode >= 0 && (state.score[std::clamp(mode, 0, ModeCount - 1)] >= 0 || voteSide(state, realtimeNow) != 0.0f);
+                    // Счёт режима стартует с нуля, поэтому «>= 0» объявляло сторону доказанной у
+                    // врага, про которого не известно ничего: отсюда sideScale 1.0, точки на край
+                    // капсулы и безопасные точки не требуются. Доказательством считаем только то,
+                    // что режим уже приносил попадания, или голосование по импактам.
+                    sideCertain = mode >= 0 && (state.score[std::clamp(mode, 0, ModeCount - 1)] > 0 || voteSide(state, realtimeNow) != 0.0f);
             }
             const bool sideUncertain = variants && !sideCertain;
             const bool safeBySetting = rage.safePoint == 2 || (rage.safePoint == 1 && misses[i] > 0);
