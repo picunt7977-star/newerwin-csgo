@@ -2266,8 +2266,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             // сняты обе неизвестности: момент настоящий (не предсказанный) и сторона десинка доказана
             // слоями с хорошей уверенностью — либо враг вовсе не десинкает. Все 5 состоявшихся
             // хедшотов за вечер прилетели именно так, и 4 из них убили сразу.
-            const bool headAllowed = isBot[i] || (!predictedRecord
-                && (mode < 0 || (layerResolved && !record.remembered && hvh::resolver::confidence(i) >= 0.5f)));
+            // Слои с хорошей уверенностью пускают голову и на предсказанную запись: ноги на сервере
+            // поворачиваются медленно (движок доворачивает их к взгляду с ограниченной скоростью),
+            // так что за одно-два обновления скелет, собранный под найденный угол, ещё годится —
+            // «вперёд + слои» попадало 49% против 29% у «вперёд + угадано». Но не у джиттерящего:
+            // у него взгляд за те же два обновления перекидывается на 60°, и ноги за ним.
+            const bool resolvedWell = layerResolved && !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
+            const bool headAllowed = isBot[i] || mode < 0
+                || (resolvedWell && (!predictedRecord || (!isJittering(state) && candidates[c].updatesAhead <= 2)));
             scanPoints(desyncSafe, !headAllowed);
             // Сторона не доказана, а общих для обеих сторон точек под мин. урон нет — лучше стрелять
             // по угаданной стороне, чем не стрелять вовсе. Настройка safePoint при этом уважается.
@@ -2307,10 +2313,15 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             const float headRate = (state.headHits + 0.5f) / (state.headShots + 1.0f);
             const float bodyRate = (state.bodyHits + 0.5f) / (state.bodyShots + 1.0f);
             const bool adaptiveBody = state.bodyShots >= 4 && bodyRate > headRate + 0.1f;
+            // Одним выстрелом убивает только голова (AK, дигл, скаут по телу не добивают) — такую
+            // точку нельзя отдавать ни статистике «по телу чаще попадаем», ни настройке «тело».
+            // Размен выигрывает тот, кто убил с первой пули, а не тот, кто снял 35 хп.
+            const bool headOnlyLethal = headOk && bestHead.damage >= static_cast<float>(health)
+                && bestBody.damage < static_cast<float>(health);
             AimPoint chosen;
             if (forced && bodyOk && bestBody.damage > bestHead.damage)
                 chosen = bestBody;   // форсшут: бьём туда, где урона больше
-            else if (bodyOk && (bodyOnly || settings.preferBody || adaptiveBody
+            else if (bodyOk && !headOnlyLethal && (bodyOnly || settings.preferBody || adaptiveBody
                     || (settings.bodyIfLethal && bestBody.damage >= static_cast<float>(health))))
                 chosen = bestBody;
             else
@@ -2392,6 +2403,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     // по очереди: цель, её вторая группа (голова/тело), следующая цель — первая, где набрался хитшанс
     csgo::Vector angle{};
     int chance = 0, firstChance = -1, chosenSlot = -1;
+    // Голова — капсула радиусом ~5 юнитов против ~18 у груди: один и тот же процент хитшанса
+    // означает для неё в разы худший реальный шанс, и именно поэтому голова мазала там, где тело
+    // попадало. С головы спрашиваем строже; не набралось — ниже по циклу всё равно пробуется тело.
+    const auto needed = [&](const AimPoint& point) {
+        return point.isHead ? std::min(settings.hitchance + 15, 95) : settings.hitchance;
+    };
     for (int k = 0; k < topCount && chosenSlot < 0; ++k) {
         auto& candidate = top[k];
         buildCapsules(*candidate.set, candidate.bones, aimCapsules);
@@ -2400,16 +2417,16 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         chance = hitchance(weapon, weaponData, entity, eye, angle, aimCapsules, candidate.point.baseDamage, candidate.minDamage);
         if (firstChance < 0)
             firstChance = chance;
-        if (chance < settings.hitchance && candidate.fallback.damage > 0.0f) {
+        if (chance < needed(candidate.point) && candidate.fallback.damage > 0.0f) {
             const auto fallbackAngle = (candidate.fallback.position - eye).toAngle();
             if (const int fallbackChance = hitchance(weapon, weaponData, entity, eye, fallbackAngle, aimCapsules, candidate.fallback.baseDamage, candidate.minDamage);
-                fallbackChance >= settings.hitchance) {
+                fallbackChance >= needed(candidate.fallback)) {
                 candidate.point = candidate.fallback;
                 angle = fallbackAngle;
                 chance = fallbackChance;
             }
         }
-        if (chance >= settings.hitchance)
+        if (chance >= needed(candidate.point))
             chosenSlot = k;
     }
     if (chosenSlot < 0) {
