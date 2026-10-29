@@ -505,6 +505,7 @@ void updateInput() noexcept
 {
     antiaim::updateInput();
     config.exploits.doubleTapKey.handleToggle();
+    config.rage.forceShotKey.handleToggle();
 }
 
 void drawIndicators(ImDrawList* drawList) noexcept
@@ -557,6 +558,8 @@ void drawIndicators(ImDrawList* drawList) noexcept
         line("DMG", color::text);
     if (ragebot::forceBodyActive())
         line("BAIM", color::text);
+    if (ragebot::forceShotActive())
+        line("FORCE", color::text);
     if (config.rage.enabled && *ragebot::status())
         line(ragebot::status(), color::textDim);
 
@@ -600,6 +603,8 @@ void drawRageTab() noexcept
             ImGui::SetTooltip("Стрелять, даже если заданный «Мин. урон» по этой цели недостижим:\n"
                               "порог опускается до лучшего достижимого урона, и выстрел всё равно идёт.\n"
                               "Без него рейдж в такой ситуации просто не стреляет («фотка»).");
+        if (rage.forceShot)
+            keybind("Клавиша форсшута", rage.forceShotKey);
         toggle("Резольвер", &rage.resolver);
         if (rage.resolver) {
             toggle("По слоям анимации", &rage.layerResolver);
@@ -617,6 +622,12 @@ void drawRageTab() noexcept
             }
             static constexpr const char* safeModes[]{ "Выкл", "После промаха", "Всегда" };
             combo("Безопасные точки", &rage.safePoint, safeModes, IM_ARRAYSIZE(safeModes));
+            toggle("Точки, общие для обеих сторон", &rage.resolverSafeWhenUnsure);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Сторона десинка не доказана (нет находки по слоям, режим ещё не попадал):\n"
+                                  "бить только точки, которые попадают в ОБЕ стороны — обычно это тело.\n"
+                                  "Попадание почти гарантировано, а «край головы» при неверной стороне — промах.\n"
+                                  "Если таких точек под мин. урон нет, стрельба по угаданной стороне остаётся.");
         }
         sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
         keybind("Мин. урон (override)", rage.minDamageOverrideKey);

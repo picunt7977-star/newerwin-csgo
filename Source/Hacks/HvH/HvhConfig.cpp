@@ -34,11 +34,13 @@ json toJson() noexcept
     r["Force shot"] = rage.forceShot;
     r["Resolver"] = rage.resolver;
     r["Layer resolver"] = rage.layerResolver;
+    r["Resolver safe when unsure"] = rage.resolverSafeWhenUnsure;
     r["Resolver steps"] = rage.resolverSteps;
     r["Safe point"] = rage.safePoint;
     r["FOV"] = rage.fov;
     writeKey(r, "Min damage override key", rage.minDamageOverrideKey);
     writeKey(r, "Force body key", rage.forceBodyKey);
+    writeKey(r, "Force shot key", rage.forceShotKey);
     for (std::size_t i = 0; i < rage.weapons.size(); ++i) {
         const auto& w = rage.weapons[i];
         auto& jw = r["Weapons"][i];
@@ -157,11 +159,13 @@ void fromJson(const json& j) noexcept
         read(r, "Force shot", rage.forceShot);
         read(r, "Resolver", rage.resolver);
         read(r, "Layer resolver", rage.layerResolver);
+        read(r, "Resolver safe when unsure", rage.resolverSafeWhenUnsure);
         read(r, "Resolver steps", rage.resolverSteps);
         read(r, "Safe point", rage.safePoint);
         read(r, "FOV", rage.fov);
         read(r, "Min damage override key", rage.minDamageOverrideKey);
         read(r, "Force body key", rage.forceBodyKey);
+        read(r, "Force shot key", rage.forceShotKey);
         if (r.contains("Weapons") && r["Weapons"].is_array()) {
             for (std::size_t i = 0; i < rage.weapons.size() && i < r["Weapons"].size(); ++i) {
                 const auto& jw = r["Weapons"][i];

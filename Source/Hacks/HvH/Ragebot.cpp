@@ -61,6 +61,7 @@ constexpr int MAX_RECORDS = 32;
 
 bool minDamageOverride = false;
 bool forceBody = false;
+bool forceShot = false;      // форсшут с учётом клавиши-переключателя
 int target = 0;
 const char* statusText = "";
 
@@ -123,6 +124,10 @@ struct ResolverState {
     // перебор стороны получается быстрее, чем ждать, пока счёт режимов перевесит
     float bruteSide = 0.0f;
     float bruteUntil = 0.0f;
+    // Попадания по голове/телу у этого игрока: у дефенсивных целей голова уходит, а тело стоит —
+    // по этой статистике выбираем, куда бить, вместо «всегда голова»
+    std::uint8_t headHits = 0, headShots = 0;
+    std::uint8_t bodyHits = 0, bodyShots = 0;
 };
 std::array<ResolverState, 65> resolverStates{};
 
@@ -897,9 +902,49 @@ PredictionCheck checkPrediction(const ShotRecord& shot, int index) noexcept
     return check;
 }
 
-// true — промах по вине резольвера (пуля прошла через точку, а модель была повёрнута иначе)
-bool logMiss(int index, float shotTime) noexcept
+// По импакту видно, на какой стороне десинка стояла модель на сервере: луч, которым мы стреляли,
+// проходит сквозь один крайний скелет и не проходит сквозь другой. Если это противоположная сторона —
+// сторона угадана неверно, и это доказано геометрией, а не «наверное, резольвер».
+// Возвращает +1/-1 (сторона, где действительно была модель) или 0, если доказать нельзя.
+float provenSideFromImpact(int index, const ShotRecord& shot) noexcept
 {
+    if (!shot.haveImpact || !shot.set || std::abs(shot.side) < 0.05f || !logMemory)
+        return 0.0f;
+    const auto& list = records[index];
+    if (list.count == 0)
+        return 0.0f;
+
+    auto direction = shot.aimPoint - shot.eye;
+    direction /= std::max(direction.length(), 0.001f);
+    const auto end = shot.eye + direction * 8192.0f;
+    const float interval = logMemory->globalVars->intervalPerTick;
+
+    static Capsules plusCapsules, minusCapsules;
+    float nearest = 1e9f;
+    float proven = 0.0f;
+    for (int age = 0; age < list.count; ++age) {
+        const auto& record = list.at(age);
+        if (!record.rebuilt)
+            continue;   // крайние скелеты не собраны — сторону этим выстрелом не проверить
+        const float distance = std::abs(record.simulationTime - shot.predictedSimulationTime);
+        if (distance > interval * 1.6f || distance >= nearest)
+            continue;
+        buildCapsules(*shot.set, record.plus, plusCapsules);
+        buildCapsules(*shot.set, record.minus, minusCapsules);
+        const bool plus = rayHitsPlayer(shot.eye, end, plusCapsules);
+        const bool minus = rayHitsPlayer(shot.eye, end, minusCapsules);
+        if (plus == minus)
+            continue;   // луч задевает обе стороны или ни одной — доказательства нет
+        nearest = distance;
+        proven = plus ? 1.0f : -1.0f;
+    }
+    return proven;
+}
+
+// true — промах по вине резольвера (пуля прошла через точку, а модель была повёрнута иначе)
+bool logMiss(int index, float shotTime, float& provenSide) noexcept
+{
+    provenSide = 0.0f;
     const auto& shot = shots[index];
     PredictionCheck check;
     if (shot.predicted && logMemory)
@@ -941,10 +986,14 @@ bool logMiss(int index, float shotTime) noexcept
     } else {
         reason = "десинк/лагкомп (пуля прошла через точку, резольвер не применялся)";
     }
+    if (resolverFault)
+        provenSide = provenSideFromImpact(index, shot);
     char text[640];
-    std::snprintf(text, sizeof(text), "[ECLIPSE] промах по %s: %s | %s%s, сторона %s (%s)%s, урон %d | %s",
+    std::snprintf(text, sizeof(text), "[ECLIPSE] промах по %s: %s | %s%s, сторона %s (%s)%s, урон %d%s | %s",
         playerName(index).c_str(), reason, shot.isHead ? "голова" : "тело", shot.edgePoint ? " (край)" : " (центр)", sideText(shot.side),
-        modeText(shot.mode), shot.safe ? ", safe" : "", shot.damage, recordText(shot).c_str());
+        modeText(shot.mode), shot.safe ? ", safe" : "", shot.damage,
+        provenSide != 0.0f ? (provenSide > 0.0f ? ", импакт: модель была на +" : ", импакт: модель была на -") : "",
+        recordText(shot).c_str());
     static constexpr std::uint8_t red[4]{ 255, 90, 90, 255 };
     consoleLog(red, text);
     {
@@ -1421,6 +1470,11 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
         auto& state = resolverStates[victimIndex];
         state.bruteSide = 0.0f;
         state.bruteUntil = 0.0f;
+        {
+            // статистика: куда реально попадаем у этого игрока (голова/тело)
+            std::uint8_t& hits = shots[victimIndex].isHead ? state.headHits : state.bodyHits;
+            hits = static_cast<std::uint8_t>(std::min<int>(hits + 1, 250));
+        }
         // джиттер: учим, совпадает ли сторона попадания с фазой взгляда. Находок по слоям мало,
         // а попаданий больше — связь фазы и стороны так выучивается быстрее
         if (isJittering(state) && std::abs(shots[victimIndex].side) > 0.05f) {
@@ -1503,6 +1557,7 @@ void onRoundStart() noexcept
     hvh::resolver::onRoundStart();
 }
 bool forceBodyActive() noexcept { return forceBody; }
+bool forceShotActive() noexcept { return forceShot; }
 int currentTarget() noexcept { return target; }
 
 namespace
@@ -1544,21 +1599,35 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     logEngine.emplace(engineInterfaces.getEngine());
     minDamageOverride = rage.minDamageOverrideKey.isSet() && rage.minDamageOverrideKey.isDown();
     forceBody = rage.forceBodyKey.isSet() && rage.forceBodyKey.isDown();
+    // клавиша форсшута — переключатель как у DT; не задана — форсшут просто по тумблеру
+    forceShot = rage.forceShot && (!rage.forceShotKey.isSet() || rage.forceShotKey.isToggled());
     target = 0;
     statusText = "";
 
     for (std::size_t i = 0; i < pendingShot.size(); ++i) {
         if (pendingShot[i] > 0.0f && memory.globalVars->realtime - pendingShot[i] > 0.7f) {
-            const bool resolverFault = logMiss(static_cast<int>(i), pendingShot[i]);
+            float provenSide = 0.0f;
+            const bool resolverFault = logMiss(static_cast<int>(i), pendingShot[i], provenSide);
             ++misses[i];
             // штрафуем режим только за промах по его вине (разброс/стена/лаг — не он)
             const int mode = shots[i].mode;
             if (resolverFault && mode >= 0 && mode < ModeCount) {
                 --resolverStates[i].score[mode];
-                // и навязываем зеркальную сторону на следующие ~1.5 с, пока не попадём
+                auto& state = resolverStates[i];
                 const float used = shots[i].side;
-                if (std::abs(used) > 0.05f) {
-                    auto& state = resolverStates[i];
+                if (provenSide != 0.0f && !isJittering(state)) {
+                    // импакт показал, где модель была на самом деле: сразу бьём этой стороной
+                    // и переносим голос на режим, который её выбирает
+                    state.bruteSide = provenSide;
+                    state.bruteUntil = memory.globalVars->realtime + 2.0f;
+                    if (std::abs(used) > 0.05f && (used > 0.0f) != (provenSide > 0.0f)) {
+                        const int better = mode == Guess ? Opposite
+                            : mode == Opposite ? Guess
+                            : mode == GuessLow ? OppositeLow : GuessLow;
+                        state.score[better] = std::min(state.score[better] + 1, 8);
+                    }
+                } else if (std::abs(used) > 0.05f) {
+                    // доказать нечем — перебираем зеркальную сторону, пока не попадём
                     state.bruteSide = used > 0.0f ? -1.0f : 1.0f;
                     state.bruteUntil = memory.globalVars->realtime + 1.5f;
                 }
@@ -1814,6 +1883,17 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         // режим резольвера — лучший по счёту для этого игрока; не чокает — значит, не десинкает, не крутим
         const int mode = isDesyncing(state) ? bestMode(state) : -1;
         const float deltaScale = mode == GuessLow || mode == OppositeLow ? 0.5f : 1.0f;
+        // Память слоёв знает не только сторону, но и величину десинка (доля от максимума): у многих
+        // врагов ноги повёрнуты не на полный угол, и «полный» скелет уводил точку мимо тела.
+        float memorySide = 0.0f;
+        float variantScale = deltaScale;
+        if (mode >= 0 && !isJittering(state)) {
+            const float ratio = rememberedRatio(state, memory.globalVars->realtime);
+            if (std::abs(ratio) > 0.3f) {
+                memorySide = ratio > 0.0f ? 1.0f : -1.0f;
+                variantScale = std::clamp(std::abs(ratio), 0.35f, 1.0f);
+            }
+        }
 
         for (int c = 0; c < candidateCount; ++c) {
             const auto& record = *candidates[c].record;
@@ -1831,7 +1911,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     std::copy(record.minus, record.minus + RECORD_BONES, minusBones);
                     variants = true;
                 }
-            } else if (rage.resolver && mode >= 0 && buildDesyncVariants(isBot[i], record, record.bones, plusBones, minusBones, deltaScale)) {
+            } else if (rage.resolver && mode >= 0 && buildDesyncVariants(isBot[i], record, record.bones, plusBones, minusBones, variantScale)) {
                 variants = true;
                 if (pendingShot[i] == 0.0f || state.guessedSide == 0.0f)
                     state.guessedSide = guessDesyncSide(engineInterfaces.engineTrace(), eye, plusBones, minusBones);
@@ -1840,12 +1920,13 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 const bool flipped = candidates[c].updatesAhead % 2 == 1;
                 const float relation = jitterRelation(state);
                 const float phase = (flipped ? -state.jitterPhase : state.jitterPhase) * (relation < 0.0f ? -1.0f : 1.0f);
-                const float base = isJittering(state) ? phase : state.guessedSide;
+                // сторона: память слоёв (находка по анимации) точнее фристенд-догадки, джиттер — по фазе
+                const float base = isJittering(state) ? phase : (memorySide != 0.0f ? memorySide : state.guessedSide);
                 if (mode == Guess || mode == GuessLow)
                     side = base;
                 else if (mode == Opposite || mode == OppositeLow)
                     side = -base;
-                // промах по вине резольвера — сразу зеркалим сторону, не дожидаясь счёта режимов
+                // промах по вине резольвера — сразу бьём стороной, которую доказал импакт
                 if (state.bruteSide != 0.0f && memory.globalVars->realtime < state.bruteUntil)
                     side = state.bruteSide;
                 if (side != 0.0f) {
@@ -1853,7 +1934,18 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     std::copy(chosen, chosen + RECORD_BONES, bones);
                 }
             }
-            const bool desyncSafe = !cheapScan && variants && (rage.safePoint == 2 || (rage.safePoint == 1 && misses[i] > 0));
+            // Насколько сторона десинка доказана: слои с хорошей уверенностью или режим, который уже
+            // приносил попадания. Иначе «край головы» — лотерея, и лучше бить точку, общую для обеих сторон.
+            bool sideCertain = !rage.resolver || isBot[i];
+            if (rage.resolver && !isBot[i]) {
+                if (layerResolved)
+                    sideCertain = !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
+                else if (variants)
+                    sideCertain = mode >= 0 && state.score[std::clamp(mode, 0, ModeCount - 1)] >= 0;
+            }
+            const bool sideUncertain = variants && !sideCertain;
+            const bool safeBySetting = rage.safePoint == 2 || (rage.safePoint == 1 && misses[i] > 0);
+            const bool desyncSafe = !cheapScan && variants && (safeBySetting || (rage.resolverSafeWhenUnsure && sideUncertain));
             const bool predictedRecord = candidates[c].kind == RecordKind::Ahead || candidates[c].kind == RecordKind::Extrapolated;
             // на предсказанной записи сторону десинка проверить нечем (взгляд за 300 мс уходит на 60°) —
             // точки, общие для обеих сторон, предпочитаем там всегда, без требования (см. steady ниже)
@@ -1880,6 +1972,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     sideScale = record.remembered ? 0.5f : std::clamp(hvh::resolver::confidence(i) * 1.4f, 0.35f, 1.0f);
                 else if (mode >= 0 && side == 0.0f)
                     sideScale = 0.0f;    // десинкает, а сторона не выбрана — точки только по центру
+                else if (mode >= 0 && sideUncertain)
+                    sideScale = 0.45f;   // сторона под вопросом — бьём ближе к центру капсулы
             }
 
             // Предсказанная запись: сервер мог успеть принять на обновление больше или меньше, чем мы
@@ -2011,7 +2105,11 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 }
             };
             scanPoints(desyncSafe, false);
-            const bool safeOnly = desyncSafe;
+            // Сторона не доказана, а общих для обеих сторон точек под мин. урон нет — лучше стрелять
+            // по угаданной стороне, чем не стрелять вовсе. Настройка safePoint при этом уважается.
+            if (desyncSafe && !safeBySetting && bestHead.damage <= 0.0f && bestBody.damage <= 0.0f)
+                scanPoints(false, false);
+            const bool safeOnly = desyncSafe && (bestHead.damage > 0.0f || bestBody.damage > 0.0f);
             if (sureHead.damage > 0.0f || sureBody.damage > 0.0f) {
                 bestHead = sureHead;
                 bestBody = sureBody;
@@ -2025,7 +2123,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             int effectiveMinDamage = minDamage;
             bool forced = false;
             if (!headOk && !bodyOk) {
-                if (!rage.forceShot || (weakHead.damage <= 0.0f && weakBody.damage <= 0.0f)) {
+                if (!forceShot || (weakHead.damage <= 0.0f && weakBody.damage <= 0.0f)) {
                     statusText = safeOnly ? "нет безопасных точек" : "мало урона";
                     continue;
                 }
@@ -2041,10 +2139,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
             // Было ещё «вперёд + джиттер → тело»: по логам 29.10 тело попадало 36%, голова 42%, а скаут в тело
             // почти не убивает с выстрела — враг успевал ответить. Тело теперь только по настройкам/если убивает.
+            // Плюс своя статистика по игроку: если по голове мы у него мажем, а по телу попадаем — бьём тело.
+            const float headRate = (state.headHits + 0.5f) / (state.headShots + 1.0f);
+            const float bodyRate = (state.bodyHits + 0.5f) / (state.bodyShots + 1.0f);
+            const bool adaptiveBody = state.bodyShots >= 4 && bodyRate > headRate + 0.1f;
             AimPoint chosen;
             if (forced && bodyOk && bestBody.damage > bestHead.damage)
                 chosen = bestBody;   // форсшут: бьём туда, где урона больше
-            else if (bodyOk && (bodyOnly || settings.preferBody
+            else if (bodyOk && (bodyOnly || settings.preferBody || adaptiveBody
                     || (settings.bodyIfLethal && bestBody.damage >= static_cast<float>(health))))
                 chosen = bestBody;
             else
@@ -2089,7 +2191,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 resolverOffset[i] = std::clamp(std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f) / limit, -1.0f, 1.0f);
                 resolverMode[i] = record.remembered ? MemoryMode : LayerMode;
             } else {
-                resolverOffset[i] = side * deltaScale;
+                resolverOffset[i] = side * variantScale;
                 resolverMode[i] = variants ? mode : -1;
             }
             break;
@@ -2171,6 +2273,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     pendingShot[best.index] = memory.globalVars->realtime;
     auto& shot = shots[best.index];
     shot = {};
+    {
+        // счётчик попыток для статистики голова/тело (попадания считает onPlayerHurt)
+        auto& st = resolverStates[best.index];
+        std::uint8_t& attempts = best.point.isHead ? st.headShots : st.bodyShots;
+        attempts = static_cast<std::uint8_t>(std::min<int>(attempts + 1, 250));
+    }
     shot.eye = eye;
     shot.aimPoint = best.point.position;
     shot.isHead = best.point.isHead;

@@ -21,6 +21,7 @@ bool run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
 // для индикаторов
 [[nodiscard]] bool minDamageOverrideActive() noexcept;
 [[nodiscard]] bool forceBodyActive() noexcept;
+[[nodiscard]] bool forceShotActive() noexcept;
 [[nodiscard]] int currentTarget() noexcept;
 [[nodiscard]] const char* status() noexcept;
 // текущая поправка резольвера для игрока (0 — без поправки)
