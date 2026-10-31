@@ -21,6 +21,7 @@
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/EngineInterfaces.h>
 #include <Memory.h>
+#include <Netvars.h>
 #include <RetSpoof/RetSpoofGadgets.h>
 #include <CSGO/LocalPlayer.h>
 #include <CSGO/UserCmd.h>
@@ -35,12 +36,24 @@ bool fakeDucking = false;
 
 bool peekActive = false;
 bool peekReturning = false;
+bool peekTeleported = false;    // заряд на этот возврат уже потрачен
+int peekReturnTicks = 0;
 csgo::Vector peekOrigin;
+
+// Сколько пройдём за сдвиг ticks команд, если каждую жмём к точке: разгон sv_accelerate от текущей скорости
+[[nodiscard]] float shiftCoverage(float speed, float maxSpeed, int ticks, float interval) noexcept
+{
+    float distance = 0.0f;
+    for (int i = 0; i < ticks; ++i) {
+        speed = std::min(speed + 5.5f * maxSpeed * interval, maxSpeed);
+        distance += speed * interval;
+    }
+    return distance;
+}
 
 [[nodiscard]] float normalizeYaw(float yaw) noexcept
 {
-    yaw = std::remainder(yaw, 360.0f);
-    return yaw;
+    return std::remainder(yaw, 360.0f);
 }
 
 }
@@ -112,7 +125,7 @@ void autoStrafe(csgo::UserCmd* cmd, float viewYaw, const csgo::Cvar& cvar, float
     cmd->sidemove = -std::sin(relative) * 450.0f;
 }
 
-void fakeDuck(csgo::UserCmd* cmd) noexcept
+void fakeDuck(csgo::UserCmd* cmd, float interval) noexcept
 {
     const auto& key = config.movement.fakeDuckKey;
     fakeDucking = key.isSet() && key.isDown() && tickbase::isInstalled()
@@ -123,9 +136,23 @@ void fakeDuck(csgo::UserCmd* cmd) noexcept
 
     // без задержки приседания, иначе за 7 тиков не успеть
     cmd->buttons |= csgo::UserCmd::IN_BULLRUSH;
-    // первую половину чока стоим (с этой высоты и стреляем), вторую — сидим:
-    // отправленный тик всегда приходится на присед, его и видят остальные
-    if (tickbase::chokedCommands() > 6)
+    // Отправленный тик (его видят остальные) должен прийтись на полный присед, а до этого стоим как можно
+    // дольше — с этой высоты и стреляем. Раньше делили чок пополам (7 стоим / 8 сидим), но присед идёт со
+    // скоростью m_flDuckSpeed, и на 128 тиках или со штрафом за спам приседа к отправке он не досаживал.
+    // Теперь садимся, когда до отправки осталось ровно столько команд, сколько нужно на полный присед (+1 запас).
+    constexpr int fakeDuckChoke = 14;   // как chokeLimit() в Tickbase.cpp при фейкдаке
+    const int commandsLeft = fakeDuckChoke - tickbase::chokedCommands() + 1;   // включая эту
+    bool duck = tickbase::chokedCommands() > 6;
+    static const auto duckAmountOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckAmount"));
+    static const auto duckSpeedOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckSpeed"));
+    if (duckAmountOffset && duckSpeedOffset && interval > 0.0f) {
+        const auto base = std::uintptr_t(localPlayer.get().getPOD());
+        const float amount = std::clamp(*reinterpret_cast<const float*>(base + duckAmountOffset), 0.0f, 1.0f);
+        const float speed = std::max(*reinterpret_cast<const float*>(base + duckSpeedOffset), 1.0f);
+        const int ticksToFull = static_cast<int>(std::ceil((1.0f - amount) / (speed * interval) - 0.001f));
+        duck = ticksToFull + 1 >= commandsLeft;
+    }
+    if (duck)
         cmd->buttons |= csgo::UserCmd::IN_DUCK;
     else
         cmd->buttons &= ~csgo::UserCmd::IN_DUCK;
@@ -152,6 +179,9 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
     }
 
     if (!ex.defensive)
+        return;
+    // пока зажат автопик, заряд бережём под телепорт назад
+    if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
         return;
 
     // дефенсив: враг только что увидел нас — рывок на заряженные тики. Между двумя пакетами мы
@@ -225,12 +255,13 @@ bool isFakeDucking() noexcept
     return fakeDucking;
 }
 
-void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot) noexcept
+void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noexcept
 {
     const auto& key = config.movement.autoPeekKey;
     if (!key.isSet() || !key.isDown() || !localPlayer || !localPlayer.get().isAlive()) {
         peekActive = false;
         peekReturning = false;
+        tickbase::holdShotShift(false);
         return;
     }
 
@@ -243,10 +274,17 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot) noexcept
         peekOrigin = origin;
     }
 
+    // пока зажат автопик, не дозаряжаемся посреди выглядывания и дефенсив заряд не тратит
+    tickbase::holdShotShift(tickbase::doubleTapEnabled());
+
+    if (!peekReturning) {
+        peekTeleported = false;
+        peekReturnTicks = 0;
+    }
     if (shot)
         peekReturning = true;
     constexpr auto moveButtons = csgo::UserCmd::IN_FORWARD | csgo::UserCmd::IN_BACK | csgo::UserCmd::IN_MOVELEFT | csgo::UserCmd::IN_MOVERIGHT;
-    if (config.movement.autoPeekOnRelease && !(cmd->buttons & moveButtons))
+    if (config.movement.autoPeekMode == static_cast<int>(AutoPeekMode::ShotOrRelease) && !(cmd->buttons & moveButtons))
         peekReturning = true;
 
     if (!peekReturning)
@@ -255,12 +293,44 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot) noexcept
     const float dx = peekOrigin.x - origin.x;
     const float dy = peekOrigin.y - origin.y;
     const float distance = std::hypot(dx, dy);
-    if (distance < 5.0f) {
+    const auto velocity = localPlayer.get().velocity();
+    if (distance < 5.0f && velocity.length2D() < 40.0f) {
         peekReturning = false;
         return;
     }
 
-    const float yaw = Helpers::rad2deg(std::atan2(dy, dx));
+    // Возврат телепортом: заряженные команды уходят одним пакетом, в каждой движение к точке (эта же
+    // функция в каждой прогоняемой команде), сервер проходит их за один тик. Раньше сдвиг шёл сразу
+    // на выстреле, а автостоп к этому моменту гасил скорость в ноль: с места за 14 тиков проходишь
+    // ~30 ед. (со скоупом AWP ~13) — телепорта не было видно. Теперь сначала разгоняемся к точке и
+    // сдвигаем, когда сдвиг довезёт до самой точки, скорость почти максимальная или прошло 6 тиков.
+    // телепорт только при включённом DT; без него — обычный возврат ногами
+    if (!peekTeleported && tickbase::doubleTapEnabled() && !tickbase::isShifting() && tickbase::chargedTicks() >= 4) {
+        float maxSpeed = 250.0f;
+        if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
+            if (const auto data = weapon.getWeaponData())
+                maxSpeed = localPlayer.get().isScoped() ? data->maxSpeedAlt : data->maxSpeed;
+        }
+        maxSpeed = std::clamp(maxSpeed, 50.0f, 260.0f);
+        const float speed = velocity.length2D();
+        const bool arrives = shiftCoverage(speed, maxSpeed, tickbase::chargedTicks() + 1, interval) >= distance - 4.0f;
+        if (arrives || speed >= maxSpeed * 0.9f || peekReturnTicks >= 6) {
+            tickbase::requestShift();
+            peekTeleported = true;
+        }
+    }
+    if (!tickbase::isShifting())
+        ++peekReturnTicks;
+
+    // Раньше жали 450 к точке до самого конца: на 250 ед/с игрока проносило мимо, и он качался
+    // туда-обратно у кольца. Теперь желаемая скорость падает к точке (тормозной путь ~ v²/2a),
+    // а ввод — по разнице желаемой и текущей скорости: вблизи это само становится торможением.
+    const float wantedSpeed = std::min(distance * 6.0f, 260.0f);
+    const float wantX = dx / std::max(distance, 0.001f) * wantedSpeed - velocity.x;
+    const float wantY = dy / std::max(distance, 0.001f) * wantedSpeed - velocity.y;
+    if (std::hypot(wantX, wantY) < 5.0f)
+        return;
+    const float yaw = Helpers::rad2deg(std::atan2(wantY, wantX));
     const float relative = Helpers::deg2rad(yaw - viewYaw);
     cmd->forwardmove = std::cos(relative) * 450.0f;
     cmd->sidemove = -std::sin(relative) * 450.0f;

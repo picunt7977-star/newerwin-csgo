@@ -14,9 +14,11 @@ target_sources(OsirisOBJ PRIVATE
   HvH/GrenadePrediction.cpp
   HvH/HvhConfig.cpp
   HvH/HvhGui.cpp
+  HvH/HvhVisuals.cpp
   HvH/ModelPreview.cpp
   HvH/Movement.cpp
   HvH/Ragebot.cpp
   HvH/Resolver.cpp
+  HvH/Scoreboard.cpp
   HvH/Tickbase.cpp
 )

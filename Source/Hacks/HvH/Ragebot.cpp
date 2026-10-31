@@ -5,12 +5,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
+#include <mutex>
 #include <optional>
 #include <string>
-#include <string_view>
 
 #include <sys/stat.h>
 
@@ -23,6 +23,7 @@
 #include "Tickbase.h"
 
 #include <Helpers.h>
+#include <Netvars.h>
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/EngineInterfaces.h>
 #include <Interfaces/OtherInterfaces.h>
@@ -31,10 +32,10 @@
 #include <CSGO/ConVar.h>
 #include <CSGO/Cvar.h>
 #include <CSGO/Engine.h>
-#include <CSGO/GameEvent.h>
-#include <CSGO/Entity.h>
 #include <CSGO/EngineTrace.h>
+#include <CSGO/Entity.h>
 #include <CSGO/EntityList.h>
+#include <CSGO/GameEvent.h>
 #include <CSGO/GlobalVars.h>
 #include <CSGO/LocalPlayer.h>
 #include <CSGO/matrix3x4.h>
@@ -45,6 +46,19 @@
 #include <CSGO/WeaponData.h>
 #include <CSGO/WeaponId.h>
 
+// Рейджбот newerwin.
+//
+// Тик рейджа:
+//  1. записи лагкомпа на каждого врага — как история на сервере (simtime назад не принимается, пока голова
+//     истории не устарела): свой скелет на каждое новое simtime + два крайних по десинку;
+//  2. сторона десинка: свежие слои анимации > перебор после промаха > фаза джиттера > свидетельства выстрелов
+//     > фристенд-догадка (с учётом, как часто она у этого игрока права);
+//  3. по каждой цели — записи-кандидаты (onshot, стоит, свежая, старая; вне окна отката — прогноз «вперёд»),
+//     каждая оценивается целиком, берётся лучшая;
+//  4. точки мультипоинта: урон автоволлом × надёжность (вероятность попасть, калибровка по логам 29+31.10);
+//  5. хитшанс по всем 256 сидам разброса, выстрел сразу, DT сдвигает тем же пакетом.
+// После выстрела: попадание/промах с причиной (по импакту пули) — это и есть обучение резольвера и прогноза.
+
 namespace hvh::ragebot
 {
 
@@ -52,316 +66,247 @@ namespace
 {
 
 constexpr int FL_ONGROUND = 1 << 0;
-// сид разброса на сервере — (random_seed & 0xFF) + 1, то есть всего 256 вариантов: перебираем все
+// сид разброса на сервере — (random_seed & 0xFF) + 1: всего 256 вариантов, перебираем все
 constexpr int HITCHANCE_SEEDS = 256;
-// кости модели игрока: хитбоксы висят на первых ~80, больше 128 у моделей CS:GO не бывает
+// кости модели: хитбоксы висят на первых ~80, больше 128 у моделей CS:GO не бывает
 constexpr int RECORD_BONES = 128;
-// записей на игрока: 0.2 с (sv_maxunlag) на 128 тиках = 26, с запасом
+// записей на игрока: sv_maxunlag 0.2 с на 128 тиках = 26, с запасом
 constexpr int MAX_RECORDS = 32;
+constexpr int HEAD_BONE = 8;
+constexpr int HITGROUP_HEAD = 1;
+
+// ---------- общее состояние ----------
 
 bool minDamageOverride = false;
 bool forceBody = false;
-bool forceShot = false;      // форсшут с учётом клавиши-переключателя
+bool forceShot = false;
 int target = 0;
 const char* statusText = "";
+float localDiedAt = -1.0f;
+const Memory* memoryPtr = nullptr;
+std::optional<csgo::Engine> engine;
 
-// промахи по игрокам: выстрел без player_hurt за 0.7 с считается промахом
-std::array<int, 65> misses{};
-std::array<float, 65> resolverOffset{};
-std::array<float, 65> pendingShot{};
-float localDiedAt = -1.0f;      // realtime нашей смерти — промах без импакта после неё = «death»
+std::mutex viewMutex;
+std::array<TargetView, 65> views{};
+ShotView lastShot;
 
-// ---------- резольвер: состояние на игрока ----------
-// Режимы: угаданная сторона, обратная, они же с половинным десинком (low delta), без поворота.
-// У каждого режима счёт: попадание +2, промах по вине резольвера -1. Стреляем режимом с лучшим счётом —
-// так резольвер «учится» на каждом игроке и не сбивается от промахов по разбросу.
-enum ResolveMode { Guess, Opposite, NoResolve, GuessLow, OppositeLow, ModeCount };
-constexpr const char* modeNames[]{ "угадано", "обратно", "без поворота", "угадано low", "обратно low" };
-// режим «слои» живёт в резольвере по анимации, у перебора стороны для него номера нет
-constexpr int LayerMode = -2;
-// слои сейчас молчат, сторону берём из прошлой находки по слоям (см. rememberedRatio)
-constexpr int MemoryMode = -3;
+// ---------- логи: консоль игры + файл ~/csgo-hvh/logs/ДАТА.log + коротко на экране ----------
 
-[[nodiscard]] const char* modeText(int mode) noexcept
+void fileLog(const char* text) noexcept
 {
-    if (mode == LayerMode)
-        return "слои";
-    if (mode == MemoryMode)
-        return "память слоёв";
-    return mode >= 0 && mode < ModeCount ? modeNames[mode] : "не десинкает";
+    static std::FILE* file = nullptr;
+    static int day = -1;
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    if (!file || local.tm_yday != day) {
+        if (file)
+            std::fclose(file);
+        file = nullptr;
+        day = local.tm_yday;
+        const char* home = std::getenv("HOME");
+        if (!home)
+            return;
+        const std::string dir = std::string{ home } + "/csgo-hvh/logs";
+        mkdir(dir.c_str(), 0755);
+        char name[32];
+        std::strftime(name, sizeof(name), "/%Y-%m-%d.log", &local);
+        file = std::fopen((dir + name).c_str(), "a");
+        if (!file)
+            return;
+    }
+    char stamp[16];
+    std::strftime(stamp, sizeof(stamp), "%H:%M:%S ", &local);
+    std::fputs(stamp, file);
+    std::fputs(text, file);
+    std::fputc('\n', file);
+    std::fflush(file);
 }
 
-struct ResolverState {
+struct ScreenLine {
+    std::string text;
+    ImU32 color = 0;
+    double time = 0.0;
+};
+std::array<ScreenLine, 8> screenLines;
+int screenNext = 0;
+std::mutex screenMutex;   // пишет игровой поток (события), читает отрисовка
+
+[[nodiscard]] double steadySeconds() noexcept
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// одна строка на событие: в консоль (цветом) и файл — полностью, на экран — до «|»
+void report(const std::uint8_t (&color)[4], const char* text) noexcept
+{
+    if (memoryPtr && memoryPtr->conColorMsg)
+        memoryPtr->conColorMsg(color, "%s\n", text);
+    fileLog(text);
+    std::string brief = text;
+    if (brief.starts_with("[newerwin] "))
+        brief.erase(0, 11);
+    if (const auto bar = brief.find(" |"); bar != std::string::npos)
+        brief.resize(bar);
+    std::scoped_lock lock{ screenMutex };
+    screenLines[screenNext] = { std::move(brief), IM_COL32(color[0], color[1], color[2], 255), steadySeconds() };
+    screenNext = (screenNext + 1) % static_cast<int>(screenLines.size());
+}
+
+[[nodiscard]] std::string playerName(int index) noexcept
+{
+    if (csgo::PlayerInfo info; engine && engine->getPlayerInfo(index, info))
+        return info.name;
+    return "#" + std::to_string(index);
+}
+
+// ---------- углы взгляда с сервера ----------
+// m_angEyeAngles у чужих игроков к CreateMove уже интерполирован (у джиттера — между фазами).
+// Присланный сервером угол живёт до RENDER_START: снимаем его в NET_UPDATE_POSTDATAUPDATE_START.
+
+struct NetworkState {
+    float simulationTime = -1.0f;
+    csgo::Vector eye{};
+    float aliveCycle = -1.0f;   // слой ALIVELOOP как прислал сервер
+    float aliveRate = 0.0f;
+    int aliveSequence = -1;
+};
+std::array<NetworkState, 65> network{};
+
+[[nodiscard]] csgo::Vector serverEyeAngles(int index, const csgo::Entity& entity) noexcept
+{
+    if (network[index].simulationTime == entity.simulationTime())
+        return network[index].eye;
+    return entity.eyeAngles();
+}
+
+// ---------- резольвер ----------
+// Одна шкала свидетельств на игрока: + — тело на стороне «взгляд + десинк», − — «взгляд − десинк».
+// Источники (вес): импакт пули доказал сторону геометрией (4), попадание по стороне (3 доказанное / 1.5),
+// промах по вине резольвера без доказательства (−2 той стороне). Свежие слои анимации используются напрямую
+// (скелет под найденный угол ног), в шкалу не пишутся.
+// Шкала медленно гаснет: статичный десинк держится долго, инвертер перебьют промахи.
+// У джиттерящих вместо стороны учим связь: совпадает ли сторона с фазой рывка взгляда.
+
+struct Brain {
     int userId = -1;
     bool tracked = false;
     float lastSimulationTime = 0.0f;
     float lastEyeYaw = 0.0f;
     float lastYawDelta = 0.0f;
-    std::uint8_t chokeHistory = 0xFF;   // бит на обновление: игрок чокал (иначе десинка нет)
-    std::uint8_t jitterHistory = 0;     // бит на обновление: yaw скачет туда-обратно
-    float jitterPhase = 1.0f;           // в какую сторону сейчас дёрнулся yaw
-    float guessedSide = 0.0f;           // фристенд-догадка (обновляется, когда нет пули в полёте)
-    std::array<int, ModeCount> score{};
-    int shotMode = -1;                  // режим, которым стреляли последним
-    // эксплойты врага
-    csgo::Vector lastOrigin{};
-    float maxSimulationTime = 0.0f;
-    bool breakingLagComp = false;       // за одно обновление сдвинулся > 64 юнитов — сервер его не откатывает
-    float defensiveUntil = 0.0f;        // время симуляции ушло назад (дефенсив/сдвиг тикбейса) — записи врут
-    // Память стороны по слоям. Слои видят угол ног в основном на ходу, а стреляем мы чаще по молчащим
-    // обновлениям — там сторону гадал фристенд, и по логам 29.10 «вперёд» с догадкой попадало 8 из 31,
-    // а с углом от слоёв 10 из 15. Статичный десинк держит одну сторону секундами — её и помним.
-    // Для джиттера учим, совпадает ли сторона с фазой yaw (у одних читов совпадает, у других наоборот).
-    float learnedFoundAt = -1.0f;       // simtime последней учтённой находки
-    float learnedAt = -100.0f;          // realtime её же
-    float memoryRatio = 0.0f;           // дельта находки в долях максимума, знак — сторона
-    std::uint8_t sameSideBits = 0;      // бит на находку: сторона та же, что у прошлой
-    std::uint8_t sameSideCount = 0;     // сколько бит выше настоящих (до 8)
-    std::uint8_t jitterSideBits = 0;    // бит на находку при джиттере: сторона = фаза yaw
-    std::uint8_t jitterSideCount = 0;
-    std::uint8_t memoryMisses = 0;      // промахи по памяти подряд
-    // После промаха по вине резольвера следующий выстрел бьёт зеркальной стороной, пока не попадём:
-    // перебор стороны получается быстрее, чем ждать, пока счёт режимов перевесит
-    float bruteSide = 0.0f;
+    std::uint8_t chokeBits = 0xFF;  // бит на обновление: чокал (без чока десинка нет)
+    std::uint8_t jitterBits = 0;    // бит на обновление: взгляд дёрнулся туда-обратно > 25°
+    float jitterPhase = 1.0f;       // знак последнего рывка
+    bool desyncProven = false;      // пуля прошла сквозь «недесинкающую» модель
+    float evidence = 0.0f;
+    float evidenceAt = 0.0f;
+    float jitterLink = 0.0f;        // + — сторона = фаза, − — сторона = −фаза
+    float bruteSide = 0.0f;         // после промаха без доказательства — пробуем другую сторону
     float bruteUntil = 0.0f;
-    // Попадания по голове/телу у этого игрока: у дефенсивных целей голова уходит, а тело стоит —
-    // по этой статистике выбираем, куда бить, вместо «всегда голова»
-    std::uint8_t headHits = 0, headShots = 0;
-    std::uint8_t bodyHits = 0, bodyShots = 0;
-    // Голосование стороны десинка: находки слоёв, доказанные импакты, попадания и промахи.
-    // Перевес затухает (~6 с), чтобы старые свидетельства не держали сторону вечно.
-    float sideVote = 0.0f;
-    float sideVoteAt = 0.0f;
-    // Как часто фаза джиттера меняется за обновление: 1 — каждый апдейт, 0.5 — раз в два.
-    // По ней предсказываем, где враг будет к моменту, когда сервер обработает наш выстрел.
-    std::uint8_t phaseChangeBits = 0;
-    std::uint8_t phaseChangeCount = 0;
-    // Совпадает ли фристенд-догадка с настоящей стороной: у части читов она систематически обратная
-    std::uint8_t guessSideBits = 0;
-    std::uint8_t guessSideCount = 0;
+    bool bruteProven = false;       // сторону перебора доказал импакт, а не «просто другая»
+    std::uint8_t guessRight = 0, guessWrong = 0;   // фристенд-догадка против доказанной стороны (его антиаим бывает наоборот)
+    float layerFoundAt = -1.0f;     // simtime последней учтённой находки по слоям
+    int misses = 0;                 // подряд, сбрасывается попаданием
+    float aheadBias = 0.0f;         // своя поправка прогноза «вперёд» (у каждого чита свой рисунок чока)
+    int aheadChecks = 0;
+    std::uint8_t headShots = 0, headHits = 0, bodyShots = 0, bodyHits = 0;
 };
-std::array<ResolverState, 65> resolverStates{};
+std::array<Brain, 65> brains{};
 
-// m_angEyeAngles у чужих игроков интерполируется: к CreateMove там уже сглаженный угол на lerp позади,
-// у джиттера — где-то между фазами. Настоящий, присланный сервером, живёт только до RENDER_START —
-// снимаем его в NET_UPDATE_POSTDATAUPDATE_START вместе с simtime, к которому он относится.
-struct NetworkAngles {
-    float simulationTime = -1.0f;
-    csgo::Vector eye{};
-};
-std::array<NetworkAngles, 65> networkAngles{};
-
-[[nodiscard]] csgo::Vector serverEyeAngles(int index, const csgo::Entity& entity) noexcept
+[[nodiscard]] bool desyncing(const Brain& brain) noexcept
 {
-    if (index > 0 && index < static_cast<int>(networkAngles.size()) && networkAngles[index].simulationTime == entity.simulationTime())
-        return networkAngles[index].eye;
-    return entity.eyeAngles();
-}
-std::array<int, 65> resolverMode{};  // режим на текущем тике, -1 — резольвер не применялся
-
-[[nodiscard]] bool isDesyncing(const ResolverState& state) noexcept
-{
-    // хотя бы 2 чока за последние 8 обновлений; без чока десинка не бывает
-    return !state.tracked || std::popcount(state.chokeHistory) >= 2;
+    return !brain.tracked || brain.desyncProven || std::popcount(brain.chokeBits) >= 2;
 }
 
-[[nodiscard]] bool isJittering(const ResolverState& state) noexcept
+[[nodiscard]] bool jittering(const Brain& brain) noexcept
 {
-    return std::popcount(static_cast<std::uint8_t>(state.jitterHistory & 0x0F)) >= 2;
+    return std::popcount(static_cast<std::uint8_t>(brain.jitterBits & 0x0F)) >= 2;
 }
 
-void addSideVote(ResolverState& state, float side, float weight, float realtime) noexcept;
-
-void trackPlayer(ResolverState& state, const csgo::Entity& entity, int index, int userId, float interval, float realtime) noexcept
+[[nodiscard]] float sideEvidence(const Brain& brain, float realtime) noexcept
 {
-    if (state.userId != userId) {
-        // на этом слоте другой игрок — всё выученное не про него
-        state = {};
-        state.userId = userId;
+    // полураспад ~14 с
+    return brain.evidence * std::exp(-(realtime - brain.evidenceAt) / 20.0f);
+}
+
+void addEvidence(Brain& brain, float side, float weight, float realtime) noexcept
+{
+    if (side == 0.0f)
+        return;
+    brain.evidence = std::clamp(sideEvidence(brain, realtime) + (side > 0.0f ? weight : -weight), -8.0f, 8.0f);
+    brain.evidenceAt = realtime;
+}
+
+void addJitterLink(Brain& brain, float side, float phase, float weight) noexcept
+{
+    if (side == 0.0f || phase == 0.0f)
+        return;
+    brain.jitterLink = std::clamp(brain.jitterLink + ((side > 0.0f) == (phase > 0.0f) ? weight : -weight), -6.0f, 6.0f);
+}
+
+void track(Brain& brain, const csgo::Entity& entity, int index, int userId, float interval) noexcept
+{
+    if (brain.userId != userId) {
+        brain = {};
+        brain.userId = userId;
     }
     const float simulationTime = entity.simulationTime();
-    if (state.tracked && simulationTime == state.lastSimulationTime)
+    if (brain.tracked && simulationTime == brain.lastSimulationTime)
         return;
-
     const float eyeYaw = serverEyeAngles(index, entity).y;
-    const auto origin = entity.origin();
-    if (state.tracked) {
-        // > 64 юнитов между обновлениями: сервер выключает для него лагкомпенсацию
-        state.breakingLagComp = (origin - state.lastOrigin).squareLength() > 64.0f * 64.0f;
-        // время пошло назад — враг сдвинул тикбейс (дефенсив/DT): его записи сейчас не совпадают с сервером
-        if (simulationTime + 0.001f < state.maxSimulationTime)
-            state.defensiveUntil = realtime + 0.2f;
+    if (brain.tracked && interval > 0.0f) {
+        const int ticks = static_cast<int>(std::lround((simulationTime - brain.lastSimulationTime) / interval));
+        if (ticks >= 1 && ticks <= 17)   // большие разрывы — дормант, а не чок
+            brain.chokeBits = static_cast<std::uint8_t>((brain.chokeBits << 1) | (ticks > 1 ? 1 : 0));
+        const float delta = std::remainder(eyeYaw - brain.lastEyeYaw, 360.0f);
+        const bool jitter = std::abs(delta) > 25.0f && std::abs(brain.lastYawDelta) > 25.0f && (delta > 0.0f) != (brain.lastYawDelta > 0.0f);
+        brain.jitterBits = static_cast<std::uint8_t>((brain.jitterBits << 1) | (jitter ? 1 : 0));
+        if (std::abs(delta) > 25.0f)
+            brain.jitterPhase = delta > 0.0f ? 1.0f : -1.0f;
+        brain.lastYawDelta = delta;
     }
-    state.lastOrigin = origin;
-    state.maxSimulationTime = std::max(state.maxSimulationTime, simulationTime);
-    if (state.tracked && interval > 0.0f) {
-        const int ticks = static_cast<int>(std::lround((simulationTime - state.lastSimulationTime) / interval));
-        // большие разрывы — это мы не следили (дормант, не та пушка), а не чок
-        if (ticks >= 1 && ticks <= 17)
-            state.chokeHistory = static_cast<std::uint8_t>((state.chokeHistory << 1) | (ticks > 1 ? 1 : 0));
+    brain.tracked = true;
+    brain.lastSimulationTime = simulationTime;
+    brain.lastEyeYaw = eyeYaw;
 
-        const float delta = std::remainder(eyeYaw - state.lastEyeYaw, 360.0f);
-        const bool jitter = std::abs(delta) > 25.0f && std::abs(state.lastYawDelta) > 25.0f && (delta > 0.0f) != (state.lastYawDelta > 0.0f);
-        state.jitterHistory = static_cast<std::uint8_t>((state.jitterHistory << 1) | (jitter ? 1 : 0));
-        // смена фазы за обновление: по этой доле предсказываем сторону к моменту выстрела на сервере
-        if (state.phaseChangeCount < 8)
-            ++state.phaseChangeCount;
-        if (std::abs(delta) > 25.0f) {
-            const float phase = delta > 0.0f ? 1.0f : -1.0f;
-            state.phaseChangeBits = static_cast<std::uint8_t>((state.phaseChangeBits << 1) | (phase != state.jitterPhase ? 1 : 0));
-            state.jitterPhase = phase;
-        } else {
-            state.phaseChangeBits = static_cast<std::uint8_t>(state.phaseChangeBits << 1);
-        }
-        state.lastYawDelta = delta;
-    }
-
-    // резольвер разбирает обновление раньше (NET_UPDATE), так что находка на этом simtime уже есть
+    // Находка по слоям у джиттерящих учит связь стороны с фазой рывка — она не устаревает.
+    // В шкалу стороны слои НЕ идут: находки приходят почти каждое обновление и за полсекунды забивали шкалу,
+    // заглушая импакты; а устаревшая сторона слоёв по логам хуже фристенд-догадки (45% против 52% в тело).
     float foundAt = 0.0f, ratio = 0.0f;
-    // Находку с низкой уверенностью в память не берём: «память слоёв» попадала 37% против 62% у самих
-    // слоёв именно потому, что в неё затекали находки на одном случайном сигнале.
-    const float foundConfidence = hvh::resolver::confidence(index);
-    if (hvh::resolver::lastFound(index, foundAt, ratio) && foundAt == simulationTime && foundAt != state.learnedFoundAt
-        && std::abs(ratio) > 0.3f && foundConfidence >= 0.25f) {
-        const bool positive = ratio > 0.0f;
-        // соседние обновления одного эпизода — не новые свидетельства, иначе «совпадений» будет 100%
-        if (realtime - state.learnedAt > 0.25f) {
-            if (state.learnedAt > 0.0f) {
-                state.sameSideBits = static_cast<std::uint8_t>((state.sameSideBits << 1) | (positive == (state.memoryRatio > 0.0f) ? 1 : 0));
-                state.sameSideCount = static_cast<std::uint8_t>(std::min(state.sameSideCount + 1, 8));
-            }
-            if (isJittering(state)) {
-                state.jitterSideBits = static_cast<std::uint8_t>((state.jitterSideBits << 1) | (positive == (state.jitterPhase > 0.0f) ? 1 : 0));
-                state.jitterSideCount = static_cast<std::uint8_t>(std::min(state.jitterSideCount + 1, 8));
-            }
-        }
-        state.learnedFoundAt = foundAt;
-        state.learnedAt = realtime;
-        state.memoryRatio = ratio;
-        state.memoryMisses = 0;
-        // находка по анимации — сильное свидетельство стороны, но ровно настолько, насколько она уверенная
-        addSideVote(state, ratio, 1.5f + 2.5f * foundConfidence, realtime);
+    if (jittering(brain) && hvh::resolver::lastFound(index, foundAt, ratio) && foundAt != brain.layerFoundAt && std::abs(ratio) > 0.3f) {
+        brain.layerFoundAt = foundAt;
+        addJitterLink(brain, ratio, brain.jitterPhase, 0.5f * std::clamp(hvh::resolver::confidence(index), 0.25f, 1.0f));
     }
-    state.lastSimulationTime = simulationTime;
-    state.lastEyeYaw = eyeYaw;
-    state.tracked = true;
 }
 
-[[nodiscard]] float agreement(std::uint8_t bits, std::uint8_t count) noexcept
-{
-    const unsigned mask = count >= 8 ? 0xFFu : (1u << count) - 1u;
-    return count ? static_cast<float>(std::popcount(static_cast<unsigned>(bits) & mask)) / static_cast<float>(count) : 0.0f;
-}
+// ---------- записи лагкомпа ----------
+// Сервер при выстреле откатывает цель в состояние на cmd->tickcount − lerp. Стреляем по записи с её simtime
+// и ставим tickcount = simtime + lerp — сервер проверит попадание по той же модели, что и мы.
 
-// Статичный десинк: дельта из памяти (доли максимума) или 0. Свежая единичная находка лучше фристенда,
-// старше — только если сторона у врага не скачет (≥ 70% находок совпали с предыдущей).
-[[nodiscard]] float rememberedRatio(const ResolverState& state, float realtime) noexcept
-{
-    if (state.learnedAt <= 0.0f || state.memoryMisses >= 2 || isJittering(state))
-        return 0.0f;
-    const float age = realtime - state.learnedAt;
-    const bool steady = state.sameSideCount >= 2 && agreement(state.sameSideBits, state.sameSideCount) >= 0.7f;
-    const bool flips = state.sameSideCount >= 2 && agreement(state.sameSideBits, state.sameSideCount) < 0.5f;
-    // Сроки были 3 и 10 с — слишком щедро: по логам 29.10 «память слоёв» попадала 27-37%, то есть
-    // ХУЖЕ фристенд-догадки (35%). Протухшая сторона вреднее отсутствия стороны, потому что ещё и
-    // отключает перебор. Держим память столько, сколько враг реально держит одну сторону.
-    if (flips || age > (steady ? 4.0f : 1.5f))
-        return 0.0f;
-    return state.memoryRatio;
-}
-
-// Джиттер: +1 — сторона десинка совпадает с фазой yaw, -1 — противоположна, 0 — не выучено (берём фазу как есть)
-[[nodiscard]] float jitterRelation(const ResolverState& state) noexcept
-{
-    if (state.jitterSideCount < 2)
-        return 0.0f;
-    const float agree = agreement(state.jitterSideBits, state.jitterSideCount);
-    return agree >= 0.7f ? 1.0f : agree <= 0.3f ? -1.0f : 0.0f;
-}
-
-// ---------- голосование стороны десинка ----------
-// Одно свидетельство ничего не решает, но находка слоёв, доказанный импакт и попадание вместе
-// дают устойчивую сторону. Перевес затухает: враг мог сменить настройки или сторону.
-void addSideVote(ResolverState& state, float side, float weight, float realtime) noexcept
-{
-    if (std::abs(side) < 0.05f || weight == 0.0f)
-        return;
-    if (state.sideVoteAt > 0.0f)
-        state.sideVote *= std::exp(-(realtime - state.sideVoteAt) / 6.0f);
-    state.sideVote += side > 0.0f ? weight : -weight;
-    state.sideVoteAt = realtime;
-}
-
-[[nodiscard]] float voteSide(const ResolverState& state, float realtime, float threshold = 1.5f) noexcept
-{
-    if (state.sideVoteAt <= 0.0f)
-        return 0.0f;
-    const float vote = state.sideVote * std::exp(-(realtime - state.sideVoteAt) / 6.0f);
-    return std::abs(vote) >= threshold ? (vote > 0.0f ? 1.0f : -1.0f) : 0.0f;
-}
-
-// Фристенд-догадка: у части читов открытая сторона систематически противоположна настоящей —
-// если попадания/импакты говорят об этом, догадку переворачиваем для этого игрока.
-[[nodiscard]] float guessSide(const ResolverState& state) noexcept
-{
-    if (state.guessSideCount >= 4 && agreement(state.guessSideBits, state.guessSideCount) <= 0.25f)
-        return -state.guessedSide;
-    return state.guessedSide;
-}
-
-// Сколько раз фаза джиттера меняется за одно обновление (по последним 8 обновлениям)
-[[nodiscard]] float phaseChangeRatio(const ResolverState& state) noexcept
-{
-    return state.phaseChangeCount >= 4 ? agreement(state.phaseChangeBits, state.phaseChangeCount) : 1.0f;
-}
-
-[[nodiscard]] int bestMode(const ResolverState& state) noexcept
-{
-    // «без поворота» не перебираем: по логам 29.10 — 1 попадание из 12, на HvH десинкают все,
-    // а он выигрывал счёт просто потому, что остальные режимы набрали промахов.
-    // Половинные режимы туда же: «угадано low» 1 из 9, «обратно low» 1 из 4 — величину десинка
-    // теперь даёт память слоёв (ratio), гадать её вслепую смысла нет.
-    int best = 0;
-    for (int mode = 1; mode < ModeCount; ++mode) {
-        if (mode == NoResolve || mode == GuessLow || mode == OppositeLow)
-            continue;
-        if (state.score[mode] > state.score[best])
-            best = mode;
-    }
-    // «Обратно» по логам 29.10 попадает 26% против 50% у «угадано», и 7 его промахов из 11 — это
-    // prediction error, а не сторона. То есть счёт ему натекает с чужих промахов (пинг, стена,
-    // смерть), а не с доказанной стороны. Зеркалить стоит только с запасом в два очка.
-    if (best == Opposite && state.score[Opposite] < state.score[Guess] + 2)
-        best = Guess;
-    return best;
-}
-
-// ---------- свой лагкомп: записи игрока на каждое новое simulationTime ----------
-// Сервер при выстреле откатывает цель ровно в состояние на cmd->tickcount - lerp. Если стрелять по записи
-// с её simtime и ставить tickcount = simtime + lerp, сервер проверит попадание по той же модели, что и мы, —
-// без интерполяции между обновлениями, которая и давала «пуля прошла через точку, а модели там не было».
-
-// откуда взята модель, по которой стреляем (приоритет: выстрел врага > стоит на месте > свежая > старая)
-// «вперёд» — свежая запись старше окна отката: сервер возьмёт своё текущее состояние врага, оно новее нашего
 enum class RecordKind { Onshot, Standing, Newest, Oldest, Live, Extrapolated, Ahead };
-constexpr const char* kindNames[]{ "onshot", "стоит", "свежая", "старая", "без бектрека", "экстраполяция", "вперёд" };
+constexpr const char* kindNames[]{ "onshot", "стоит", "свежая", "старая", "без записей", "экстраполяция", "вперёд" };
 
 struct LagRecord {
     float simulationTime = 0.0f;
-    csgo::Vector origin{};          // m_vecOrigin — где игрок стоит на сервере в этот simtime
-    csgo::Vector eyeAngles{};
-    float absYaw = 0.0f;            // куда клиент повернул ноги (от этого считает резольвер)
+    float receivedAt = 0.0f;
+    csgo::Vector origin{};
     csgo::Vector velocity{};
+    csgo::Vector eyeAngles{};
+    float absYaw = 0.0f;
     int flags = 0;
-    int choked = 0;                 // тиков между этим и прошлым обновлением (1 — не чокал)
-    bool shot = false;              // в этом обновлении враг выстрелил: углы настоящие, не фейк
-    bool breakingLagComp = false;   // сдвинулся > 64 юнитов — сервер не откатывает, только экстраполяция
-    float receivedAt = 0.0f;        // realtime, когда запись пришла к нам
-    bool rebuilt = false;           // plus/minus собраны анимацией (ноги = взгляд ± десинк), а не поворотом костей
-    bool resolved = false;          // bones собраны под угол ног от резольвера по слоям анимации
-    bool remembered = false;        // ...или под сторону из памяти прошлых находок (слои молчат)
+    int choked = 1;                 // тиков с прошлого обновления (1 — не чокал)
+    bool shot = false;              // выстрелил в этом обновлении: углы настоящие
+    bool breakingLagComp = false;   // сдвинулся > 64 ед.: сервер не откатывает
+    bool animStale = false;         // анимация прошла не столько, сколько simtime (дефенсив)
+    float maxDesync = 0.0f;
+    float jitterPhase = 1.0f;       // фаза джиттера на момент записи
+    bool variants = false;          // plus/minus собраны анимацией
+    bool resolved = false;          // bones собраны под угол ног от резольвера по слоям
     float resolvedYaw = 0.0f;
-    float maxDesync = 0.0f;         // предел десинка из animstate врага на этот simtime (0 — считать по скорости)
+    float resolvedConfidence = 0.0f;
+    float aliveCycle = -1.0f;
+    float aliveRate = 0.0f;
+    int aliveSequence = -1;
     csgo::matrix3x4 bones[RECORD_BONES];
     csgo::matrix3x4 plus[RECORD_BONES];
     csgo::matrix3x4 minus[RECORD_BONES];
@@ -371,22 +316,14 @@ struct PlayerRecords {
     std::array<LagRecord, MAX_RECORDS> ring;
     int newestIndex = -1;
     int count = 0;
-    float skippedSimulationTime = -1.0f;    // запись после отката времени — её не берём
+    float skippedSimulationTime = -1.0f;
 
-    // age 0 — самая свежая
     [[nodiscard]] const LagRecord& at(int age) const noexcept { return ring[(newestIndex - age + MAX_RECORDS) % MAX_RECORDS]; }
     LagRecord& push() noexcept
     {
         newestIndex = (newestIndex + 1) % MAX_RECORDS;
         count = std::min(count + 1, MAX_RECORDS);
         return ring[newestIndex];
-    }
-    void popNewest() noexcept
-    {
-        if (count <= 0)
-            return;
-        newestIndex = (newestIndex - 1 + MAX_RECORDS) % MAX_RECORDS;
-        --count;
     }
     void clear() noexcept
     {
@@ -397,20 +334,17 @@ struct PlayerRecords {
 };
 std::array<PlayerRecords, 65> records;
 
-// чем быстрее бежит, тем меньше возможный десинк (~58° стоя, ~29° на полном беге)
 [[nodiscard]] float maxDesyncFor(const csgo::Vector& velocity) noexcept
 {
     return 58.0f * (1.0f - 0.5f * std::clamp(velocity.length2D() / 250.0f, 0.0f, 1.0f));
 }
 
-// ---------- пересборка анимации ----------
-// Вместо поворота готовых костей ставим модели то, что есть на сервере: ноги (abs yaw) = взгляд ± десинк,
-// body_yaw = взгляд - ноги, move_yaw — от новых ног, сбрасываем кэш костей и зовём setupBones.
-// Офсеты кэша берём из байтов C_BaseAnimating::InvalidateBoneCache (паттерн в LinuxClientPatternFinder):
+// ---------- пересборка скелета под заданный угол ног ----------
+// Ставим модели ноги (abs yaw), body_yaw = взгляд − ноги и move_yaw от новых ног, сбрасываем кэш костей
+// и просим у игры скелет. Офсеты кэша — из байтов C_BaseAnimating::InvalidateBoneCache:
 //   mov rax,[rip+g_iModelBoneCounter]; mov dword [rdi+m_flLastBoneSetupTime],-FLT_MAX; sub rax,1; mov [rdi+m_iMostRecentModelBoneCounter],rax
-// Саму функцию не зовём: она закрыта флагом s_bEnableInvalidateBoneCache и вне отрисовки ничего не делает.
-constexpr int POSE_MOVE_YAW = 7;    // [-180, 180]
-constexpr int POSE_BODY_YAW = 11;   // [-60, 60] (animset_t.mdl)
+constexpr int POSE_MOVE_YAW = 7;
+constexpr int POSE_BODY_YAW = 11;
 
 struct BoneCacheOffsets {
     bool ok = false;
@@ -430,7 +364,6 @@ const BoneCacheOffsets& boneCacheOffsets(const Memory& memory) noexcept
         std::memcpy(&counterDisplacement, function + 16, 4);
         std::memcpy(&lastBoneSetupTime, function + 22, 4);
         std::memcpy(&mostRecentModelBoneCounter, function + 37, 4);
-        // на этой сборке игры: 0x2f98 и 0x2c58 — всё, что сильно в стороне, считаем чужой функцией
         if (lastBoneSetupTime < 0x1000 || lastBoneSetupTime > 0x8000 || mostRecentModelBoneCounter < 0x1000 || mostRecentModelBoneCounter > 0x8000)
             return result;
         result.lastBoneSetupTime = lastBoneSetupTime;
@@ -449,11 +382,9 @@ void invalidateBoneCache(const csgo::Entity& entity, const BoneCacheOffsets& off
     *reinterpret_cast<std::uint64_t*>(base + offsets.mostRecentModelBoneCounter) = *offsets.modelBoneCounter - 1;
 }
 
-int rebuildFailures = 0;        // подряд скелетов, где пересборка ничего не поменяла
-bool rebuildDisabled = false;   // кэш костей так и не сбрасывается — дальше только поворот по высоте
+int rebuildFailures = 0;
+bool rebuildDisabled = false;   // кэш так и не сбрасывается — дальше крайние скелеты поворотом костей
 
-// Собирает скелет при заданном угле ног: ставит animstate-подобные позы (body_yaw/move_yaw),
-// крутит ноги модели на feetYaw, сбрасывает кэш костей и просит у игры скелет.
 bool rebuildAtYaw(const csgo::Entity& entity, const Memory& memory, const LagRecord& record, float feetYaw, csgo::matrix3x4* out) noexcept
 {
     const auto& offsets = boneCacheOffsets(memory);
@@ -490,7 +421,7 @@ bool rebuildAtYaw(const csgo::Entity& entity, const Memory& memory, const LagRec
         }
     }
 
-    // вернуть как было и снова сбросить кэш — иначе этот кадр отрисует наш последний скелет
+    // вернуть как было и снова сбросить кэш — иначе кадр отрисует наш последний скелет
     poses[POSE_BODY_YAW] = savedBodyYaw;
     poses[POSE_MOVE_YAW] = savedMoveYaw;
     absAngles = savedAbsAngles;
@@ -499,82 +430,96 @@ bool rebuildAtYaw(const csgo::Entity& entity, const Memory& memory, const LagRec
     return ok;
 }
 
-// plus/minus — крайние углы ног (для безопасных точек), а если резольвер по слоям дал угол,
-// то и сам скелет записи собираем под него: стреляем ровно по той модели, что на сервере.
-bool rebuildDesyncVariants(const csgo::Entity& entity, const Memory& memory, LagRecord& record, float maxDesync,
-    float resolvedYaw, bool haveResolved, bool needExtremes) noexcept
+// Запасной путь, если пересборка недоступна: поворот готовых костей вокруг оси игрока.
+// На сервере на полный угол повёрнуты ноги и таз, а позвоночник закручен обратно к взгляду:
+// чем выше кость, тем меньше доворот (ступни 100%, голова ~35%).
+void rotateVariant(const LagRecord& record, float sign, csgo::matrix3x4* out) noexcept
 {
-    const auto& offsets = boneCacheOffsets(memory);
-    if (!offsets.ok || rebuildDisabled)
-        return false;
-
-    // Резольвер дал угол, а безопасные точки выключены — крайние скелеты не нужны,
-    // а каждый из них это ещё один setupBones (самое дорогое, что чит делает за тик).
-    if (haveResolved && !needExtremes) {
-        if (!rebuildAtYaw(entity, memory, record, resolvedYaw, record.plus))
-            return false;
-        constexpr int headBone = 8;
-        if ((record.plus[headBone].origin() - record.bones[headBone].origin()).length() >= 40.0f)
-            return false;   // скелет уехал — пересборка сломалась, лучше стрелять по клиентскому
-        std::copy(record.plus, record.plus + RECORD_BONES, record.bones);
-        record.resolved = true;
-        record.resolvedYaw = std::remainder(resolvedYaw, 360.0f);
-        return false;       // plus/minus не построены — геометрических вариантов нет
+    const float maxDesync = record.maxDesync > 1.0f ? record.maxDesync : maxDesyncFor(record.velocity);
+    const float turn = std::remainder(record.eyeAngles.y - record.absYaw, 360.0f) + sign * maxDesync;
+    for (int bone = 0; bone < RECORD_BONES; ++bone) {
+        out[bone] = record.bones[bone];
+        const float height = std::clamp((record.bones[bone].origin().z - record.origin.z) / 64.0f, 0.0f, 1.0f);
+        const float radians = Helpers::deg2rad(turn * (1.0f - 0.65f * height));
+        out[bone].rotateYaw(record.origin, std::cos(radians), std::sin(radians));
     }
-
-    const float eyeYaw = record.eyeAngles.y;
-    if (!rebuildAtYaw(entity, memory, record, eyeYaw + maxDesync, record.plus)
-        || !rebuildAtYaw(entity, memory, record, eyeYaw - maxDesync, record.minus))
-        return false;
-
-    // самопроверка: при десинке ~30°+ голова обязана сдвинуться, но не улететь за пределы модели
-    constexpr int headBone = 8;
-    const float plusMove = (record.plus[headBone].origin() - record.bones[headBone].origin()).length();
-    const float minusMove = (record.minus[headBone].origin() - record.bones[headBone].origin()).length();
-    const bool sane = plusMove < 40.0f && minusMove < 40.0f;
-    const bool changed = std::max(plusMove, minusMove) > 0.5f;
-    if (!sane || (!changed && maxDesync > 25.0f)) {
-        if (++rebuildFailures >= 8) {
-            rebuildDisabled = true;
-            static constexpr std::uint8_t yellow[4]{ 255, 210, 90, 255 };
-            if (memory.conColorMsg)
-                memory.conColorMsg(yellow, "%s\n", "[ECLIPSE] пересборка анимации не меняет скелет — резольвер вернулся к повороту костей по высоте");
-        }
-        return false;
-    }
-    rebuildFailures = 0;
-
-    if (haveResolved && rebuildAtYaw(entity, memory, record, resolvedYaw, record.bones)) {
-        record.resolved = true;
-        record.resolvedYaw = std::remainder(resolvedYaw, 360.0f);
-    } else if (std::abs(std::remainder(entity.eyeAngles().y - eyeYaw, 360.0f)) > 5.0f) {
-        // клиент собрал скелет со сглаженным взглядом (джиттер) — верх тела смотрит не туда, куда на сервере;
-        // пересобираем «без поворота» с теми же ногами, но настоящим взглядом
-        rebuildAtYaw(entity, memory, record, record.absYaw, record.bones);
-    }
-    return true;
 }
 
-void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory& memory, bool rebuild, int index) noexcept
+void buildVariants(const csgo::Entity& entity, const Memory& memory, LagRecord& record, int index) noexcept
+{
+    const float maxDesync = record.maxDesync > 1.0f ? record.maxDesync : maxDesyncFor(record.velocity);
+    const float eyeYaw = record.eyeAngles.y;
+    record.variants = rebuildAtYaw(entity, memory, record, eyeYaw + maxDesync, record.plus)
+        && rebuildAtYaw(entity, memory, record, eyeYaw - maxDesync, record.minus);
+    if (record.variants) {
+        // самопроверка: при десинке ~30°+ голова обязана сдвинуться, но не улететь
+        const float plusMove = (record.plus[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length();
+        const float minusMove = (record.minus[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length();
+        if (plusMove > 40.0f || minusMove > 40.0f || (std::max(plusMove, minusMove) < 0.5f && maxDesync > 25.0f)) {
+            record.variants = false;
+            if (++rebuildFailures >= 8)
+                rebuildDisabled = true;
+        } else {
+            rebuildFailures = 0;
+        }
+    }
+    if (!record.variants) {
+        rotateVariant(record, 1.0f, record.plus);
+        rotateVariant(record, -1.0f, record.minus);
+        record.variants = true;
+    }
+
+    // угол ног от резольвера по слоям — стреляем ровно по той модели, что на сервере
+    if (hvh::resolver::valid(index)) {
+        static csgo::matrix3x4 resolved[RECORD_BONES];
+        // Угол ног — от взгляда ЭТОЙ записи: у резольвера взгляд с его последнего разбора, и если враг
+        // успел развернуться (выстрел, дефенсив), абсолютный угол уезжал за предел десинка
+        // (лог 31.10: «ноги +159°/57°» — скелет с телом задом наперёд).
+        const float yaw = eyeYaw + std::clamp(hvh::resolver::delta(index), -maxDesync, maxDesync);
+        if (rebuildAtYaw(entity, memory, record, yaw, resolved) && (resolved[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length() < 40.0f) {
+            std::copy(resolved, resolved + RECORD_BONES, record.bones);
+            record.resolved = true;
+            record.resolvedYaw = std::remainder(yaw, 360.0f);
+            record.resolvedConfidence = hvh::resolver::confidence(index);
+            return;
+        }
+    }
+    // клиент собрал скелет со сглаженным взглядом (джиттер) — пересобираем с теми же ногами и настоящим взглядом
+    if (std::abs(std::remainder(entity.eyeAngles().y - eyeYaw, 360.0f)) > 5.0f)
+        rebuildAtYaw(entity, memory, record, record.absYaw, record.bones);
+}
+
+// «потерял след» у лагкомпа сервера: соседние записи дальше 64 ед. по горизонтали
+[[nodiscard]] bool horizontalJump(const csgo::Vector& a, const csgo::Vector& b) noexcept
+{
+    const float dx = a.x - b.x;
+    const float dy = a.y - b.y;
+    return dx * dx + dy * dy > 64.0f * 64.0f;
+}
+
+void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory& memory, bool withVariants, int index, float maxUnlag) noexcept
 {
     const float simulationTime = entity.simulationTime();
     if (list.count && simulationTime == list.at(0).simulationTime)
         return;
     if (simulationTime == list.skippedSimulationTime)
         return;
-
     if (list.count && simulationTime < list.at(0).simulationTime) {
-        // время ушло назад — дефенсив/сдвиг тикбейса. Записи новее этого момента сервер теперь не найдёт:
-        // при откате он берёт первую запись с simtime <= цели, начиная с новых, а новые теперь «из прошлого».
-        // Саму эту запись тоже пропускаем, ждать её «починки» не будем — стреляем по остальным.
-        while (list.count && list.at(0).simulationTime >= simulationTime)
-            list.popNewest();
-        list.skippedSimulationTime = simulationTime;
-        return;
+        // Время ушло назад (дефенсив DT). Сервер в таком случае новую запись в историю лагкомпа не кладёт
+        // и старые не трогает (CLagCompensationManager: "don't add new entry for same or older time"):
+        // выстрел проверяется по голове истории — записи с наибольшим simtime. Повторяем ровно это:
+        // наша свежая запись и есть та модель, по которой сервер будет судить, пока simtime её не перегонит.
+        // Но каждый кадр сервер удаляет записи старше curtime − sv_maxunlag; удалил голову — история пуста,
+        // и следующая запись принимается с любым simtime (иначе после отката тикбейса держали бы старьё секундами).
+        // Записи старше остаются: скорость и чок считаются по max(Δsimtime, Δприёма), бектрек — по simtime каждой.
+        if (list.at(0).simulationTime >= memory.globalVars->serverTime() - maxUnlag) {
+            list.skippedSimulationTime = simulationTime;
+            return;
+        }
     }
 
-    static csgo::matrix3x4 bones[MAXSTUDIOBONES];
-    if (!entity.setupBones(bones, MAXSTUDIOBONES, BONE_USED_BY_HITBOX, memory.globalVars->currenttime))
+    static csgo::matrix3x4 setup[MAXSTUDIOBONES];
+    if (!entity.setupBones(setup, MAXSTUDIOBONES, BONE_USED_BY_HITBOX, memory.globalVars->currenttime))
         return;
 
     const float interval = memory.globalVars->intervalPerTick;
@@ -586,72 +531,75 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
     record.simulationTime = simulationTime;
     record.receivedAt = memory.globalVars->realtime;
     record.origin = entity.origin();
+    record.velocity = entity.velocity();
     record.eyeAngles = serverEyeAngles(index, entity);
     record.absYaw = entity.getAbsAngle().y;
-    record.velocity = entity.velocity();
     record.flags = entity.flags();
-    record.choked = havePrevious && interval > 0.0f ? std::clamp(static_cast<int>(std::lround((simulationTime - previousSimulationTime) / interval)), 1, 17) : 1;
-    record.breakingLagComp = havePrevious && (record.origin - previousOrigin).squareLength() > 64.0f * 64.0f;
+    if (havePrevious && interval > 0.0f) {
+        const float gap = std::max(simulationTime - previousSimulationTime, record.receivedAt - list.at(1).receivedAt - interval);
+        record.choked = std::clamp(static_cast<int>(std::lround(gap / interval)), 1, 17);
+    } else {
+        record.choked = 1;
+    }
+    // сервер сравнивает по горизонтали (Length2DSqr > m_flTeleportDistanceSqr): падение или прыжок — не телепорт
+    record.breakingLagComp = havePrevious && horizontalJump(record.origin, previousOrigin);
     record.shot = false;
     if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, entity.getActiveWeapon()); weapon.getPOD())
         record.shot = std::abs(weapon.lastShotTime() - simulationTime) < interval * 0.5f;
+    record.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
+    record.jitterPhase = brains[index].jitterPhase;
+    record.variants = false;
+    record.resolved = false;
+    record.resolvedConfidence = 0.0f;
 
-    // setupBones отдаёт скелет в интерполированной позиции (getAbsOrigin); на сервере в этот simtime
-    // игрок стоит в m_vecOrigin — переносим скелет туда целиком
+    // Дефенсив: сервер гоняет команды со сдвинутым тикбейсом, а цикл ALIVELOOP идёт по настоящему времени
+    // анимации. Сдвинулся не на rate·Δsimtime — запись описывает не тот тик, откат её не найдёт.
+    const auto& net = network[index];
+    const bool haveAlive = net.simulationTime == simulationTime && net.aliveSequence >= 0;
+    record.aliveCycle = haveAlive ? net.aliveCycle : -1.0f;
+    record.aliveRate = haveAlive ? net.aliveRate : 0.0f;
+    record.aliveSequence = haveAlive ? net.aliveSequence : -1;
+    record.animStale = false;
+    if (haveAlive && havePrevious && simulationTime > previousSimulationTime) {
+        const auto& previous = list.at(1);
+        const float expected = previous.aliveCycle + previous.aliveRate * (simulationTime - previousSimulationTime);
+        if (previous.aliveSequence == record.aliveSequence && previous.aliveCycle >= 0.0f && previous.aliveRate > 0.0f
+            && expected < 0.9f && record.aliveCycle >= previous.aliveCycle && record.aliveCycle < 0.9f)
+            record.animStale = std::abs(record.aliveCycle - expected) > std::max(2.0f * interval * previous.aliveRate, 0.002f);
+    }
+
+    // setupBones отдаёт скелет в интерполированной позиции; на сервере в этот simtime игрок в m_vecOrigin
     const auto shift = record.origin - entity.getAbsOrigin();
     for (int bone = 0; bone < RECORD_BONES; ++bone) {
-        record.bones[bone] = bones[bone];
+        record.bones[bone] = setup[bone];
         record.bones[bone].translate(shift);
     }
-    record.rebuilt = false;
-    record.resolved = false;
-    record.remembered = false;
-    record.resolvedYaw = 0.0f;
-    // предел десинка из animstate врага: у бегущих/присевших он свой, и «58°» на глаз уводит точку мимо
-    record.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
-    if (rebuild) {
-        // максимальный десинк — по формуле самого клиента из animstate врага, а не на глаз
-        const float animMax = entity.getMaxDesyncAngle();
-        const float maxDesync = animMax > 1.0f ? std::clamp(animMax, 0.0f, 60.0f) : maxDesyncFor(record.velocity);
-        const bool haveResolved = hvh::resolver::valid(index);
-        // слои молчат — сторона из прошлой находки, если враг её держит (статичный десинк)
-        const auto& state = resolverStates[index];
-        const float remembered = haveResolved || !isDesyncing(state) ? 0.0f : rememberedRatio(state, memory.globalVars->realtime);
-        const bool useMemory = remembered != 0.0f;
-        const float yaw = haveResolved ? hvh::resolver::footYaw(index) : record.eyeAngles.y + remembered * maxDesync;
-        record.rebuilt = rebuildDesyncVariants(entity, memory, record, maxDesync,
-            haveResolved || useMemory ? yaw : 0.0f, haveResolved || useMemory,
-            config.rage.safePoint != 0 || config.rage.resolverSafeWhenUnsure);
-        record.remembered = useMemory && record.resolved;
-    }
+    if (withVariants)
+        buildVariants(entity, memory, record, index);
 }
 
-// Стандартная проверка лагкомпа: сервер откатит на cmd->tickcount, только если эта цель
-// не дальше 0.2 с от «правильного» времени (пинг туда + обратно + lerp) и не старше sv_maxunlag
-[[nodiscard]] bool recordValid(float simulationTime, float serverTime, float latencyOut, float latencyIn, float lerp, float maxUnlag) noexcept
+// Окно отката сервера: цель не дальше 0.2 с от «правильного» времени и не старше sv_maxunlag
+// (serverTime — наш тикбейс, то есть время выполнения команды на сервере)
+[[nodiscard]] bool recordValid(float simulationTime, float serverTime, float latencyIn, float lerp, float maxUnlag, float interval) noexcept
 {
-    // как на сервере: его исходящая задержка (к нам — наша входящая) + lerp, без нашей исходящей
-    (void)latencyOut;
-    const float correct = std::clamp(latencyIn + lerp, 0.0f, maxUnlag);
-    if (std::abs(correct - (serverTime - simulationTime)) >= 0.2f)
+    // сервер берёт lerp в целых тиках
+    const float lerpTicks = std::floor(0.5f + lerp / interval) * interval;
+    const float correct = std::clamp(latencyIn + lerpTicks, 0.0f, maxUnlag);
+    // запас 10 мс: задержка, которую меряет сервер, дрожит относительно нашей — запись на самом краю окна
+    // он сочтёт невалидной и откатит врага в другое время
+    if (std::abs(correct - (serverTime - simulationTime)) >= 0.19f)
         return false;
-    // serverTime — наш тикбейс, то есть уже время, когда сервер выполнит команду (пинг в нём учтён).
-    // Раньше тут был ещё + latencyOut: пинг считался дважды, и при пинге от ~100 мс не проходила ни одна запись
     return simulationTime >= serverTime - maxUnlag;
 }
 
-// Сколько обновлений врага сервер успеет принять сверх нашей свежей записи к моменту, когда выполнит наш выстрел:
-// запись уже лежит у нас (realtime - receivedAt), плюс пинг туда-обратно; враг шлёт пакет раз в choked тиков.
-// Движение считаем не по m_vecVelocity (у чужих игроков она оценочная), а по самим записям: смещение между
-// двумя последними, поворот скорости между тремя (распрыжка с автострейфом идёт дугой), гравитация и земля.
-// Дальше прогоняем это по тикам до нужного обновления.
-// Поправка к числу обновлений, которые успеет принять сервер: пинг из getLatency не знает, сколько наша
-// команда ждёт на сервере и сколько стоит в чоке. Подстраивается по промахам «вперёд» (calibrateAhead).
-float aheadBias = 0.0f;
+// ---------- прогноз для врагов вне окна отката ----------
+// У заряженных DT/дефенсива simtime отстаёт на 150-450 мс: окно отката до записей не дотягивается, и сервер
+// стреляет по своему текущему состоянию врага — оно новее нашей свежей записи на обновления, которые придут
+// к нему, пока летит наш выстрел. Движение — по самим записям (смещение, поворот дугой, гравитация, земля).
+// Сервер чаще берёт на обновление меньше расчёта: ставим модель между N−1 и N, «устойчивые» точки — по обеим.
 
-// Сколько тиков враг обычно чокает: медиана последних 5 записей. По одной свежей нельзя — у фейклага
-// с рандомом чок скачет 2/15/2, и «+7 обн.» по чоку 2 означает, что мы увели модель на 200 мс вперёд,
-// а сервер всё это время держал её на месте до следующего пакета.
+float aheadBias = 0.0f;   // общая поправка числа обновлений по проверкам промахов — пока своей у игрока мало
+
 [[nodiscard]] int typicalChoke(const PlayerRecords& list) noexcept
 {
     std::array<int, 5> chokes{};
@@ -664,40 +612,42 @@ float aheadBias = 0.0f;
     return chokes[count / 2];
 }
 
-// step — на сколько враг сдвинется за одно своё обновление сверх предсказанного (для точек, устойчивых к ±1 обн.)
-int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, float latency, float interval, float gravity, csgo::Vector& step) noexcept
+// step — полшага (половина смещения за обновление): модели N−1 и N = out ∓ step
+int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, float latency, float interval, float gravity, float bias, csgo::Vector& step) noexcept
 {
     const auto& newest = list.at(0);
     const int choke = typicalChoke(list);
     const float updateTime = static_cast<float>(choke) * interval;
-    // Мы уже дольше обычного не получаем от него ничего — значит, он не шлёт (длинный чок, зарядка DT),
-    // и у сервера данных не новее нашей записи: модель стоит там же, пока не придёт пачка. Раньше в такой
-    // тишине насчитывали «+8 обн.» и уводили модель на 250 мс туда, где её не было.
+    // дольше обычного молчит — не шлёт (зарядка DT) или simtime ушёл назад (дефенсив, запись не принята):
+    // у сервера ровно наша запись. Запас на дрожание сети: не меньше периода + 30 мс
     const float silence = realtime - newest.receivedAt;
     const float elapsed = std::clamp(silence + latency, 0.0f, 0.5f);
-    const int updates = silence > updateTime * 1.5f
-        ? 0 : std::max(static_cast<int>(elapsed / updateTime) + static_cast<int>(std::lround(aheadBias)), 0);
+    const int updates = silence > std::max(updateTime * 1.5f, updateTime + 0.03f)
+        ? 0 : std::max(static_cast<int>(elapsed / updateTime) + static_cast<int>(std::lround(bias)), 0);
     const int ticks = std::min(updates * choke, static_cast<int>(0.3f / interval));
 
+    // время между записями: у дефенсива simtime почти стоит, а враг идёт по настоящему времени —
+    // берём большее из разницы simtime и времени между пакетами (минус тик дрожания приёма)
+    const auto moveTime = [interval](const LagRecord& later, const LagRecord& earlier) {
+        return std::max(later.simulationTime - earlier.simulationTime, later.receivedAt - earlier.receivedAt - interval);
+    };
     auto velocity = newest.velocity;
-    float turnRate = 0.0f;   // градусов в секунду
+    float turnRate = 0.0f;
     if (list.count >= 2) {
         const auto& previous = list.at(1);
-        const float dt = newest.simulationTime - previous.simulationTime;
+        const float dt = moveTime(newest, previous);
         if (dt > 0.0f && dt <= 0.5f && (newest.origin - previous.origin).squareLength() < 64.0f * 64.0f) {
             velocity = (newest.origin - previous.origin) / dt;
-            // средняя вертикальная скорость за отрезок -> скорость в момент свежей записи
             if (!(newest.flags & FL_ONGROUND))
                 velocity.z -= 0.5f * gravity * dt;
             if (list.count >= 3) {
                 const auto& older = list.at(2);
-                const float dt2 = previous.simulationTime - older.simulationTime;
+                const float dt2 = moveTime(previous, older);
                 if (dt2 > 0.0f && dt2 <= 0.5f) {
-                    const auto velocityBefore = (previous.origin - older.origin) / dt2;
-                    if (velocity.length2D() > 30.0f && velocityBefore.length2D() > 30.0f) {
-                        const float yawNow = std::atan2(velocity.y, velocity.x);
-                        const float yawBefore = std::atan2(velocityBefore.y, velocityBefore.x);
-                        turnRate = std::clamp(Helpers::rad2deg(std::remainder(yawNow - yawBefore, 2.0f * 3.14159265f)) / (0.5f * (dt + dt2)), -300.0f, 300.0f);
+                    const auto before = (previous.origin - older.origin) / dt2;
+                    if (velocity.length2D() > 30.0f && before.length2D() > 30.0f) {
+                        const float turn = std::remainder(std::atan2(velocity.y, velocity.x) - std::atan2(before.y, before.x), 2.0f * 3.14159265f);
+                        turnRate = std::clamp(Helpers::rad2deg(turn) / (0.5f * (dt + dt2)), -300.0f, 300.0f);
                     }
                 }
             }
@@ -713,7 +663,7 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
     }
 
     csgo::Vector position = newest.origin;
-    bool onGround = newest.flags & FL_ONGROUND;
+    const bool onGround = newest.flags & FL_ONGROUND;
     const float turnPerTick = Helpers::deg2rad(turnRate * interval);
     const float c = std::cos(turnPerTick), s = std::sin(turnPerTick);
     for (int tick = 0; tick < ticks; ++tick) {
@@ -732,7 +682,12 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
         }
     }
 
-    step = { velocity.x * updateTime, velocity.y * updateTime, onGround ? 0.0f : velocity.z * updateTime };
+    step = csgo::Vector{};
+    if (updates > 0) {
+        const csgo::Vector full{ velocity.x * updateTime, velocity.y * updateTime, onGround ? 0.0f : velocity.z * updateTime };
+        step = full * 0.5f;
+        position -= step;
+    }
     out = newest;
     out.choked = choke;
     const auto shift = position - newest.origin;
@@ -743,7 +698,6 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
     }
     out.origin = position;
     out.velocity = velocity;
-    // время того обновления врага, в котором он, по нашему расчёту, будет на сервере
     out.simulationTime = newest.simulationTime + static_cast<float>(updates) * updateTime;
     return updates;
 }
@@ -753,9 +707,8 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
     return static_cast<int>(0.5f + time / interval);
 }
 
-// ---------- логи выстрелов в консоль ----------
+// ---------- геометрия: хитбоксы-капсулы ----------
 
-// хитбоксы-капсулы одной версии скелета: считаем один раз, дальше по ним сотни лучей
 struct Capsule {
     csgo::Vector a, b;
     float radius;
@@ -766,400 +719,13 @@ struct Capsules {
     int count = 0;
 };
 
-bool rayHitsPlayer(const csgo::Vector& start, const csgo::Vector& end, const Capsules& capsules) noexcept;
-void buildCapsules(const csgo::StudioHitboxSet& set, const csgo::matrix3x4* bones, Capsules& out) noexcept;
-
-struct ShotRecord {
-    csgo::Vector eye;
-    csgo::Vector aimPoint;
-    bool isHead = false;
-    bool edgePoint = false;  // мультипоинт (край), а не центр хитбокса
-    bool safe = false;
-    float side = 0.0f;       // резольвер: +1/-1, ±0.5 — low delta, 0 — без поправки
-    float guessedSide = 0.0f; // что в момент выстрела давала фристенд-догадка (проверяем её на попаданиях)
-    int damage = 0;
-    int mode = -1;
-    RecordKind kind = RecordKind::Live;
-    int backtrackTicks = 0;  // на сколько тиков запись старше самой свежей
-    int hitchance = 0;       // % из 256 сидов
-    float enemySpeed = 0.0f;
-    int enemyChoke = 0;
-    // почему без бектрека: сколько было записей, возраст свежей, пинг, sv_maxunlag
-    int updatesAhead = 0;    // «вперёд»: на сколько обновлений врага продвинули запись
-    int recordCount = 0;
-    int newestAgeMs = 0;
-    int pingMs = 0;
-    int maxUnlagMs = 0;
-    Capsules capsules;       // скелет, по которому стреляли: прошла ли пуля сквозь нашу модель
-    // проверка предсказания «вперёд»: где он, по расчёту, будет и с каким взглядом
-    bool predicted = false;
-    float predictedSimulationTime = 0.0f;
-    csgo::Vector predictedOrigin{};
-    float usedEyeYaw = 0.0f;
-    float updateTime = 0.0f;                    // как часто враг слал обновления на момент выстрела
-    const csgo::StudioHitboxSet* set = nullptr; // хитбоксы цели — проверить пулю по пришедшим потом записям
-    // часы: насколько наш тикбейс впереди часов клиента и насколько simtime врага позади
-    int ourClockMs = 0;
-    int enemyLagMs = 0;
-    bool haveImpact = false;
-    csgo::Vector impact;     // самый дальний импакт пули
-};
-std::array<ShotRecord, 65> shots{};
-int lastShotIndex = 0;
-float lastShotTime = 0.0f;
-
-const Memory* logMemory = nullptr;
-std::optional<csgo::Engine> logEngine;  // обёртка над указателем, храним копию
-
-// Всё, что пишем в консоль, дублируем в ~/csgo-hvh/logs/ДАТА.log — чтобы не копировать из консоли игры
-void fileLog(const char* text) noexcept
-{
-    static std::FILE* file = nullptr;
-    static int day = -1;
-    const std::time_t now = std::time(nullptr);
-    std::tm local{};
-    localtime_r(&now, &local);
-    if (!file || local.tm_yday != day) {
-        if (file)
-            std::fclose(file);
-        file = nullptr;
-        day = local.tm_yday;
-        const char* home = std::getenv("HOME");
-        if (!home)
-            return;
-        const std::string dir = std::string{ home } + "/csgo-hvh/logs";
-        mkdir(dir.c_str(), 0755);
-        char name[32];
-        std::strftime(name, sizeof(name), "/%Y-%m-%d.log", &local);
-        file = std::fopen((dir + name).c_str(), "a");
-        if (!file)
-            return;
-    }
-    char stamp[16];
-    std::strftime(stamp, sizeof(stamp), "%H:%M:%S ", &local);
-    std::fputs(stamp, file);
-    std::fputs(text, file);
-    std::fputc('\n', file);
-    std::fflush(file);
-}
-
-// короткие строки для экрана: «попал в X: голова -100», «промах по X: prediction error»
-struct ScreenLine {
-    std::string text;
-    ImU32 color = 0;
-    double time = 0.0;
-};
-std::array<ScreenLine, 8> screenLines;
-int screenNext = 0;
-
-[[nodiscard]] double steadySeconds() noexcept
-{
-    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-void screenLog(ImU32 color, std::string text) noexcept
-{
-    auto& line = screenLines[screenNext];
-    line = { std::move(text), color, steadySeconds() };
-    screenNext = (screenNext + 1) % static_cast<int>(screenLines.size());
-}
-
-void consoleLog(const std::uint8_t (&color)[4], const char* text) noexcept
-{
-    if (logMemory && logMemory->conColorMsg)
-        logMemory->conColorMsg(color, "%s\n", text);
-    fileLog(text);
-}
-
-[[nodiscard]] std::string playerName(int index) noexcept
-{
-    if (csgo::PlayerInfo info; logEngine && logEngine->getPlayerInfo(index, info))
-        return info.name;
-    return "#" + std::to_string(index);
-}
-
-[[nodiscard]] const char* sideText(float side) noexcept
-{
-    if (side == 0.0f)
-        return "без резольвера";
-    if (std::abs(side) < 1.0f)
-        return side > 0.0f ? "+ low" : "- low";
-    return side > 0.0f ? "+" : "-";
-}
-
-// «запись onshot, бт 3т, хш 74%, скорость 120, чок 2»
-[[nodiscard]] std::string recordText(const ShotRecord& shot) noexcept
-{
-    char text[320];
-    int length = std::snprintf(text, sizeof(text), "запись %s, бт %dт, хш %d%%, скорость %.0f, чок %d",
-        kindNames[static_cast<int>(shot.kind)], shot.backtrackTicks, shot.hitchance, shot.enemySpeed, shot.enemyChoke);
-    if ((shot.kind == RecordKind::Live || shot.kind == RecordKind::Ahead || shot.kind == RecordKind::Extrapolated) && length > 0 && length < static_cast<int>(sizeof(text)))
-        std::snprintf(text + length, sizeof(text) - length, " (+%d обн., записей %d, свежей %d мс, пинг %d мс, maxunlag %d мс, наш тб %+d мс, simtime врага -%d мс)",
-            shot.updatesAhead, shot.recordCount, shot.newestAgeMs, shot.pingMs, shot.maxUnlagMs, shot.ourClockMs, shot.enemyLagMs);
-    return text;
-}
-
-struct LocalImpactListener : csgo::GameEventListener {
-    void fireGameEvent(csgo::GameEventPOD* eventPointer) override
-    {
-        const auto event = csgo::GameEvent::from(retSpoofGadgets->client, eventPointer);
-        if (!logEngine || !localPlayer || logEngine->getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
-            return;
-        if (lastShotIndex <= 0 || !logMemory || logMemory->globalVars->realtime - lastShotTime > 0.5f)
-            return;
-        auto& shot = shots[lastShotIndex];
-        const csgo::Vector position{ event.getFloat("x"), event.getFloat("y"), event.getFloat("z") };
-        // пуля даёт несколько импактов (пробития) — нужен последний, самый дальний
-        if (!shot.haveImpact || (position - shot.eye).squareLength() > (shot.impact - shot.eye).squareLength()) {
-            shot.impact = position;
-            shot.haveImpact = true;
-        }
-    }
-};
-LocalImpactListener localImpactListener;
-bool localImpactRegistered = false;
-
-[[nodiscard]] float distanceToRay(const csgo::Vector& point, const csgo::Vector& origin, const csgo::Vector& through) noexcept
-{
-    auto direction = through - origin;
-    const float length = direction.length();
-    if (length <= 0.0f)
-        return 1e9f;
-    direction /= length;
-    const auto offset = point - origin;
-    const float along = offset.x * direction.x + offset.y * direction.y + offset.z * direction.z;
-    return (offset - direction * along).length();
-}
-
-// true — промах по вине резольвера (пуля прошла через точку прицеливания)
-// Предсказание «вперёд»: за 0.7 с записи врага за тот момент уже пришли — сравниваем с расчётом
-struct PredictionCheck {
-    const LagRecord* actual = nullptr;  // запись с предсказанным simtime
-    bool matched = false;               // пуля попала бы в одну из пришедших записей
-    int matchedOffset = 0;              // в какую: на сколько обновлений от предсказанной
-};
-
-PredictionCheck checkPrediction(const ShotRecord& shot, int index) noexcept
-{
-    PredictionCheck check;
-    const auto& list = records[index];
-    const float interval = logMemory->globalVars->intervalPerTick;
-    for (int age = 0; age < list.count; ++age) {
-        const auto& record = list.at(age);
-        if (std::abs(record.simulationTime - shot.predictedSimulationTime) <= interval * 2.5f
-            && (!check.actual || std::abs(record.simulationTime - shot.predictedSimulationTime) < std::abs(check.actual->simulationTime - shot.predictedSimulationTime)))
-            check.actual = &record;
-    }
-    // В какую из пришедших потом записей пуля попала бы: если не в предсказанную, а на N обновлений
-    // раньше/позже — сервер брал другой момент, и поправка aheadBias шагает в ту сторону
-    if (shot.kind == RecordKind::Ahead && shot.haveImpact && shot.set && shot.updateTime > 0.0f) {
-        static Capsules test;
-        float closest = 1e9f;
-        for (int age = 0; age < list.count; ++age) {
-            const auto& record = list.at(age);
-            const float offset = (record.simulationTime - shot.predictedSimulationTime) / shot.updateTime;
-            if (std::abs(offset) > 3.5f || std::abs(offset) >= std::abs(closest))
-                continue;
-            const csgo::matrix3x4* variants[]{ record.bones, record.plus, record.minus };
-            for (int v = 0; v < (record.rebuilt ? 3 : 1); ++v) {
-                buildCapsules(*shot.set, variants[v], test);
-                if (rayHitsPlayer(shot.eye, shot.impact, test)) {
-                    closest = offset;
-                    break;
-                }
-            }
-        }
-        if (closest < 1e8f) {
-            check.matched = true;
-            check.matchedOffset = static_cast<int>(std::lround(closest));
-            if (check.matchedOffset != 0)
-                aheadBias = std::clamp(aheadBias + (check.matchedOffset > 0 ? 0.34f : -0.34f), -2.0f, 3.0f);
-        }
-    }
-    return check;
-}
-
-// По геометрии выстрела видно, на какой стороне десинка стояла модель на сервере: луч, которым мы
-// стреляли, проходит сквозь один крайний скелет и не проходит сквозь другой. Если это промах —
-// модель была на другой стороне; если попадание — на этой. Доказательство геометрией, а не «наверное».
-// bulletLanded: пуля заведомо дошла до цели (попадание) — тогда импакт для проверки не обязателен.
-// Возвращает +1/-1 (сторона, где действительно была модель) или 0, если доказать нельзя.
-float provenSideFromShot(int index, const ShotRecord& shot, bool bulletLanded) noexcept
-{
-    if ((!bulletLanded && !shot.haveImpact) || !shot.set || !logMemory)
-        return 0.0f;
-    const auto& list = records[index];
-    if (list.count == 0)
-        return 0.0f;
-
-    auto direction = shot.aimPoint - shot.eye;
-    direction /= std::max(direction.length(), 0.001f);
-    const auto end = shot.eye + direction * 8192.0f;
-    const float interval = logMemory->globalVars->intervalPerTick;
-
-    static Capsules plusCapsules, minusCapsules;
-    float nearest = 1e9f;
-    float proven = 0.0f;
-    for (int age = 0; age < list.count; ++age) {
-        const auto& record = list.at(age);
-        if (!record.rebuilt)
-            continue;   // крайние скелеты не собраны — сторону этим выстрелом не проверить
-        const float distance = std::abs(record.simulationTime - shot.predictedSimulationTime);
-        if (distance > interval * 1.6f || distance >= nearest)
-            continue;
-        buildCapsules(*shot.set, record.plus, plusCapsules);
-        buildCapsules(*shot.set, record.minus, minusCapsules);
-        const bool plus = rayHitsPlayer(shot.eye, end, plusCapsules);
-        const bool minus = rayHitsPlayer(shot.eye, end, minusCapsules);
-        if (plus == minus)
-            continue;   // луч задевает обе стороны или ни одной — доказательства нет
-        nearest = distance;
-        proven = plus ? 1.0f : -1.0f;
-    }
-    return proven;
-}
-
-// true — промах по вине резольвера (пуля прошла через точку, а модель была повёрнута иначе)
-bool logMiss(int index, float shotTime, float& provenSide) noexcept
-{
-    provenSide = 0.0f;
-    const auto& shot = shots[index];
-    PredictionCheck check;
-    if (shot.predicted && logMemory)
-        check = checkPrediction(shot, index);
-    const float positionError = check.actual ? (check.actual->origin - shot.predictedOrigin).length() : 0.0f;
-
-    const char* reason;
-    bool resolverFault = false;
-    if (!shot.haveImpact) {
-        reason = localDiedAt >= shotTime - 0.05f
-            ? "death (нас убили раньше, чем сервер принял выстрел)"
-            : "нет импакта (сервер не засчитал выстрел — пинг/лаг)";
-    } else if ((shot.impact - shot.eye).length() + 8.0f < (shot.aimPoint - shot.eye).length()) {
-        reason = "пуля застряла раньше цели (автоволл ошибся)";
-    } else if (shot.capsules.count ? !rayHitsPlayer(shot.eye, shot.impact, shot.capsules) : distanceToRay(shot.aimPoint, shot.eye, shot.impact) > 3.0f) {
-        // при хитшансе 100% пуля почти всегда задевает модель и мимо точки — это не разброс, а модель не там
-        reason = "разброс (пуля прошла мимо нашей модели)";
-    } else if (shot.kind == RecordKind::Extrapolated) {
-        reason = "prediction error (ломал лагкомп, экстраполяция не угадала, где он на сервере)";
-    } else if (shot.kind == RecordKind::Ahead) {
-        if (check.matched && check.matchedOffset != 0) {
-            reason = "prediction error (сервер взял другое обновление врага)";
-        } else if (check.actual && positionError > 4.0f) {
-            reason = "prediction error (враг сменил движение)";
-        } else if (check.matched) {
-            // время и место угаданы, пуля прошла сквозь запись — модель была повёрнута не так
-            resolverFault = true;
-            reason = "резольвер (движение угадано, модель на сервере повёрнута иначе)";
-        } else if (!check.actual && records[index].count == 0) {
-            // записи сбрасываются, когда умираем мы или он (дормант) — сверять не с чем, это не ошибка предсказания
-            reason = localDiedAt >= shotTime - 0.05f
-                ? "не проверить (нас убили сразу после выстрела, записей нет)"
-                : "не проверить (враг пропал/умер, записей нет)";
-        } else {
-            reason = "prediction error (модели на сервере не было ни в одном соседнем обновлении)";
-        }
-    } else if ((resolverFault = true), shot.side != 0.0f || shot.safe || shot.mode == LayerMode) {
-        reason = "резольвер (пуля прошла через точку, а модель на сервере была не там)";
-    } else {
-        reason = "десинк/лагкомп (пуля прошла через точку, резольвер не применялся)";
-    }
-    if (resolverFault)
-        provenSide = provenSideFromShot(index, shot, false);
-    char text[640];
-    std::snprintf(text, sizeof(text), "[ECLIPSE] промах по %s: %s | %s%s, сторона %s (%s)%s, урон %d%s | %s",
-        playerName(index).c_str(), reason, shot.isHead ? "голова" : "тело", shot.edgePoint ? " (край)" : " (центр)", sideText(shot.side),
-        modeText(shot.mode), shot.safe ? ", safe" : "", shot.damage,
-        provenSide != 0.0f ? (provenSide > 0.0f ? ", импакт: модель была на +" : ", импакт: модель была на -") : "",
-        recordText(shot).c_str());
-    static constexpr std::uint8_t red[4]{ 255, 90, 90, 255 };
-    consoleLog(red, text);
-    {
-        std::string brief = "промах по " + playerName(index) + ": ";
-        const std::string_view full{ reason };
-        brief += full.substr(0, full.find(" ("));
-        brief += shot.isHead ? " (голова)" : " (тело)";
-        screenLog(IM_COL32(255, 100, 100, 255), std::move(brief));
-    }
-    if (shot.mode == LayerMode && hvh::resolver::statusLine(index)[0]) {
-        char layers[256];
-        std::snprintf(layers, sizeof(layers), "[ECLIPSE]   резольвер по слоям: %s", hvh::resolver::statusLine(index));
-        static constexpr std::uint8_t grey[4]{ 190, 190, 190, 255 };
-        consoleLog(grey, layers);
-    }
-
-    if (shot.predicted && logMemory && shot.haveImpact) {
-        char match[96] = "";
-        if (shot.kind == RecordKind::Ahead) {
-            if (check.matched)
-                std::snprintf(match, sizeof(match), "; пуля попала бы в запись %+d обн., поправка %+d", check.matchedOffset, static_cast<int>(std::lround(aheadBias)));
-            else
-                std::snprintf(match, sizeof(match), "; ни в одну соседнюю запись");
-        }
-        char line[288];
-        if (check.actual) {
-            std::snprintf(line, sizeof(line), "[ECLIPSE]   проверка предсказания: ошибка %.1f ед. (по высоте %+.1f), взгляд повернулся на %+.0f°, чок %d%s",
-                positionError, check.actual->origin.z - shot.predictedOrigin.z,
-                std::remainder(check.actual->eyeAngles.y - shot.usedEyeYaw, 360.0f), check.actual->choked, match);
-        } else {
-            std::snprintf(line, sizeof(line), "[ECLIPSE]   проверка предсказания: записи с этим временем не пришло (сдвиг тикбейса/дормант, записей %d)%s", records[index].count, match);
-        }
-        static constexpr std::uint8_t orange[4]{ 255, 160, 90, 255 };
-        consoleLog(orange, line);
-    }
-    return resolverFault;
-}
-
-struct AimPoint {
-    csgo::Vector position{};
-    float damage = 0.0f;        // с множителем хитгруппы и бронёй
-    float baseDamage = 0.0f;    // долетает до точки без множителя — для хитшанса
-    bool isHead = false;
-    bool edge = false;          // точка мультипоинта, а не центр хитбокса
-};
-
-csgo::Vector cross(const csgo::Vector& a, const csgo::Vector& b) noexcept
-{
-    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
-}
-
-csgo::Vector normalized(csgo::Vector v) noexcept
+[[nodiscard]] csgo::Vector normalized(csgo::Vector v) noexcept
 {
     const float length = v.length();
     return length > 0.0f ? v / length : v;
 }
 
-WeaponGroup groupOf(const csgo::Entity& weapon) noexcept
-{
-    switch (weapon.itemDefinitionIndex()) {
-    case WeaponId::Deagle:
-    case WeaponId::Revolver: return WeaponGroup::Heavy;
-    case WeaponId::Ssg08: return WeaponGroup::Scout;
-    case WeaponId::Awp: return WeaponGroup::Awp;
-    case WeaponId::Scar20:
-    case WeaponId::G3SG1: return WeaponGroup::Auto;
-    default: break;
-    }
-    switch (weapon.getWeaponType()) {
-    case WeaponType::Pistol: return WeaponGroup::Pistol;
-    case WeaponType::Rifle: return WeaponGroup::Rifle;
-    case WeaponType::SubMachinegun: return WeaponGroup::Smg;
-    default: return WeaponGroup::General;
-    }
-}
-
-// хитбоксы модели по группам из меню
-constexpr std::array<std::pair<int, std::array<Hitbox, 4>>, 7> hitboxGroups{ {
-    { HB_Head, { Hitbox::Head, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
-    { HB_Chest, { Hitbox::UpperChest, Hitbox::Thorax, Hitbox::LowerChest, Hitbox::Max } },
-    { HB_Stomach, { Hitbox::Belly, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
-    { HB_Pelvis, { Hitbox::Pelvis, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
-    { HB_Arms, { Hitbox::RightUpperArm, Hitbox::LeftUpperArm, Hitbox::RightForearm, Hitbox::LeftForearm } },
-    { HB_Legs, { Hitbox::RightThigh, Hitbox::LeftThigh, Hitbox::RightCalf, Hitbox::LeftCalf } },
-    { HB_Feet, { Hitbox::RightFoot, Hitbox::LeftFoot, Hitbox::Max, Hitbox::Max } },
-} };
-
-// кратчайшее расстояние между отрезками p1-q1 и p2-q2; s — где на первом отрезке ближайшая точка (0..1)
+// кратчайшее расстояние между отрезками p1-q1 и p2-q2; s — где на первом ближайшая точка (0..1)
 float segmentDistance(const csgo::Vector& p1, const csgo::Vector& q1, const csgo::Vector& p2, const csgo::Vector& q2, float& s) noexcept
 {
     const auto d1 = q1 - p1;
@@ -1168,7 +734,6 @@ float segmentDistance(const csgo::Vector& p1, const csgo::Vector& q1, const csgo
     const float a = d1.dotProduct(d1);
     const float e = d2.dotProduct(d2);
     const float f = d2.dotProduct(r);
-
     float t = 0.0f;
     s = 0.0f;
     if (a <= 1e-6f && e <= 1e-6f)
@@ -1207,7 +772,7 @@ void buildCapsules(const csgo::StudioHitboxSet& set, const csgo::matrix3x4* bone
     }
 }
 
-// первый хитбокс на луче start -> end (хитгруппа), -1 — луч мимо модели
+// хитгруппа первого хитбокса на луче, −1 — мимо модели
 int firstHitGroup(const Capsules& capsules, const csgo::Vector& start, const csgo::Vector& end) noexcept
 {
     const float length = (end - start).length();
@@ -1219,7 +784,6 @@ int firstHitGroup(const Capsules& capsules, const csgo::Vector& start, const csg
         const float distance = segmentDistance(start, end, capsule.a, capsule.b, s);
         if (distance > capsule.radius)
             continue;
-        // где луч входит в капсулу: от ближайшей точки назад на полхорды
         const float entry = s * length - std::sqrt(std::max(capsule.radius * capsule.radius - distance * distance, 0.0f));
         if (entry < nearest) {
             nearest = entry;
@@ -1229,7 +793,7 @@ int firstHitGroup(const Capsules& capsules, const csgo::Vector& start, const csg
     return group;
 }
 
-bool rayHitsPlayer(const csgo::Vector& start, const csgo::Vector& end, const Capsules& capsules) noexcept
+bool rayHits(const csgo::Vector& start, const csgo::Vector& end, const Capsules& capsules) noexcept
 {
     for (int i = 0; i < capsules.count; ++i) {
         float s;
@@ -1240,19 +804,17 @@ bool rayHitsPlayer(const csgo::Vector& start, const csgo::Vector& end, const Cap
 }
 
 // ---------- разброс: тот же генератор, что у игры ----------
-// Копия CUniformRandomStream из vstdlib (RandomSeed/RandomFloat): проверено офлайн против
-// libvstdlib_client.so — 1024 из 1024 чисел совпали. Своя копия, чтобы не сбивать глобальный генератор игры.
+// Копия CUniformRandomStream из vstdlib (проверено офлайн: 1024 из 1024 чисел совпали).
+
 struct UniformRandomStream {
     int idum = 0;
     int iy = 0;
     int iv[32]{};
-
     void seed(int value) noexcept
     {
         idum = value < 0 ? value : -value;
         iy = 0;
     }
-
     int next() noexcept
     {
         constexpr int IA = 16807, IM = 2147483647, IQ = 127773, IR = 2836, NTAB = 32, NDIV = 1 + (IM - 1) / NTAB;
@@ -1280,7 +842,6 @@ struct UniformRandomStream {
         iv[j] = idum;
         return iy;
     }
-
     float randomFloat(float low, float high) noexcept
     {
         float value = static_cast<float>((1.0 / 2147483647) * next());
@@ -1290,19 +851,21 @@ struct UniformRandomStream {
     }
 };
 
-// FX_FireBullets: RandomSeed(seed); a = RandomFloat(0,1); b = RandomFloat(0,2π); c = RandomFloat(0,1); d = RandomFloat(0,2π)
-// отклонение = a*inaccuracy по углу b + c*spread по углу d
+// FX_FireBullets: отклонение = a·inaccuracy по углу b + c·spread по углу d
 struct SpreadSeed {
     float a, cosB, sinB;
     float c, cosD, sinD;
 };
 
-const std::array<SpreadSeed, HITCHANCE_SEEDS>& spreadSeeds() noexcept
+// дробовик: дробина k берёт сид выстрела + k (FX_FireBullets: iSeed++ на каждую) — запас на 16 дробин
+constexpr int SPREAD_TABLE = HITCHANCE_SEEDS + 16;
+
+const std::array<SpreadSeed, SPREAD_TABLE>& spreadSeeds() noexcept
 {
     static const auto table = [] {
-        std::array<SpreadSeed, HITCHANCE_SEEDS> result{};
+        std::array<SpreadSeed, SPREAD_TABLE> result{};
         UniformRandomStream stream;
-        for (int i = 0; i < HITCHANCE_SEEDS; ++i) {
+        for (int i = 0; i < SPREAD_TABLE; ++i) {
             stream.seed(i + 1);
             const float a = stream.randomFloat(0.0f, 1.0f);
             const float b = stream.randomFloat(0.0f, 2.0f * 3.14159265f);
@@ -1315,52 +878,58 @@ const std::array<SpreadSeed, HITCHANCE_SEEDS>& spreadSeeds() noexcept
     return table;
 }
 
-// Хитшанс: % сидов из 256, при которых пуля по скелету выбранной записи даст не меньше minDamage.
-// Первый хитбокс на луче решает, куда попадём: «целился в голову, попал в грудь» тоже считается,
-// если урона в грудь хватает, а в ногу при мин. уроне 50 — уже нет.
+// Хитшанс: % сидов, при которых пуля по скелету цели даст не меньше minDamage
+// (первый хитбокс на луче решает, куда придёт пуля: целился в голову, попал в грудь — тоже засчитано).
+// У дробовика урон всех дробин этого сида складывается.
 int hitchance(const csgo::Entity& weapon, const csgo::WeaponInfo* weaponData, const csgo::Entity& entity, const csgo::Vector& eye, const csgo::Vector& angle,
               const Capsules& capsules, float baseDamage, int minDamage) noexcept
 {
     const float inaccuracy = weapon.getInaccuracy();
     float spread = weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread;
-    // офсет spread взят из раскладки CCSWeaponInfo: если там мусор — считаем без него, но не врём в плюс
     if (!(spread >= 0.0f && spread < 0.2f))
         spread = 0.0f;
     const bool negev = weapon.itemDefinitionIndex() == WeaponId::Negev;
     const int recoilIndex = weapon.recoilIndex();
-
     const float sp = std::sin(Helpers::deg2rad(angle.x)), cp = std::cos(Helpers::deg2rad(angle.x));
     const float sy = std::sin(Helpers::deg2rad(angle.y)), cy = std::cos(Helpers::deg2rad(angle.y));
     const csgo::Vector forward{ cp * cy, cp * sy, -sp };
     const csgo::Vector right{ sy, -cy, 0.0f };
     const csgo::Vector up{ sp * cy, sp * sy, cp };
-
-    // урон по каждой хитгруппе считаем один раз
-    std::array<bool, 11> enough{};
-    for (int group = 0; group < static_cast<int>(enough.size()); ++group)
-        enough[group] = autowall::scaleDamage(entity, group, weaponData, baseDamage) >= static_cast<float>(minDamage);
+    // урон одной пули/дробины по хитгруппе
+    std::array<float, 11> groupDamage{};
+    for (int group = 0; group < static_cast<int>(groupDamage.size()); ++group)
+        groupDamage[group] = autowall::scaleDamage(entity, group, weaponData, baseDamage);
+    const int bullets = std::clamp(weaponData->bullets, 1, SPREAD_TABLE - HITCHANCE_SEEDS);
+    const auto& seeds = spreadSeeds();
 
     int hits = 0;
-    for (const auto& seed : spreadSeeds()) {
-        float a = seed.a, c = seed.c;
-        // негев первые выстрелы кладёт кучнее (как в FX_FireBullets)
-        if (negev && recoilIndex < 3) {
-            for (int j = 3; j > recoilIndex; --j) {
-                a *= a;
-                c *= c;
+    for (int i = 0; i < HITCHANCE_SEEDS; ++i) {
+        float total = 0.0f;
+        for (int pellet = 0; pellet < bullets; ++pellet) {
+            const auto& seed = seeds[i + pellet];
+            float a = seed.a, c = seed.c;
+            if (negev && recoilIndex < 3) {
+                for (int j = 3; j > recoilIndex; --j) {
+                    a *= a;
+                    c *= c;
+                }
+                a = 1.0f - a;
+                c = 1.0f - c;
             }
-            a = 1.0f - a;
-            c = 1.0f - c;
+            const float x = seed.cosB * a * inaccuracy + seed.cosD * c * spread;
+            const float y = seed.sinB * a * inaccuracy + seed.sinD * c * spread;
+            const auto direction = normalized(forward + right * x + up * y);
+            const int group = firstHitGroup(capsules, eye, eye + direction * weaponData->range);
+            if (group >= 0)
+                total += group < static_cast<int>(groupDamage.size()) ? groupDamage[group] : baseDamage;
         }
-        const float x = seed.cosB * a * inaccuracy + seed.cosD * c * spread;
-        const float y = seed.sinB * a * inaccuracy + seed.sinD * c * spread;
-        const auto direction = normalized(forward + right * x + up * y);
-        const int group = firstHitGroup(capsules, eye, eye + direction * weaponData->range);
-        if (group >= 0 && (group >= static_cast<int>(enough.size()) || enough[group]))
+        if (total >= static_cast<float>(minDamage))
             ++hits;
     }
     return hits * 100 / HITCHANCE_SEEDS;
 }
+
+// ---------- автостоп ----------
 
 struct MovementVars {
     float friction = 5.2f;
@@ -1383,20 +952,18 @@ MovementVars movementVars(const csgo::Cvar& cvar) noexcept
     return vars;
 }
 
-// «Точность»: разброс в CS:GO не растёт, пока скорость ниже ~34% максимальной
+// «Точность»: разброс не растёт, пока скорость ниже ~34% максимальной
 [[nodiscard]] float autoStopTarget(AutoStop mode, float maxSpeed) noexcept
 {
     return mode == AutoStop::Accuracy ? maxSpeed * 0.33f : 0.0f;
 }
 
-// сколько скорости съест трение за тик (CGameMovement::Friction)
 [[nodiscard]] float afterFriction(float speed, const MovementVars& vars, float interval) noexcept
 {
     return std::max(0.0f, speed - std::max(speed, vars.stopSpeed) * vars.friction * interval);
 }
 
-// За сколько тиков трение + полный встречный ввод погасят скорость до цели: столько тиков до готовности
-// оружия и начинаем тормозить (с 250 ед/с до нуля — около 6 тиков, «за тик» не успеть)
+// за сколько тиков трение + встречный ввод погасят скорость: за столько до готовности оружия и тормозим
 [[nodiscard]] int ticksToStop(float speed, float targetSpeed, float maxSpeed, const MovementVars& vars, float interval) noexcept
 {
     int ticks = 0;
@@ -1407,23 +974,18 @@ MovementVars movementVars(const csgo::Cvar& cvar) noexcept
     return ticks;
 }
 
-// Автостоп с предсказанием: сколько скорости съест трение на следующем тике
-// и какой встречный ввод нужен, чтобы прийти ровно к цели, а не улететь в обратную сторону
 void autoStop(csgo::UserCmd* cmd, AutoStop mode, float maxSpeed, float interval, const MovementVars& vars) noexcept
 {
     const auto velocity = localPlayer.get().velocity();
     const float speed = velocity.length2D();
-
     const float targetSpeed = autoStopTarget(mode, maxSpeed);
     const float nextSpeed = afterFriction(speed, vars, interval);
-
     if (nextSpeed <= targetSpeed + 1.0f) {
         if (mode == AutoStop::Full || speed < 15.0f) {
             cmd->forwardmove = 0.0f;
             cmd->sidemove = 0.0f;
             return;
         }
-        // одного трения хватает — ограничиваем ввод так, чтобы не разогнаться обратно
         const float move = std::hypot(cmd->forwardmove, cmd->sidemove);
         if (move > targetSpeed && move > 0.0f) {
             cmd->forwardmove *= targetSpeed / move;
@@ -1431,186 +993,447 @@ void autoStop(csgo::UserCmd* cmd, AutoStop mode, float maxSpeed, float interval,
         }
         return;
     }
-
-    // Accelerate: прибавка за тик = sv_accelerate * interval * wishspeed — берём такой wishspeed,
-    // чтобы погасить ровно остаток (больше — перелёт назад и снова разброс)
+    // встречный ввод ровно на остаток скорости (больше — перелёт назад и снова разброс)
     const float wish = std::clamp((nextSpeed - targetSpeed) / std::max(vars.accelerate * interval, 0.001f), 0.0f, 450.0f);
     const float relative = Helpers::deg2rad(velocity.toAngle().y - cmd->viewangles.y);
     cmd->forwardmove = -std::cos(relative) * wish;
     cmd->sidemove = std::sin(relative) * wish;
 }
 
-}
+// ---------- оружие ----------
 
-namespace
+WeaponGroup groupOf(const csgo::Entity& weapon) noexcept
 {
-
-// Резольвер десинка. Клиент рисует десинкера с ногами там, где их считает сам, а на сервере
-// тело повёрнуто до maxDesync в сторону от взгляда. Строим две версии скелета — ноги под углом
-// взгляд + maxDesync и взгляд - maxDesync (поворот костей вокруг оси игрока).
-// Дальше: «безопасная точка» — та, что попадает во все три версии; если её нет — бьём по угаданной
-// стороне, а сторону перебираем по промахам.
-bool buildDesyncVariants(bool isBot, const LagRecord& record, const csgo::matrix3x4* client, csgo::matrix3x4* plus, csgo::matrix3x4* minus, float deltaScale) noexcept
-{
-    // боты не десинкают
-    if (isBot)
-        return false;
-
-    // полный десинк — скелеты, собранные анимацией при записи; low delta и запасной путь — поворот костей
-    if (record.rebuilt && deltaScale == 1.0f) {
-        std::copy(record.plus, record.plus + RECORD_BONES, plus);
-        std::copy(record.minus, record.minus + RECORD_BONES, minus);
-        return true;
+    switch (weapon.itemDefinitionIndex()) {
+    case WeaponId::Deagle:
+    case WeaponId::Revolver: return WeaponGroup::Heavy;
+    case WeaponId::Ssg08: return WeaponGroup::Scout;
+    case WeaponId::Awp: return WeaponGroup::Awp;
+    case WeaponId::Scar20:
+    case WeaponId::G3SG1: return WeaponGroup::Auto;
+    default: break;
     }
-
-    const float eyeYaw = record.eyeAngles.y;
-    const float clientYaw = record.absYaw;
-    const auto& pivot = record.origin;
-    const float maxDesync = deltaScale * (record.maxDesync > 1.0f ? record.maxDesync : maxDesyncFor(record.velocity));
-
-    // На сервере на полный угол повёрнуты ноги и таз (feet yaw), а позвоночник закручен обратно к взгляду
-    // (body_yaw), поэтому чем выше кость, тем меньше её доворот: ступни — 100%, голова — ~35%.
-    const float delta = std::remainder(eyeYaw - clientYaw, 360.0f);
-    const auto rotated = [&](csgo::matrix3x4* out, float sign) {
-        const float target = delta + sign * maxDesync;
-        for (int bone = 0; bone < RECORD_BONES; ++bone) {
-            out[bone] = client[bone];
-            const float height = std::clamp((client[bone].origin().z - pivot.z) / 64.0f, 0.0f, 1.0f);
-            // у клиента верх тела уже довёрнут к взгляду своим body_yaw — по высоте уменьшаем весь поворот ног
-            const float radians = Helpers::deg2rad(target * (1.0f - 0.65f * height));
-            out[bone].rotateYaw(pivot, std::cos(radians), std::sin(radians));
-        }
-    };
-    rotated(plus, 1.0f);
-    rotated(minus, -1.0f);
-    return true;
+    switch (weapon.getWeaponType()) {
+    case WeaponType::Pistol: return WeaponGroup::Pistol;
+    case WeaponType::Rifle: return WeaponGroup::Rifle;
+    case WeaponType::SubMachinegun: return WeaponGroup::Smg;
+    default: return WeaponGroup::General;
+    }
 }
+
+constexpr std::array<std::pair<int, std::array<Hitbox, 4>>, 7> hitboxGroups{ {
+    { HB_Head, { Hitbox::Head, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
+    { HB_Chest, { Hitbox::UpperChest, Hitbox::Thorax, Hitbox::LowerChest, Hitbox::Max } },
+    { HB_Stomach, { Hitbox::Belly, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
+    { HB_Pelvis, { Hitbox::Pelvis, Hitbox::Max, Hitbox::Max, Hitbox::Max } },
+    { HB_Arms, { Hitbox::RightUpperArm, Hitbox::LeftUpperArm, Hitbox::RightForearm, Hitbox::LeftForearm } },
+    { HB_Legs, { Hitbox::RightThigh, Hitbox::LeftThigh, Hitbox::RightCalf, Hitbox::LeftCalf } },
+    { HB_Feet, { Hitbox::RightFoot, Hitbox::LeftFoot, Hitbox::Max, Hitbox::Max } },
+} };
 
 // Фристенд-догадка: десинкеры прячут настоящую голову — за стену, а в открытую — подальше от стрелка.
-// +1 — настоящее тело на стороне «взгляд + десинк», -1 — «взгляд - десинк».
-float guessDesyncSide(const csgo::EngineTrace& engineTrace, const csgo::Vector& eye, const csgo::matrix3x4* plus, const csgo::matrix3x4* minus) noexcept
+// +1 — тело на стороне «взгляд + десинк».
+float freestandSide(const csgo::EngineTrace& engineTrace, const csgo::Vector& eye, const LagRecord& record) noexcept
 {
-    constexpr int headBone = 8;
-    const auto headPlus = plus[headBone].origin();
-    const auto headMinus = minus[headBone].origin();
-    // помимо головы смотрим грудь: по одному хитбоксу «открыто/закрыто» решается случайно
+    const auto headPlus = record.plus[HEAD_BONE].origin();
+    const auto headMinus = record.minus[HEAD_BONE].origin();
+    const auto exposed = [&](const csgo::Vector& point) {
+        csgo::Trace trace;
+        engineTrace.traceRay({ eye, point }, 0x1400B, { localPlayer.get().getPOD() }, trace);   // только стены
+        return trace.fraction > 0.97f;
+    };
+    // помимо головы — грудь (кость на ~28 ед. ниже головы): по одной точке «открыто/закрыто» решается случайно
     int chestBone = 3;
     float chestDistance = 1e9f;
-    const float chestZ = headPlus.z - 28.0f;
-    for (int bone = 1; bone < headBone; ++bone) {
-        const float distance = std::abs(plus[bone].origin().z - chestZ);
+    for (int bone = 1; bone < HEAD_BONE; ++bone) {
+        const float distance = std::abs(record.plus[bone].origin().z - (headPlus.z - 28.0f));
         if (distance < chestDistance) {
             chestDistance = distance;
             chestBone = bone;
         }
     }
-    const auto chestPlus = plus[chestBone].origin();
-    const auto chestMinus = minus[chestBone].origin();
-    const auto exposed = [&](const csgo::Vector& point) {
-        // только стены (MASK_SOLID_BRUSHONLY): игроки луч не загораживают
-        csgo::Trace trace;
-        engineTrace.traceRay({ eye, point }, 0x1400B, { localPlayer.get().getPOD() }, trace);
-        return trace.fraction > 0.97f;
-    };
-    const int plusScore = (exposed(headPlus) ? 1 : 0) + (exposed(chestPlus) ? 1 : 0);
-    const int minusScore = (exposed(headMinus) ? 1 : 0) + (exposed(chestMinus) ? 1 : 0);
-    if (plusScore != minusScore)
-        return plusScore < minusScore ? 1.0f : -1.0f;   // настоящая сторона — та, что спрятана
+    const int plusOpen = (exposed(headPlus) ? 1 : 0) + (exposed(record.plus[chestBone].origin()) ? 1 : 0);
+    const int minusOpen = (exposed(headMinus) ? 1 : 0) + (exposed(record.minus[chestBone].origin()) ? 1 : 0);
+    if (plusOpen != minusOpen)
+        return plusOpen < minusOpen ? 1.0f : -1.0f;
     return (headPlus - eye).squareLength() > (headMinus - eye).squareLength() ? 1.0f : -1.0f;
 }
 
+// ---------- выстрелы: что запомнили, чтобы потом понять, почему промах ----------
+
+enum class SideSource { None, Bot, NoDesync, Air, Layers, Evidence, Jitter, Guess, Brute };
+constexpr const char* sideSourceNames[]{ "без резольвера", "бот", "не десинкает", "в воздухе", "слои", "память", "джиттер", "догадка", "перебор" };
+
+struct ShotRecord {
+    float time = 0.0f;              // realtime выстрела, 0 — ждать нечего
+    csgo::Vector eye{};
+    csgo::Vector aimPoint{};
+    bool isHead = false;
+    bool edge = false;
+    int damage = 0;
+    int hitchance = 0;
+    float side = 0.0f;              // +1/−1 — по какой стороне стреляли, 0 — без резольвера
+    SideSource source = SideSource::None;
+    float phase = 0.0f;             // фаза джиттера на момент записи
+    float guess = 0.0f;             // что сказала фристенд-догадка (0 — не спрашивали)
+    float layerDelta = 0.0f;        // слои: угол ног от взгляда, по которому собран скелет
+    float layerMax = 0.0f;          // ...и максимум десинка на той записи
+    float layerConfidence = 0.0f;
+    bool sideSafe = false;          // точка попадает и в найденный угол, и в максимум той же стороны
+    RecordKind kind = RecordKind::Live;
+    int backtrackTicks = 0;
+    int updatesAhead = 0;
+    float predictedSimulationTime = 0.0f;
+    float updateTime = 0.0f;
+    const csgo::StudioHitboxSet* set = nullptr;
+    Capsules aimed;                 // скелет, по которому стреляли
+    Capsules plus, minus;           // крайние скелеты той же записи
+    bool haveImpact = false;
+    csgo::Vector impact{};
+};
+std::array<ShotRecord, 65> shots{};
+int lastShotIndex = 0;
+
+struct ImpactListener : csgo::GameEventListener {
+    void fireGameEvent(csgo::GameEventPOD* eventPointer) override
+    {
+        const auto event = csgo::GameEvent::from(retSpoofGadgets->client, eventPointer);
+        if (!engine || !localPlayer || !memoryPtr || engine->getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
+            return;
+        if (lastShotIndex <= 0)
+            return;
+        auto& shot = shots[lastShotIndex];
+        if (shot.time <= 0.0f || memoryPtr->globalVars->realtime - shot.time > 0.5f)
+            return;
+        const csgo::Vector position{ event.getFloat("x"), event.getFloat("y"), event.getFloat("z") };
+        // пробития дают несколько импактов — нужен самый дальний
+        if (!shot.haveImpact || (position - shot.eye).squareLength() > (shot.impact - shot.eye).squareLength()) {
+            shot.impact = position;
+            shot.haveImpact = true;
+        }
+    }
+};
+ImpactListener impactListener;
+bool impactRegistered = false;
+
+// доказанная сторона против того, что говорила догадка (счёт с потолком, старое вытесняется)
+void scoreGuess(Brain& brain, float guess, float truth) noexcept
+{
+    if (guess == 0.0f || truth == 0.0f)
+        return;
+    std::uint8_t& counter = (guess > 0.0f) == (truth > 0.0f) ? brain.guessRight : brain.guessWrong;
+    counter = static_cast<std::uint8_t>(std::min(counter + 1, 12));
+    if (brain.guessRight + brain.guessWrong > 12) {
+        brain.guessRight = static_cast<std::uint8_t>(brain.guessRight * 3 / 4);
+        brain.guessWrong = static_cast<std::uint8_t>(brain.guessWrong * 3 / 4);
+    }
 }
+
+// По лучу пули видно, на какой стороне стояла модель: луч проходит сквозь один крайний скелет и мимо другого.
+// landed — пуля попала (модель была там, где луч), иначе промах (модель была там, где луча нет).
+[[nodiscard]] float provenSide(const ShotRecord& shot, bool landed) noexcept
+{
+    if (!shot.haveImpact || shot.plus.count == 0 || shot.minus.count == 0)
+        return 0.0f;
+    const auto end = shot.eye + normalized(shot.impact - shot.eye) * 8192.0f;
+    const bool plus = rayHits(shot.eye, end, shot.plus);
+    const bool minus = rayHits(shot.eye, end, shot.minus);
+    if (plus == minus)
+        return 0.0f;
+    return (plus == landed) ? 1.0f : -1.0f;
+}
+
+[[nodiscard]] std::string shotText(const ShotRecord& shot) noexcept
+{
+    char text[256];
+    int length = std::snprintf(text, sizeof(text), "%s%s, сторона %s (%s), запись %s", shot.isHead ? "голова" : "тело", shot.edge ? " (край)" : "",
+        shot.side > 0.0f ? "+" : shot.side < 0.0f ? "−" : "0", sideSourceNames[static_cast<int>(shot.source)], kindNames[static_cast<int>(shot.kind)]);
+    if (shot.source == SideSource::Layers && length > 0 && length < static_cast<int>(sizeof(text)))
+        length += std::snprintf(text + length, sizeof(text) - length, " [ноги %+.0f°/%.0f°, %.0f%%%s]", shot.layerDelta, shot.layerMax,
+            shot.layerConfidence * 100.0f, shot.sideSafe ? ", общая точка" : "");
+    if (length > 0 && length < static_cast<int>(sizeof(text))) {
+        if (shot.kind == RecordKind::Ahead || shot.kind == RecordKind::Extrapolated)
+            length += std::snprintf(text + length, sizeof(text) - length, " +%d обн.", shot.updatesAhead);
+        else if (shot.backtrackTicks > 0)
+            length += std::snprintf(text + length, sizeof(text) - length, " бт %dт", shot.backtrackTicks);
+    }
+    if (length > 0 && length < static_cast<int>(sizeof(text)))
+        std::snprintf(text + length, sizeof(text) - length, ", урон %d, хш %d%%", shot.damage, shot.hitchance);
+    return text;
+}
+
+// Промах: причина по импакту пули и обучение резольвера
+void evaluateMiss(int index) noexcept
+{
+    auto& shot = shots[index];
+    auto& brain = brains[index];
+    const float realtime = memoryPtr->globalVars->realtime;
+    if (index == lastShotIndex) {
+        std::scoped_lock lock{ viewMutex };
+        lastShot.result = -1;
+    }
+
+    const char* reason = nullptr;
+    char detail[160] = "";
+    bool positionRight = false;   // прогноз позиции подтвердился — промах ушёл в резольвер
+    // промахи подряд (сжимают мультипоинт, включают безопасные точки) — только те, где виновата цель:
+    // разброс, сторона, прогноз; смерть, лаг и стена тут ни при чём
+    if (!shot.haveImpact) {
+        reason = localDiedAt >= shot.time ? "нас убили раньше, чем сервер принял выстрел" : "сервер не засчитал выстрел (лаг)";
+    } else if ((shot.impact - shot.eye).length() + 8.0f < (shot.aimPoint - shot.eye).length()) {
+        reason = "пуля застряла раньше цели (автоволл)";
+    } else {
+        ++brain.misses;
+        if (!rayHits(shot.eye, shot.eye + normalized(shot.impact - shot.eye) * 8192.0f, shot.aimed)) {
+            reason = "разброс";
+        } else if ((shot.kind == RecordKind::Ahead || shot.kind == RecordKind::Extrapolated) && shot.set && shot.updateTime > 0.0f) {
+            // прогноз: в какую из пришедших потом записей пуля попала бы
+            const auto& list = records[index];
+            const auto end = shot.eye + normalized(shot.impact - shot.eye) * 8192.0f;
+            float closest = 1e9f;
+            static Capsules test;
+            for (int age = 0; age < list.count; ++age) {
+                const auto& record = list.at(age);
+                const float offset = (record.simulationTime - shot.predictedSimulationTime) / shot.updateTime;
+                if (std::abs(offset) > 3.5f || std::abs(offset) >= std::abs(closest))
+                    continue;
+                const csgo::matrix3x4* variants[]{ record.bones, record.plus, record.minus };
+                for (int v = 0; v < (record.variants ? 3 : 1); ++v) {
+                    buildCapsules(*shot.set, variants[v], test);
+                    if (rayHits(shot.eye, end, test)) {
+                        closest = offset;
+                        break;
+                    }
+                }
+            }
+            const int rounded = closest < 1e8f ? static_cast<int>(std::lround(closest)) : 99;
+            // Луч лёг в пришедшую потом запись ровно на предсказанное время — позиция угадана (по логам 31.10–01.11
+            // так 19 из 59 «промахов прогноза»: «сервер взял +0»). Если при этом одна крайняя сторона десинка
+            // под лучом, а другая нет — модель на сервере была на другой стороне: это промах резольвера,
+            // и его надо учить, а не списывать на прогноз (раньше такие промахи не учили ни то, ни другое).
+            if (rounded == 0 && provenSide(shot, false) != 0.0f) {
+                positionRight = true;
+                ++brain.aheadChecks;
+            } else if (closest < 1e8f) {
+                const int offset = rounded;
+                // Модель стоит между N−1 и N, но если промах лёг в N−1 или N+1 — сервер был не там, где
+                // мы ждали, и поправку надо сдвигать (раньше −1 считался «и так внутри», и по логам 31.10
+                // «сервер взял −1/−2» шли подряд, не меняя прогноз). 0 — сервер брал то же, что и мы.
+                if (offset != 0) {
+                    aheadBias = std::clamp(aheadBias + (offset > 0 ? 0.34f : -0.34f), -2.0f, 3.0f);
+                    brain.aheadBias = std::clamp(brain.aheadBias + (offset > 0 ? 0.5f : -0.5f), -2.0f, 3.0f);
+                }
+                ++brain.aheadChecks;
+                reason = "прогноз";
+                if (offset == 0)
+                    std::snprintf(detail, sizeof(detail), " (позиция верна, сервер был между обновлениями)");
+                else
+                    std::snprintf(detail, sizeof(detail), " (сервер взял %+d обн.)", offset);
+            } else {
+                // ни одна пришедшая потом запись не легла под луч — враг сменил движение. Сторону тут не доказать:
+                // крайние скелеты стояли там же, где неверная позиция, — резольвер на этом не учим
+                reason = "прогноз (враг сменил движение)";
+            }
+        }
+    }
+
+    if (!reason) {
+        // пуля прошла сквозь нашу модель, а на сервере модели там не было — сторона десинка
+        reason = positionRight ? "резольвер (прогноз позиции верный)" : "резольвер";
+        const float proven = provenSide(shot, false);
+        if (shot.side == 0.0f && shot.source == SideSource::NoDesync)
+            brain.desyncProven = true;
+        scoreGuess(brain, shot.guess, proven);
+        if (proven != 0.0f) {
+            std::snprintf(detail, sizeof(detail), " (модель была на %s)", proven > 0.0f ? "+" : "−");
+            if (shot.source == SideSource::Jitter)
+                addJitterLink(brain, proven, shot.phase, 3.0f);
+            else
+                addEvidence(brain, proven, 4.0f, realtime);
+            brain.bruteSide = proven;
+            brain.bruteUntil = realtime + 2.0f;
+            brain.bruteProven = true;
+        } else if (shot.side != 0.0f) {
+            if (shot.source == SideSource::Jitter)
+                addJitterLink(brain, -shot.side, shot.phase, 1.5f);
+            else
+                addEvidence(brain, -shot.side, 2.0f, realtime);
+            brain.bruteSide = -shot.side;
+            brain.bruteUntil = realtime + 1.5f;
+            brain.bruteProven = false;
+        }
+        if (shot.source == SideSource::Layers) {
+            // Импакт показал, что модель была на той же стороне, по которой стреляли: сторона верна,
+            // не хватило величины угла (слои нашли ноги ближе к взгляду, чем на сервере). Такой промах
+            // не должен штрафовать слои и уводить резольвер в зеркало — он учит доводить угол до максимума.
+            if (proven != 0.0f && shot.side != 0.0f && proven == shot.side) {
+                hvh::resolver::onMagnitudeMiss(index);
+                std::snprintf(detail, sizeof(detail), " (модель была на %s: сторона верна, ноги дальше — доводим до максимума)", proven > 0.0f ? "+" : "−");
+            } else {
+                hvh::resolver::onMiss(index, proven != 0.0f);
+            }
+        }
+    }
+
+    char text[640];
+    std::snprintf(text, sizeof(text), "[newerwin] промах по %s: %s%s | %s", playerName(index).c_str(), reason, detail, shotText(shot).c_str());
+    static constexpr std::uint8_t red[4]{ 255, 110, 110, 255 };
+    report(red, text);
+    shot.time = 0.0f;
+}
+
+// Слои дали ноги почти по взгляду и без уверенности — сторона там случайна (лог 31.10, новая сборка:
+// все 3 промаха по слоям в голову — «+6°/29° 3%», «−5°/35° 30%» и т. п.). Такую находку не берём,
+// сторона идёт из памяти/перебора/догадки, а у них по логам голова без промахов резольвера.
+[[nodiscard]] bool layerSideUsable(const LagRecord& record) noexcept
+{
+    const float delta = std::abs(std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f));
+    const float limit = std::max(record.maxDesync, 1.0f);
+    return record.resolvedConfidence >= 0.35f || delta >= 0.4f * limit;
+}
+
+// ---------- кандидаты-записи и выбор точки ----------
+
+struct AimPoint {
+    csgo::Vector position{};
+    float damage = 0.0f;        // с множителем хитгруппы и бронёй
+    float baseDamage = 0.0f;    // долетает до точки без множителя — для хитшанса
+    bool isHead = false;
+    bool edge = false;
+    int group = 0;
+    bool sideSafe = false;      // общая для найденного угла и максимума той же стороны
+};
+
+struct Target {
+    int index = 0;
+    AimPoint point;
+    AimPoint fallback;          // вторая группа (тело вместо головы и наоборот) — если по первой нет хитшанса
+    float score = -1.0f;
+    float fov = 0.0f;
+    int minDamage = 0;
+    RecordKind kind = RecordKind::Live;
+    float simulationTime = 0.0f;
+    int backtrackTicks = 0;
+    int updatesAhead = 0;
+    int choke = 1;
+    float side = 0.0f;
+    SideSource source = SideSource::None;
+    float phase = 0.0f;
+    float guess = 0.0f;
+    float layerDelta = 0.0f;
+    float layerMax = 0.0f;
+    float layerConfidence = 0.0f;
+    const csgo::StudioHitboxSet* set = nullptr;
+    const csgo::StudioHdr* studio = nullptr;
+    csgo::matrix3x4 bones[RECORD_BONES];
+    csgo::matrix3x4 plus[RECORD_BONES];
+    csgo::matrix3x4 minus[RECORD_BONES];
+    bool haveVariants = false;
+};
+
+[[nodiscard]] const char* sideLabel(SideSource source, float side) noexcept
+{
+    switch (source) {
+    case SideSource::Bot: return "бот";
+    case SideSource::NoDesync: return "нет десинка";
+    case SideSource::Air: return "воздух";
+    case SideSource::Layers: return side >= 0.0f ? "слои +" : "слои −";
+    case SideSource::Evidence: return side > 0.0f ? "память +" : "память −";
+    case SideSource::Jitter: return side > 0.0f ? "джиттер +" : "джиттер −";
+    case SideSource::Guess: return side > 0.0f ? "догадка +" : "догадка −";
+    case SideSource::Brute: return side > 0.0f ? "перебор +" : "перебор −";
+    default: return "";
+    }
+}
+
+bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory) noexcept;
+float lerpTime = 0.0f;
+bool revolverRelease = false;   // R8 взведён, а выстрела этим тиком нет — отпустить ЛКМ, иначе выстрелит в пустоту
+
+} // namespace
+
+// ================= публичное =================
+
+bool minDamageOverrideActive() noexcept { return minDamageOverride; }
+bool forceBodyActive() noexcept { return forceBody; }
+bool forceShotActive() noexcept { return forceShot; }
+int currentTarget() noexcept { return target; }
+const char* status() noexcept { return statusText; }
 
 float resolverOffsetFor(int index) noexcept
 {
-    return index > 0 && index < static_cast<int>(resolverOffset.size()) ? resolverOffset[index] : 0.0f;
+    if (index <= 0 || index >= 65 || !memoryPtr)
+        return 0.0f;
+    if (hvh::resolver::valid(index)) {
+        const float limit = std::max(hvh::resolver::maxDesync(index), 1.0f);
+        return std::clamp(hvh::resolver::delta(index) / limit, -1.0f, 1.0f);
+    }
+    const float evidence = sideEvidence(brains[index], memoryPtr->globalVars->realtime);
+    return std::clamp(evidence / 3.0f, -1.0f, 1.0f);
 }
 
-bool minDamageOverrideActive() noexcept { return minDamageOverride; }
-const char* status() noexcept { return statusText; }
+TargetView targetView(int index) noexcept
+{
+    if (index <= 0 || index >= static_cast<int>(views.size()))
+        return {};
+    std::scoped_lock lock{ viewMutex };
+    return views[index];
+}
+
+ShotView shotView() noexcept
+{
+    std::scoped_lock lock{ viewMutex };
+    return lastShot;
+}
 
 void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgroup, int damage, int healthLeft) noexcept
 {
-    if (attackerIndex != localIndex || victimIndex <= 0 || victimIndex >= static_cast<int>(misses.size()))
+    if (attackerIndex != localIndex || victimIndex <= 0 || victimIndex >= 65 || !memoryPtr)
         return;
-    if (pendingShot[victimIndex] > 0.0f) {
-        static constexpr const char* hitgroups[]{ "тело", "голова", "грудь", "живот", "левая рука", "правая рука", "левая нога", "правая нога", "шея" };
-        const auto& shot = shots[victimIndex];
-        char text[448];
-        std::snprintf(text, sizeof(text), "[ECLIPSE] попал в %s: %s -%d (осталось %d) | целился в %s, сторона %s (%s)%s | %s",
-            playerName(victimIndex).c_str(), hitgroup >= 0 && hitgroup < 9 ? hitgroups[hitgroup] : "?", damage, healthLeft,
-            shot.isHead ? "голову" : "тело", sideText(shot.side), modeText(shot.mode), shot.safe ? ", safe" : "", recordText(shot).c_str());
-        static constexpr std::uint8_t green[4]{ 120, 230, 120, 255 };
-        consoleLog(green, text);
-        char brief[160];
-        std::snprintf(brief, sizeof(brief), "попал в %s: %s -%d (осталось %d)", playerName(victimIndex).c_str(),
-            hitgroup >= 0 && hitgroup < 9 ? hitgroups[hitgroup] : "?", damage, healthLeft);
-        screenLog(IM_COL32(120, 230, 120, 255), brief);
+    auto& shot = shots[victimIndex];
+    auto& brain = brains[victimIndex];
+    brain.misses = 0;
+    if (shot.time <= 0.0f)
+        return;
+    const float realtime = memoryPtr->globalVars->realtime;
+    if (victimIndex == lastShotIndex) {
+        std::scoped_lock lock{ viewMutex };
+        lastShot.result = 1;
     }
-    misses[victimIndex] = 0;
-    // попали — этот режим резольвера хорош для этого игрока
-    if (pendingShot[victimIndex] > 0.0f) {
-        const int mode = shots[victimIndex].mode;
-        if (mode >= 0 && mode < ModeCount)
-            resolverStates[victimIndex].score[mode] += 2;
-        else if (mode == LayerMode)
-            hvh::resolver::onHit(victimIndex);
-        else if (mode == MemoryMode)
-            resolverStates[victimIndex].memoryMisses = 0;
 
-        auto& state = resolverStates[victimIndex];
-        state.bruteSide = 0.0f;
-        state.bruteUntil = 0.0f;
-        {
-            // статистика: куда реально попадаем у этого игрока (голова/тело)
-            std::uint8_t& hits = shots[victimIndex].isHead ? state.headHits : state.bodyHits;
-            hits = static_cast<std::uint8_t>(std::min<int>(hits + 1, 250));
-        }
-        // Попадание — тоже доказательство стороны, если луч проходит только сквозь один крайний скелет:
-        // модель на сервере могла стоять лишь там. Это сильнее, чем «попали — значит сторона верна»:
-        // в тело мы попадаем при любой стороне, а геометрия луча различает стороны.
-        if (logMemory) {
-            if (const float proven = provenSideFromShot(victimIndex, shots[victimIndex], true); proven != 0.0f) {
-                addSideVote(state, proven, 3.0f, logMemory->globalVars->realtime);
-                if (!isJittering(state)) {
-                    state.bruteSide = proven;
-                    state.bruteUntil = logMemory->globalVars->realtime + 2.0f;
-                }
-                if (std::abs(shots[victimIndex].guessedSide) > 0.05f) {
-                    const bool same = (proven > 0.0f) == (shots[victimIndex].guessedSide > 0.0f);
-                    state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
-                    state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
-                }
-            }
-        }
-        // джиттер: учим, совпадает ли сторона попадания с фазой взгляда. Находок по слоям мало,
-        // а попаданий больше — связь фазы и стороны так выучивается быстрее
-        if (isJittering(state) && std::abs(shots[victimIndex].side) > 0.05f) {
-            const bool samePhase = (shots[victimIndex].side > 0.0f) == (state.jitterPhase > 0.0f);
-            state.jitterSideBits = static_cast<std::uint8_t>((state.jitterSideBits << 1) | (samePhase ? 1 : 0));
-            state.jitterSideCount = static_cast<std::uint8_t>(std::min<int>(state.jitterSideCount + 1, 8));
-        }
-        if (logMemory)
-            addSideVote(state, shots[victimIndex].side, 2.0f, logMemory->globalVars->realtime);
-        // попадание подтверждает и фристенд-догадку (или показывает, что она у этого игрока обратная)
-        if (!isJittering(state) && std::abs(shots[victimIndex].side) > 0.05f && std::abs(shots[victimIndex].guessedSide) > 0.05f) {
-            const bool same = (shots[victimIndex].side > 0.0f) == (shots[victimIndex].guessedSide > 0.0f);
-            state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
-            state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
-        }
-    }
-    pendingShot[victimIndex] = 0.0f;
+    // попадание — свидетельство: геометрией (луч прошёл только сквозь один крайний скелет) или стороной выстрела
+    const float proven = provenSide(shot, true);
+    const float side = proven != 0.0f ? proven : shot.side;
+    scoreGuess(brain, shot.guess, side);
+    const float weight = proven != 0.0f ? 3.0f : 1.5f;
+    if (shot.source == SideSource::Jitter)
+        addJitterLink(brain, side, shot.phase, weight);
+    else if (shot.source != SideSource::NoDesync && shot.source != SideSource::Bot)
+        addEvidence(brain, side, weight, realtime);
+    if (shot.source == SideSource::Layers)
+        hvh::resolver::onHit(victimIndex);
+    brain.bruteSide = 0.0f;
+    std::uint8_t& hits = shot.isHead ? brain.headHits : brain.bodyHits;
+    hits = static_cast<std::uint8_t>(std::min<int>(hits + 1, 250));
+
+    static constexpr const char* hitgroups[]{ "тело", "голова", "грудь", "живот", "левая рука", "правая рука", "левая нога", "правая нога", "шея" };
+    char text[640];
+    std::snprintf(text, sizeof(text), "[newerwin] попал в %s: %s −%d (осталось %d) | %s", playerName(victimIndex).c_str(),
+        hitgroup >= 0 && hitgroup < 9 ? hitgroups[hitgroup] : "?", damage, healthLeft, shotText(shot).c_str());
+    static constexpr std::uint8_t green[4]{ 120, 230, 120, 255 };
+    report(green, text);
+    shot.time = 0.0f;
 }
 
 void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory& memory, bool forceRemove) noexcept
 {
     const bool wanted = !forceRemove && config.rage.enabled;
-    if (wanted && !localImpactRegistered) {
-        engineInterfaces.getGameEventManager(memory.getEventDescriptor).addListener(&localImpactListener, csgo::bullet_impact);
-        localImpactRegistered = true;
-    } else if (!wanted && localImpactRegistered) {
-        engineInterfaces.getGameEventManager(memory.getEventDescriptor).removeListener(&localImpactListener);
-        localImpactRegistered = false;
+    if (wanted && !impactRegistered) {
+        engineInterfaces.getGameEventManager(memory.getEventDescriptor).addListener(&impactListener, csgo::bullet_impact);
+        impactRegistered = true;
+    } else if (!wanted && impactRegistered) {
+        engineInterfaces.getGameEventManager(memory.getEventDescriptor).removeListener(&impactListener);
+        impactRegistered = false;
     }
 }
 
@@ -1618,17 +1441,22 @@ void captureNetworkAngles(const EngineInterfaces& engineInterfaces, const Client
 {
     if (!config.rage.enabled)
         return;
-    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), static_cast<int>(networkAngles.size()) - 1);
+    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
         if (entity.getPOD() == nullptr || entity.getNetworkable().isDormant()) {
-            networkAngles[i].simulationTime = -1.0f;
+            network[i].simulationTime = -1.0f;
             continue;
         }
-        // simtime не сдвинулся — пакета на этого игрока не было, в поле лежит интерполированный угол
-        if (entity.simulationTime() == networkAngles[i].simulationTime)
-            continue;
-        networkAngles[i] = { entity.simulationTime(), entity.eyeAngles() };
+        if (entity.simulationTime() == network[i].simulationTime)
+            continue;   // пакета на него не было — в поле интерполированный угол
+        network[i] = { entity.simulationTime(), entity.eyeAngles() };
+        if (const auto* layers = entity.animOverlays(); layers && entity.animOverlayCount() > csgo::LAYER_ALIVELOOP) {
+            const auto& alive = layers[csgo::LAYER_ALIVELOOP];
+            network[i].aliveCycle = alive.cycle;
+            network[i].aliveRate = alive.playbackRate;
+            network[i].aliveSequence = alive.sequence;
+        }
     }
 }
 
@@ -1639,7 +1467,7 @@ void drawLogs(ImDrawList* drawList) noexcept
     constexpr double lifetime = 6.0, fade = 1.0;
     const double now = steadySeconds();
     ImVec2 position{ 8.0f, 6.0f };
-    // от старых к новым: новая строка снизу
+    std::scoped_lock lock{ screenMutex };
     for (int k = 0; k < static_cast<int>(screenLines.size()); ++k) {
         const auto& line = screenLines[(screenNext + k) % screenLines.size()];
         const double age = now - line.time;
@@ -1662,111 +1490,170 @@ void logToFile(const char* text) noexcept
 
 void onPlayerDeath(int victimIndex, int localIndex) noexcept
 {
-    if (victimIndex == localIndex && logMemory)
-        localDiedAt = logMemory->globalVars->realtime;
+    if (victimIndex == localIndex && memoryPtr)
+        localDiedAt = memoryPtr->globalVars->realtime;
 }
 
 void onRoundStart() noexcept
 {
-    misses.fill(0);
-    pendingShot.fill(0.0f);
+    for (auto& shot : shots)
+        shot.time = 0.0f;
+    for (auto& brain : brains) {
+        brain.misses = 0;
+        brain.bruteSide = 0.0f;
+    }
     hvh::resolver::onRoundStart();
-}
-bool forceBodyActive() noexcept { return forceBody; }
-bool forceShotActive() noexcept { return forceShot; }
-int currentTarget() noexcept { return target; }
-
-namespace
-{
-bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory, float lerp) noexcept;
 }
 
 bool run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory, float lerp) noexcept
 {
-    const bool shot = runImpl(cmd, engineInterfaces, clientInterfaces, interfaces, memory, lerp);
-
-    // «Фотка»: оружие готово, цель есть, а выстрела нет дольше секунды — пишем причину в файл (в консоль нет)
-    static float stuckSince = -1.0f;
-    static float lastWritten = -10.0f;
-    const std::string_view status{ statusText };
-    const bool waiting = status.starts_with("хитшанс") || status == "мало урона" || status == "нет безопасных точек";
-    const float now = memory.globalVars->realtime;
-    if (shot || !waiting) {
-        stuckSince = -1.0f;
-    } else if (stuckSince < 0.0f) {
-        stuckSince = now;
-    } else if (now - stuckSince > 1.0f && now - lastWritten > 2.0f) {
-        lastWritten = now;
-        char text[192];
-        std::snprintf(text, sizeof(text), "[ECLIPSE] не стреляю %.1f с: %s%s%s", now - stuckSince, statusText,
-            target ? ", цель " : "", target ? playerName(target).c_str() : "");
-        fileLog(text);
-    }
+    lerpTime = lerp;
+    revolverRelease = false;
+    const bool shot = runImpl(cmd, engineInterfaces, clientInterfaces, interfaces, memory);
+    if (!shot && revolverRelease)
+        cmd->buttons &= ~csgo::UserCmd::IN_ATTACK;
     return shot;
 }
 
 namespace
 {
 
-bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory, float lerp) noexcept
+// ---------- кнайфбот ----------
+// Нож бьёт трассой из глаз: ЛКМ на 48 ед., ПКМ (удар) на 32 ед. Урон: ЛКМ 25 (первый взмах 40 — не
+// рассчитываем на него), ПКМ 65; в спину — 90 и 180. Броня режет урон ножа примерно до 85%.
+// В спину — когда мы смотрим врагу в спину: направление на него совпадает с его взглядом (как в игре: > 0.475).
+// Лагкомп для ножа тот же, что для пуль: бьём по записи и ставим tickcount под неё.
+bool knifeBot(csgo::UserCmd* cmd, const csgo::Entity& weapon, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces,
+    const Memory& memory, float maxUnlag) noexcept
 {
     const auto& rage = config.rage;
-    logMemory = &memory;
-    logEngine.emplace(engineInterfaces.getEngine());
+    if (!rage.knifeBot || (!rage.autoFire && !(cmd->buttons & (csgo::UserCmd::IN_ATTACK | csgo::UserCmd::IN_ATTACK2))))
+        return false;
+    const float serverTime = memory.globalVars->serverTime();
+    const float interval = memory.globalVars->intervalPerTick;
+    if (localPlayer.get().nextAttack() > serverTime)
+        return false;
+    const bool primaryReady = weapon.nextPrimaryAttack() <= serverTime;
+    const bool secondaryReady = weapon.nextSecondaryAttack() <= serverTime;
+    if (!primaryReady && !secondaryReady)
+        return false;
+
+    float latencyIn = 0.0f;
+    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel())
+        latencyIn = csgo::NetworkChannel::from(retSpoofGadgets->client, channel).getLatency(1);
+
+    constexpr float primaryRange = 48.0f, secondaryRange = 32.0f;
+    const auto eye = localPlayer.get().getEyePosition();
+    struct Best {
+        int index = 0;
+        const LagRecord* record = nullptr;
+        csgo::Vector point{};
+        bool secondary = false;
+        bool lethal = false;
+        float distance = 1e9f;
+    } best;
+    static Capsules caps;
+
+    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
+    for (int i = 1; i <= maxClients; ++i) {
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+        if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
+            || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()) || entity.gunGameImmunity())
+            continue;
+        if ((entity.getAbsOrigin() - eye).squareLength() > 200.0f * 200.0f)
+            continue;
+        const auto model = entity.getRenderable().getModel();
+        const auto studio = model ? engineInterfaces.getModelInfo().getStudioModel(model) : nullptr;
+        const auto set = studio ? studio->getHitboxSet(entity.hitboxSet()) : nullptr;
+        if (!set)
+            continue;
+        const float hp = static_cast<float>(entity.health());
+        const float armor = entity.armor() > 0 ? 0.85f : 1.0f;
+        const auto& list = records[i];
+        for (int age = 0; age < list.count; ++age) {
+            const auto& record = list.at(age);
+            if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
+                break;
+            if (!recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval))
+                continue;
+            // ближайшая к глазам точка тела: по оси капсулы, расстояние — до её поверхности
+            buildCapsules(*set, record.bones, caps);
+            float distance = 1e9f;
+            csgo::Vector point{};
+            for (int k = 0; k < caps.count; ++k) {
+                const auto& capsule = caps.items[k];
+                const auto axis = capsule.b - capsule.a;
+                const float lengthSquared = axis.squareLength();
+                const float t = lengthSquared > 0.0f ? std::clamp((eye - capsule.a).dotProduct(axis) / lengthSquared, 0.0f, 1.0f) : 0.0f;
+                const auto nearest = capsule.a + axis * t;
+                const float surface = (nearest - eye).length() - capsule.radius;
+                if (surface < distance) {
+                    distance = surface;
+                    point = nearest;
+                }
+            }
+            if (distance > primaryRange)
+                continue;
+
+            const float yawRadians = Helpers::deg2rad(record.eyeAngles.y);
+            csgo::Vector toVictim = record.origin - eye;
+            toVictim.z = 0.0f;
+            const float flat = toVictim.length();
+            const bool backstab = flat > 0.1f && (toVictim.x * std::cos(yawRadians) + toVictim.y * std::sin(yawRadians)) / flat > 0.475f;
+            const float primaryDamage = (backstab ? 90.0f : 25.0f) * armor;
+            const float secondaryDamage = (backstab ? 180.0f : 65.0f) * armor;
+
+            bool secondary = false, lethal = false, use = false;
+            if (secondaryReady && distance <= secondaryRange && secondaryDamage >= hp) {
+                secondary = lethal = use = true;
+            } else if (primaryReady && primaryDamage >= hp) {
+                lethal = use = true;
+            } else if (rage.knifeBotMode == 1) {
+                // не наповал: ПКМ сильнее, но медленнее и короче — если достаём, бьём им
+                if (secondaryReady && distance <= secondaryRange)
+                    secondary = use = true;
+                else if (primaryReady)
+                    use = true;
+            }
+            if (!use)
+                continue;
+            if ((lethal && !best.lethal) || (lethal == best.lethal && distance < best.distance)) {
+                best = { i, &record, point, secondary, lethal, distance };
+            }
+        }
+    }
+    if (!best.record)
+        return false;
+
+    auto angle = (best.point - eye).toAngle();
+    angle.normalize();
+    cmd->viewangles = angle;
+    cmd->buttons &= ~(csgo::UserCmd::IN_ATTACK | csgo::UserCmd::IN_ATTACK2);
+    cmd->buttons |= best.secondary ? csgo::UserCmd::IN_ATTACK2 : csgo::UserCmd::IN_ATTACK;
+    cmd->tickCount = timeToTicks(best.record->simulationTime, interval) + timeToTicks(lerpTime, interval);
+    if (!rage.silent)
+        engineInterfaces.getEngine().setViewAngles(cmd->viewangles);
+    target = best.index;
+    statusText = best.secondary ? "нож: ПКМ" : "нож: ЛКМ";
+    return true;
+}
+
+bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory) noexcept
+{
+    const auto& rage = config.rage;
+    memoryPtr = &memory;
+    engine.emplace(engineInterfaces.getEngine());
     minDamageOverride = rage.minDamageOverrideKey.isSet() && rage.minDamageOverrideKey.isDown();
     forceBody = rage.forceBodyKey.isSet() && rage.forceBodyKey.isDown();
-    // клавиша форсшута — переключатель как у DT; не задана — форсшут просто по тумблеру
     forceShot = rage.forceShot && (!rage.forceShotKey.isSet() || rage.forceShotKey.isToggled());
     target = 0;
     statusText = "";
+    const float realtime = memory.globalVars->realtime;
 
-    for (std::size_t i = 0; i < pendingShot.size(); ++i) {
-        if (pendingShot[i] > 0.0f && memory.globalVars->realtime - pendingShot[i] > 0.7f) {
-            float provenSide = 0.0f;
-            const bool resolverFault = logMiss(static_cast<int>(i), pendingShot[i], provenSide);
-            ++misses[i];
-            // штрафуем режим только за промах по его вине (разброс/стена/лаг — не он)
-            const int mode = shots[i].mode;
-            if (resolverFault && mode >= 0 && mode < ModeCount) {
-                --resolverStates[i].score[mode];
-                auto& state = resolverStates[i];
-                const float used = shots[i].side;
-                if (provenSide != 0.0f && !isJittering(state)) {
-                    // импакт показал, где модель была на самом деле: сразу бьём этой стороной
-                    // и переносим голос на режим, который её выбирает
-                    state.bruteSide = provenSide;
-                    state.bruteUntil = memory.globalVars->realtime + 2.0f;
-                    addSideVote(state, provenSide, 4.0f, memory.globalVars->realtime);
-                    if (std::abs(used) > 0.05f && (used > 0.0f) != (provenSide > 0.0f)) {
-                        const int better = mode == Guess ? Opposite
-                            : mode == Opposite ? Guess
-                            : mode == GuessLow ? OppositeLow : GuessLow;
-                        state.score[better] = std::min(state.score[better] + 1, 8);
-                    }
-                    // и проверяем фристенд-догадку: импакт знает сторону точно
-                    if (std::abs(shots[i].guessedSide) > 0.05f) {
-                        const bool same = (provenSide > 0.0f) == (shots[i].guessedSide > 0.0f);
-                        state.guessSideBits = static_cast<std::uint8_t>((state.guessSideBits << 1) | (same ? 1 : 0));
-                        state.guessSideCount = static_cast<std::uint8_t>(std::min<int>(state.guessSideCount + 1, 8));
-                    }
-                } else if (std::abs(used) > 0.05f) {
-                    // доказать нечем — перебираем зеркальную сторону, пока не попадём
-                    state.bruteSide = used > 0.0f ? -1.0f : 1.0f;
-                    state.bruteUntil = memory.globalVars->realtime + 1.5f;
-                }
-            }
-            else if (resolverFault && mode == LayerMode)
-                hvh::resolver::onMiss(static_cast<int>(i));
-            else if (resolverFault && mode == MemoryMode) {
-                // враг переключил сторону (инвертер) — пробуем зеркальную, второй промах — память выключаем до новой находки
-                auto& state = resolverStates[i];
-                state.memoryRatio = -state.memoryRatio;
-                ++state.memoryMisses;
-            }
-            else if (resolverFault && mode == -1)
-                resolverStates[i].chokeHistory = 0xFF;  // считали, что не десинкает, а пуля прошла сквозь — значит, десинкает
-            pendingShot[i] = 0.0f;
-        }
+    // выстрелы без player_hurt за 0.7 с — промахи
+    for (int i = 1; i < 65; ++i) {
+        if (shots[i].time > 0.0f && realtime - shots[i].time > 0.7f)
+            evaluateMiss(i);
     }
 
     if (!rage.enabled || !localPlayer || !localPlayer.get().isAlive()) {
@@ -1778,8 +1665,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
     const float interval = memory.globalVars->intervalPerTick;
     const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
+    static const auto maxUnlagVar = interfaces.getCvar().findVar("sv_maxunlag");
+    const float maxUnlag = maxUnlagVar ? csgo::ConVar::from(retSpoofGadgets->client, maxUnlagVar).getFloat() : 0.2f;
 
-    // записи лагкомпа и резольвер обновляем каждый тик, даже когда стрелять нечем
+    // ---- записи и резольвер — каждый тик, даже когда стрелять нечем ----
     std::array<bool, 65> isBot{};
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
@@ -1788,125 +1677,148 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             records[i].clear();
             continue;
         }
-        csgo::PlayerInfo playerInfo{};
-        const bool haveInfo = engineInterfaces.getEngine().getPlayerInfo(i, playerInfo);
-        isBot[i] = haveInfo && playerInfo.fakeplayer;
-        trackPlayer(resolverStates[i], entity, i, haveInfo ? playerInfo.userId : -1, interval, memory.globalVars->realtime);
-        updateRecords(records[i], entity, memory, rage.resolver && !isBot[i], i);
+        csgo::PlayerInfo info{};
+        const bool haveInfo = engineInterfaces.getEngine().getPlayerInfo(i, info);
+        isBot[i] = haveInfo && info.fakeplayer;
+        track(brains[i], entity, i, haveInfo ? info.userId : -1, interval);
+        updateRecords(records[i], entity, memory, rage.resolver && !isBot[i], i, maxUnlag);
+
+        const auto& list = records[i];
+        std::scoped_lock lock{ viewMutex };
+        auto& view = views[i];
+        view.updatedAt = realtime;
+        view.breakingLagComp = list.count && list.at(0).breakingLagComp;
+        view.charged = list.count && memory.globalVars->serverTime() - list.at(0).simulationTime > 0.15f + interval * 2.0f;
     }
 
     if (localPlayer.get().isDefusing())
         return false;
-
     const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon());
-    if (!weapon.getPOD() || weapon.clip() <= 0)
+    if (!weapon.getPOD())
         return false;
-
     const auto weaponType = weapon.getWeaponType();
-    if (weaponType == WeaponType::Knife || weaponType == WeaponType::Grenade || weaponType == WeaponType::C4 || weapon.itemDefinitionIndex() == WeaponId::Revolver)
+    if (weaponType == WeaponType::Knife)
+        return knifeBot(cmd, weapon, engineInterfaces, clientInterfaces, memory, maxUnlag);
+    if (weapon.clip() <= 0 || weaponType == WeaponType::Grenade || weaponType == WeaponType::C4)
         return false;
-
+    // зевс — свой режим: только наповал, тело, свой хитшанс; выключен — не стреляем им вовсе
+    const bool taser = weapon.itemDefinitionIndex() == WeaponId::Taser;
+    if (taser && !rage.zeusBot)
+        return false;
+    const bool revolver = weapon.itemDefinitionIndex() == WeaponId::Revolver;
+    static const bool havePostpone = Netvars::get(fnv::hash("CWeaponCSBase->m_flPostponeFireReadyTime")) != 0;
+    if (revolver && !havePostpone)
+        return false;
     const auto weaponData = weapon.getWeaponData();
     if (!weaponData)
         return false;
 
-    if (!rage.autoFire && !(cmd->buttons & csgo::UserCmd::IN_ATTACK))
+    // без автострельбы и без ЛКМ не стреляем, но точки для визуала ищем
+    const bool visualOnly = !rage.autoFire && !(cmd->buttons & csgo::UserCmd::IN_ATTACK);
+    const bool viewWanted = config.view.aimDot;
+    if (visualOnly && !viewWanted)
         return false;
 
-    const auto& settings = weaponSettings(groupOf(weapon));
+    static RageWeapon zeusSettings;
+    if (taser) {
+        zeusSettings = {};
+        zeusSettings.hitboxes = zeusSettings.multipoint = HB_Chest | HB_Stomach | HB_Pelvis;
+        zeusSettings.bodyScale = 0.5f;
+        zeusSettings.minDamage = 100;               // не больше хп — значит, только наповал
+        zeusSettings.hitchance = std::clamp(rage.zeusHitchance, 1, 100);
+        zeusSettings.autoStop = static_cast<int>(AutoStop::Accuracy);
+        zeusSettings.autoScope = false;
+        zeusSettings.bodyIfLethal = true;
+    }
+    const auto& settings = taser ? zeusSettings : weaponSettings(groupOf(weapon));
     const float serverTime = memory.globalVars->serverTime();
-    // Во время сдвига DT команды идут пачкой без предсказания между ними: nextPrimaryAttack оружия ещё старый,
-    // и без этой проверки рейдж «стрелял» в каждой из прогоняемых команд, затирая данные настоящего выстрела
+    // во время сдвига DT команды идут пачкой без предсказания между ними: nextPrimaryAttack ещё старый
     static float firedAt = -1.0f;
     static float firedCycle = 0.0f;
-    // вне сдвига верим предсказанию игры: если сервер выстрел не принял, ждать 1.25 с скаута незачем
     const bool cycling = tickbase::isShifting() && firedAt >= 0.0f && serverTime >= firedAt && serverTime < firedAt + firedCycle;
-    const bool canShoot = localPlayer.get().nextAttack() <= serverTime && weapon.nextPrimaryAttack() <= serverTime && !cycling;
+    const bool weaponReady = localPlayer.get().nextAttack() <= serverTime && weapon.nextPrimaryAttack() <= serverTime && !cycling;
+    // R8 стреляет, только когда ЛКМ продержали 0.234 с (взвод), и сам — как только взвёлся. Взводим сами;
+    // в тик готовности либо выстрел, либо ЛКМ отпускается (взвод начнётся заново)
+    bool canShoot = weaponReady;
+    float revolverReadyAt = 0.0f;
+    if (revolver) {
+        const float fireReady = weapon.postponeFireReadyTime();
+        const bool cocking = fireReady > 0.0f && fireReady < serverTime + 1.0f;
+        canShoot = weaponReady && cocking && fireReady <= serverTime;
+        revolverReadyAt = cocking ? fireReady : serverTime + 0.234375f;
+        if (rage.autoFire && weaponReady) {
+            if (canShoot)
+                revolverRelease = true;
+            else
+                cmd->buttons |= csgo::UserCmd::IN_ATTACK;
+        }
+    }
     const bool needScope = settings.autoScope && weapon.isSniperRifle() && !localPlayer.get().isScoped();
-    // оружие будет готово раньше, чем мы успеем затормозить, — тормозим уже сейчас, к выстрелу скорость погашена
     const auto stopMode = static_cast<AutoStop>(settings.autoStop);
     const auto moveVars = movementVars(interfaces.getCvar());
     const float stopMaxSpeed = localPlayer.get().isScoped() || needScope ? weaponData->maxSpeedAlt : weaponData->maxSpeed;
     const int stopTicks = stopMode == AutoStop::Off ? 0
         : ticksToStop(localPlayer.get().velocity().length2D(), autoStopTarget(stopMode, stopMaxSpeed), stopMaxSpeed, moveVars, interval);
-    const float readyIn = std::max(localPlayer.get().nextAttack(), weapon.nextPrimaryAttack()) - serverTime;
+    const float readyIn = std::max({ localPlayer.get().nextAttack(), weapon.nextPrimaryAttack(), revolverReadyAt }) - serverTime;
     const bool readySoon = readyIn <= interval * static_cast<float>(std::max(stopTicks, 1));
 
-    // Между выстрелами точки не ищем: автоволл по записям — самое дорогое в чите, отсюда и фризы.
-    // Если цель нужна заранее (ранний автостоп/скоуп) — только дешёвый поиск: свежая запись, центры хитбоксов.
-    if (!canShoot && !readySoon && !settings.autoStopEarly && !needScope) {
+    // Между выстрелами полный поиск не нужен (автоволл — самое дорогое): только ради раннего стопа/скопа
+    // или отрисовки точек — дешёвый (одна запись), для отрисовки раз в 4 тика
+    const bool idle = !canShoot && !readySoon;
+    const bool viewOnly = visualOnly || (idle && !settings.autoStopEarly && !needScope);
+    if (idle && !settings.autoStopEarly && !needScope && !viewWanted) {
         statusText = "перезарядка";
         return false;
     }
-    const bool cheapScan = !canShoot && !readySoon;
-
+    if (viewOnly) {
+        static int viewTick = 0;
+        if (!visualOnly)
+            statusText = "перезарядка";
+        if (++viewTick % 4 != 0)
+            return false;
+    }
+    const bool cheap = idle || visualOnly;
+    const bool doubleTapReady = tickbase::doubleTapEnabled() && tickbase::isCharged() && !tickbase::isShifting();
+    // вторая пуля DT сразу — только у быстрого оружия (авто, пистолеты); у скаута/AWP перезарядка больше секунды
+    const bool doubleTapKill = doubleTapReady && weaponData->cycletime <= 0.4f;
+    // команда этого тика чокается — уйдёт со следующим пакетом (выстрел его форсирует), на тик позже;
+    // с DT сдвиг уходит тем же пакетом, что и выстрел
+    const float sendDelay = tickbase::isInstalled() && !tickbase::sendPacket() && !doubleTapReady ? interval : 0.0f;
     statusText = "нет целей";
 
     float latencyOut = 0.0f, latencyIn = 0.0f;
     if (const auto channel = engineInterfaces.getEngine().getNetworkChannel()) {
-        const auto network = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
-        latencyOut = network.getLatency(0);
-        latencyIn = network.getLatency(1);
+        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
+        latencyOut = net.getLatency(0);
+        latencyIn = net.getLatency(1);
     }
-    static const auto maxUnlagVar = interfaces.getCvar().findVar("sv_maxunlag");
-    const float maxUnlag = maxUnlagVar ? csgo::ConVar::from(retSpoofGadgets->client, maxUnlagVar).getFloat() : 0.2f;
     static const auto gravityVar = interfaces.getCvar().findVar("sv_gravity");
     const float gravity = gravityVar ? csgo::ConVar::from(retSpoofGadgets->client, gravityVar).getFloat() : 800.0f;
 
     const auto eye = localPlayer.get().getEyePosition();
-    const auto worldUp = csgo::Vector{ 0.0f, 0.0f, 1.0f };
-
-    struct Best {
-        int index = 0;
-        csgo::Vector origin{};
-        float eyeYaw = 0.0f;
-        AimPoint point;
-        AimPoint fallback;      // вторая группа (тело вместо головы и наоборот) — если по первой не хватит хитшанса
-        float fov = 0.0f;
-        csgo::matrix3x4 bones[RECORD_BONES];
-        csgo::StudioHitboxSet* set = nullptr;
-        float simulationTime = 0.0f;
-        bool safe = false;
-        RecordKind kind = RecordKind::Live;
-        int backtrackTicks = 0;
-        float speed = 0.0f;
-        int choke = 0;
-        int minDamage = 0;
-        int recordCount = 0;
-        float newestAge = 0.0f;
-        int updatesAhead = 0;
-    };
-    // Мультипоинт по всему телу — до ~70 точек на цель, каждая это автоволл. Центры хитбоксов проверяем всегда,
-    // доп. точки — пока не кончился бюджет на тик (иначе фризы при нескольких целях за стенами)
+    const csgo::Vector worldUp{ 0.0f, 0.0f, 1.0f };
+    // разброс в долях дистанции: радиус пятна пуль на d юнитах ≈ d·cone
+    const float cone = std::max(weapon.getInaccuracy(), 0.0f)
+        + std::clamp(weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread, 0.0f, 0.2f);
+    // мультипоинт по всему телу — до ~70 точек на цель, каждая автоволл: бюджет на тик против фризов
     int pointBudget = 160;
 
-    // Три лучшие цели по урону: если по первой не набирается хитшанс, стреляем во вторую/третью, а не стоим
-    static std::array<Best, 3> top;
+    static std::array<Target, 3> top;
     int topCount = 0;
-
-    // рабочие скелеты: выбранный резольвером и три версии для безопасных точек
-    static csgo::matrix3x4 bones[RECORD_BONES], plusBones[RECORD_BONES], minusBones[RECORD_BONES];
-    static LagRecord liveRecord, extrapolatedRecord;
-    static csgo::Vector aheadStep;
-    static Capsules earlierCapsules, laterCapsules;
-    static Capsules clientCapsules, plusCapsules, minusCapsules, aimCapsules;
+    static LagRecord predicted;
+    static LagRecord live;
+    static csgo::matrix3x4 bones[RECORD_BONES];
+    static Capsules aimCaps, plusCaps, minusCaps, earlierCaps, laterCaps;
 
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
         if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
             || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()) || entity.gunGameImmunity())
             continue;
-
-        auto& state = resolverStates[i];
-        resolverOffset[i] = 0.0f;
-        resolverMode[i] = -1;
-        // дефенсив не ждём: у хвх-игроков он почти всегда включён, рейдж бы просто не стрелял
-
         const auto toTarget = (entity.getAbsOrigin() - eye).toAngle();
         const float fov = std::hypot(std::remainder(toTarget.x - cmd->viewangles.x, 360.0f), std::remainder(toTarget.y - cmd->viewangles.y, 360.0f));
         if (fov > rage.fov)
             continue;
-
         const auto model = entity.getRenderable().getModel();
         if (!model)
             continue;
@@ -1917,27 +1829,33 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         if (!set)
             continue;
 
-        // ---- кандидаты-записи в порядке приоритета ----
+        auto& brain = brains[i];
+        const auto& list = records[i];
+
+        // ---- записи-кандидаты по приоритету ----
         struct Candidate {
             const LagRecord* record;
             RecordKind kind;
             int age;
-            int updatesAhead = 0;
+            int updatesAhead;
         };
         std::array<Candidate, 4> candidates{};
         int candidateCount = 0;
-        const auto& list = records[i];
+        csgo::Vector aheadStep{};
 
         if (list.count && list.at(0).breakingLagComp) {
-            // ломает лагкомп: сервер стреляет по его текущей позиции, откат не поможет.
-            // Сдвигаем свежую запись вперёд по скорости на время, пока данные шли к нам и пакет идёт обратно.
-            const int updates = predictAhead(list, extrapolatedRecord, memory.globalVars->realtime, latencyOut + latencyIn, interval, gravity, aheadStep);
-            candidates[candidateCount++] = { &extrapolatedRecord, RecordKind::Extrapolated, 0, updates };
+            // ломает лагкомп: сервер стреляет по текущей позиции — только прогноз
+            const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep);
+            candidates[candidateCount++] = { &predicted, RecordKind::Extrapolated, 0, updates };
         } else {
             int onshot = -1, standing = -1, newest = -1, oldest = -1;
             for (int age = 0; age < list.count; ++age) {
                 const auto& record = list.at(age);
-                if (!recordValid(record.simulationTime, serverTime, latencyOut, latencyIn, lerp, maxUnlag))
+                // сервер идёт от свежей записи к старым и на первом разрыве > 64 ед. бросает откат:
+                // всё, что старше разрыва, недостижимо — выстрел уйдёт по текущей позиции
+                if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
+                    break;
+                if (record.animStale || !recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval))
                     continue;
                 if (newest < 0)
                     newest = age;
@@ -1948,7 +1866,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 oldest = age;
             }
             const auto add = [&](int age, RecordKind kind) {
-                if (age < 0 || candidateCount >= static_cast<int>(candidates.size()))
+                if (age < 0)
                     return;
                 for (int c = 0; c < candidateCount; ++c) {
                     if (candidates[c].age == age)
@@ -1959,474 +1877,500 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             add(onshot, RecordKind::Onshot);
             add(standing, RecordKind::Standing);
             add(newest, RecordKind::Newest);
-            // старая — только если она заметно в другом месте: выглядывающего так ловят до того, как он спрятался
-            if (oldest >= 0 && newest >= 0 && (list.at(oldest).origin - list.at(newest).origin).squareLength() > 4.0f * 4.0f)
+            // старая — только если заметно в другом месте: выглядывающего ловим до того, как спрятался
+            if (oldest >= 0 && newest >= 0 && (list.at(oldest).origin - list.at(newest).origin).squareLength() > 16.0f)
                 add(oldest, RecordKind::Oldest);
 
             if (candidateCount == 0 && list.count) {
-                // Все записи старше окна отката (у хвх-игроков simtime отстаёт на 200-450 мс: заряженный DT/дефенсив).
-                // Сервер до них не дотянется и возьмёт своё текущее состояние врага — оно новее нашей свежей записи
-                // на те обновления, что придут к нему, пока летит наш выстрел. Туда и стреляем, tickcount не трогаем.
-                const int updates = predictAhead(list, extrapolatedRecord, memory.globalVars->realtime, latencyOut + latencyIn, interval, gravity, aheadStep);
-                candidates[candidateCount++] = { &extrapolatedRecord, RecordKind::Ahead, 0, updates };
+                const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep);
+                candidates[candidateCount++] = { &predicted, RecordKind::Ahead, 0, updates };
             }
-
             if (candidateCount == 0) {
-                // записей ещё нет (только что появился, дефенсив съел всё) — старый способ:
-                // интерполированная модель, tickcount не трогаем
+                // записей ещё нет (только что появился) — интерполированная модель, tickcount не трогаем
                 static csgo::matrix3x4 setup[MAXSTUDIOBONES];
                 if (!entity.setupBones(setup, MAXSTUDIOBONES, BONE_USED_BY_HITBOX, memory.globalVars->currenttime))
                     continue;
-                std::copy(setup, setup + RECORD_BONES, liveRecord.bones);
-                liveRecord.simulationTime = entity.simulationTime();
-                liveRecord.origin = entity.getAbsOrigin();
-                liveRecord.eyeAngles = serverEyeAngles(i, entity);
-                liveRecord.absYaw = entity.getAbsAngle().y;
-                liveRecord.velocity = entity.velocity();
-                liveRecord.flags = entity.flags();
-                liveRecord.choked = list.count ? list.at(0).choked : 1;
-                liveRecord.shot = false;
-                liveRecord.breakingLagComp = false;
-                liveRecord.rebuilt = false;
-                liveRecord.resolved = false;
-                liveRecord.remembered = false;
-                liveRecord.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
-                candidates[candidateCount++] = { &liveRecord, RecordKind::Live, 0, 0 };
+                std::copy(setup, setup + RECORD_BONES, live.bones);
+                live.simulationTime = entity.simulationTime();
+                live.origin = entity.getAbsOrigin();
+                live.eyeAngles = serverEyeAngles(i, entity);
+                live.absYaw = entity.getAbsAngle().y;
+                live.velocity = entity.velocity();
+                live.flags = entity.flags();
+                live.choked = 1;
+                live.maxDesync = std::clamp(entity.getMaxDesyncAngle(), 0.0f, 60.0f);
+                live.jitterPhase = brain.jitterPhase;
+                live.variants = false;
+                live.resolved = false;
+                if (rage.resolver && !isBot[i]) {
+                    rotateVariant(live, 1.0f, live.plus);
+                    rotateVariant(live, -1.0f, live.minus);
+                    live.variants = true;
+                }
+                candidates[candidateCount++] = { &live, RecordKind::Live, 0, 0 };
             }
         }
-        if (cheapScan)
+        if (cheap)
             candidateCount = 1;
 
         const int health = entity.health();
+        const float hp = static_cast<float>(health);
         const int minDamageSetting = minDamageOverride ? settings.minDamageOverride : settings.minDamage;
-        // больше 100 — «HP+N»: убить с запасом N; иначе хп меньше мин. урона — достаточно добить
+        // больше 100 — «HP+N»: убить с запасом; иначе хп меньше мин. урона — достаточно добить
         const int minDamage = minDamageSetting > 100 ? health + (minDamageSetting - 100) : std::min(minDamageSetting, health);
-        const bool bodyOnly = forceBody;
-        // конечности — только когда можно убить: рука даёт x1, нога x0.75 от урона оружия
-        const bool limbsLethal = static_cast<float>(weaponData->damage) >= static_cast<float>(health);
+        // конечности — только наповал: рука x1, нога x0.75 от урона оружия
+        const bool limbsLethal = static_cast<float>(weaponData->damage) >= hp;
+        const bool safeRequired = rage.safePoint == 2 || (rage.safePoint == 1 && brain.misses > 0);
+        // своя статистика: по голове мажем, а по телу попадаем — голове меньше доверия
+        const float headRate = (brain.headHits + 0.5f) / (brain.headShots + 1.0f);
+        const float bodyRate = (brain.bodyHits + 0.5f) / (brain.bodyShots + 1.0f);
+        const bool headUnlucky = brain.bodyShots >= 4 && bodyRate > headRate + 0.1f;
 
-        // режим резольвера — лучший по счёту для этого игрока; не чокает — значит, не десинкает, не крутим
-        const int mode = isDesyncing(state) ? bestMode(state) : -1;
-        const float deltaScale = mode == GuessLow || mode == OppositeLow ? 0.5f : 1.0f;
-        // Память слоёв знает не только сторону, но и величину десинка (доля от максимума): у многих
-        // врагов ноги повёрнуты не на полный угол, и «полный» скелет уводил точку мимо тела.
-        const float realtimeNow = memory.globalVars->realtime;
-        // Голосование по свидетельствам: чуть перевесило — сторона известна, сильно перевесило —
-        // оно перекрывает даже одиночную находку по слоям (та могла быть на разошедшейся тени анимации).
-        const float votedSide = voteSide(state, realtimeNow);
-        const float strongVotedSide = voteSide(state, realtimeNow, 3.0f);
-        float memorySide = 0.0f;
-        float variantScale = deltaScale;
-        if (mode >= 0 && !isJittering(state)) {
-            const float ratio = rememberedRatio(state, realtimeNow);
-            if (std::abs(ratio) > 0.3f) {
-                memorySide = ratio > 0.0f ? 1.0f : -1.0f;
-                variantScale = std::clamp(std::abs(ratio), 0.35f, 1.0f);
-            }
-            // голосование по всем свидетельствам перекрывает одиночную находку
-            if (votedSide != 0.0f)
-                memorySide = votedSide;
-        }
-        // доля смен фазы джиттера за обновление: 1 — каждый апдейт, 0.5 — раз в два
-        const float phaseRatio = phaseChangeRatio(state);
+        std::array<std::pair<csgo::Vector, std::uint8_t>, 64> viewPoints, shownPoints;
+        int viewPointCount = 0, shownPointCount = 0;
+        const char* resolverText = "";
+        const char* shownResolver = "";
+        // лучшая запись игрока: каждая запись-кандидат оценивается целиком, берётся самая полезная
+        // (выглядывал — в старой записи голова открыта, в свежей уже за стеной)
+        static Target playerBest;
+        playerBest.score = -1.0f;
 
         for (int c = 0; c < candidateCount; ++c) {
             const auto& record = *candidates[c].record;
-
-            // Скелет, по которому стреляем. Если резольвер по слоям дал угол ног, скелет записи
-            // уже собран под него (updateRecords), а plus/minus — крайние ноги для безопасных точек.
-            std::copy(record.bones, record.bones + RECORD_BONES, bones);
-            const bool layerResolved = rage.resolver && record.resolved;
-            bool variants = false;
-            bool layerOverridden = false;
-            float side = 0.0f;
-            if (layerResolved) {
-                // крайние скелеты собраны только при включённых безопасных точках
-                if (record.rebuilt) {
-                    std::copy(record.plus, record.plus + RECORD_BONES, plusBones);
-                    std::copy(record.minus, record.minus + RECORD_BONES, minusBones);
-                    variants = true;
-                    // Находка слоёв могла быть на разошедшейся тени анимации. Если голосование уверенно
-                    // показывает обратную сторону (её доказали попадания/импакты, а не догадка), берём
-                    // скелет этой стороны, а величину — из находки: десинк не всегда на полный угол.
-                    const float layerDelta = std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f);
-                    const bool shaky = record.remembered || hvh::resolver::confidence(i) < 0.5f;
-                    if (shaky && strongVotedSide != 0.0f && std::abs(layerDelta) > 1.0f
-                        && ((layerDelta > 0.0f ? 1.0f : -1.0f) != strongVotedSide)) {
-                        const auto* chosen = strongVotedSide > 0.0f ? record.plus : record.minus;
-                        std::copy(chosen, chosen + RECORD_BONES, bones);
-                        layerOverridden = true;
-                    }
-                }
-            } else if (rage.resolver && mode >= 0 && buildDesyncVariants(isBot[i], record, record.bones, plusBones, minusBones, variantScale)) {
-                variants = true;
-                if (pendingShot[i] == 0.0f || state.guessedSide == 0.0f)
-                    state.guessedSide = guessDesyncSide(engineInterfaces.engineTrace(), eye, plusBones, minusBones);
-                // у джиттеров десинк обычно переключается вместе с yaw — берём фазу джиттера вместо фристенда
-                // сколько раз фаза перещёлкнется, пока сервер дойдёт до нашей записи: по выученной доле смен
-                const bool flipped = std::lround(static_cast<float>(candidates[c].updatesAhead) * phaseRatio) % 2 != 0;
-                const float relation = jitterRelation(state);
-                const float phase = (flipped ? -state.jitterPhase : state.jitterPhase) * (relation < 0.0f ? -1.0f : 1.0f);
-                // сторона: голосование/память слоёв точнее фристенд-догадки, джиттер — по фазе
-                const float base = isJittering(state) ? phase : (memorySide != 0.0f ? memorySide : guessSide(state));
-                if (mode == Guess || mode == GuessLow)
-                    side = base;
-                else if (mode == Opposite || mode == OppositeLow)
-                    side = -base;
-                // промах по вине резольвера — сразу бьём стороной, которую доказал импакт
-                if (state.bruteSide != 0.0f && memory.globalVars->realtime < state.bruteUntil)
-                    side = state.bruteSide;
-                if (side != 0.0f) {
-                    const auto* chosen = side > 0.0f ? plusBones : minusBones;
-                    std::copy(chosen, chosen + RECORD_BONES, bones);
-                }
-            }
-            // Насколько сторона десинка доказана: слои с хорошей уверенностью или режим, который уже
-            // приносил попадания. Иначе «край головы» — лотерея, и лучше бить точку, общую для обеих сторон.
-            bool sideCertain = !rage.resolver || isBot[i];
-            if (rage.resolver && !isBot[i]) {
-                if (layerResolved)
-                    sideCertain = !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
-                else if (variants)
-                    // Счёт режима стартует с нуля, поэтому «>= 0» объявляло сторону доказанной у
-                    // врага, про которого не известно ничего: отсюда sideScale 1.0, точки на край
-                    // капсулы и безопасные точки не требуются. Доказательством считаем только то,
-                    // что режим уже приносил попадания, или голосование по импактам.
-                    sideCertain = mode >= 0 && (state.score[std::clamp(mode, 0, ModeCount - 1)] > 0 || voteSide(state, realtimeNow) != 0.0f);
-            }
-            const bool sideUncertain = variants && !sideCertain;
-            const bool safeBySetting = rage.safePoint == 2 || (rage.safePoint == 1 && misses[i] > 0);
             const bool predictedRecord = candidates[c].kind == RecordKind::Ahead || candidates[c].kind == RecordKind::Extrapolated;
-            // Предсказанная запись + неизвестная сторона — это две догадки подряд, и по логам 29.10
-            // так выходит 29% попаданий («вперёд» + «угадано», 188 выстрелов) против 78% у «свежая» + «слои».
-            // В такой связке точки, общие для обеих сторон, требуем, а не предпочитаем; если под них
-            // не набирается мин. урон, ниже всё равно идёт второй проход без требования.
-            const bool desyncSafe = !cheapScan && variants
-                && (safeBySetting || ((rage.resolverSafeWhenUnsure || predictedRecord) && sideUncertain));
-            // на предсказанной записи сторону десинка проверить нечем (взгляд за 300 мс уходит на 60°) —
-            // точки, общие для обеих сторон, предпочитаем там всегда, без требования (см. steady ниже)
-            const bool preferDesyncSafe = predictedRecord && !cheapScan && variants;
-            if (desyncSafe || preferDesyncSafe) {
-                buildCapsules(*set, record.bones, clientCapsules);
-                buildCapsules(*set, plusBones, plusCapsules);
-                buildCapsules(*set, minusBones, minusCapsules);
+            const bool airborne = !(record.flags & FL_ONGROUND);
+
+            // ---- резольвер: по какому скелету стреляем и насколько уверены ----
+            std::copy(record.bones, record.bones + RECORD_BONES, bones);
+            float side = 0.0f;
+            float guess = 0.0f;
+            bool sideCertain = true;
+            // доверие к стороне ≈ доля попаданий в тело при таком источнике (логи 29+31.10);
+            // голова к ошибке стороны чувствительнее — для неё квадрат
+            float sideTrust = 1.0f;
+            SideSource source = SideSource::None;
+            const bool resolve = rage.resolver && !isBot[i] && record.variants;
+            if (!rage.resolver) {
+                source = SideSource::None;
+            } else if (isBot[i]) {
+                source = SideSource::Bot;
+            } else if (!desyncing(brain)) {
+                source = SideSource::NoDesync;
+            } else if (!record.variants) {
+                source = SideSource::None;
+                sideCertain = false;
+                sideTrust = 0.6f;
+            } else if (airborne) {
+                // в прыжке десинк мал, модели почти совпадают — поворот по догадке только уводит точку
+                source = SideSource::Air;
+                sideTrust = 0.8f;
+            } else if (record.resolved && layerSideUsable(record) && !(predictedRecord && jittering(brain)) && !(brain.bruteSide != 0.0f && realtime < brain.bruteUntil)) {
+                // Слои — лучший источник (логи 29+31.10: 152 попадания на 24 промаха резольвера, 86%), в том числе
+                // при низкой уверенности: скелет собран ровно под найденный угол ног, а не под крайний.
+                // Уступают только перебору сразу после промаха по вине резольвера.
+                source = SideSource::Layers;
+                side = std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f) >= 0.0f ? 1.0f : -1.0f;
+                sideCertain = record.resolvedConfidence >= 0.5f;
+                sideTrust = sideCertain ? 0.85f : 0.75f;
+            } else {
+                // сторона: перебор после промаха > связь с фазой (джиттер) > свидетельства > фристенд
+                const float evidence = sideEvidence(brain, realtime);
+                if (brain.bruteSide != 0.0f && realtime < brain.bruteUntil) {
+                    side = brain.bruteSide;
+                    source = SideSource::Brute;
+                    sideCertain = false;
+                    sideTrust = brain.bruteProven ? 0.75f : 0.5f;
+                } else if (jittering(brain) && std::abs(brain.jitterLink) >= 1.0f) {
+                    // за время до сервера фаза могла перещёлкнуться: нечётное число обновлений — обратная
+                    const float phase = candidates[c].updatesAhead % 2 ? -record.jitterPhase : record.jitterPhase;
+                    side = brain.jitterLink > 0.0f ? phase : -phase;
+                    source = SideSource::Jitter;
+                    sideCertain = std::abs(brain.jitterLink) >= 3.0f;
+                    sideTrust = sideCertain ? 0.75f : 0.6f;
+                } else if (std::abs(evidence) >= 1.0f && !jittering(brain)) {
+                    side = evidence > 0.0f ? 1.0f : -1.0f;
+                    source = SideSource::Evidence;
+                    sideCertain = std::abs(evidence) >= 3.0f;
+                    sideTrust = sideCertain ? 0.8f : 0.65f;
+                } else {
+                    guess = freestandSide(engineInterfaces.engineTrace(), eye, record);
+                    // у этого игрока догадка доказанно ошибается — его антиаим прячет голову наоборот
+                    side = brain.guessWrong >= 3 && brain.guessWrong > 2 * brain.guessRight ? -guess : guess;
+                    source = SideSource::Guess;
+                    sideCertain = false;
+                    sideTrust = 0.6f;
+                }
+                std::copy(side > 0.0f ? record.plus : record.minus, (side > 0.0f ? record.plus : record.minus) + RECORD_BONES, bones);
             }
-            const auto isSafe = [&](const csgo::Vector& point) {
-                auto direction = point - eye;
-                direction /= std::max(direction.length(), 0.001f);
-                const auto end = eye + direction * weaponData->range;
-                return rayHitsPlayer(eye, end, clientCapsules) && rayHitsPlayer(eye, end, plusCapsules) && rayHitsPlayer(eye, end, minusCapsules);
+            resolverText = sideLabel(source, side);
+
+            // ---- точки ----
+            // Каждая точка: урон (автоволл до точки записи, реальная хитгруппа на луче) и надёжность —
+            // оценка вероятности попасть при том, чего мы точно не знаем (калибровка по логам 29+31.10):
+            //  * сторона: точка, общая для всех трёх скелетов, от неё не зависит; иначе × доверие к стороне
+            //    (тело), × его квадрат (голова: догадкой 31% против 52% у тела, перебором 15% против 42%);
+            //  * прогноз «вперёд»: тело ×0.7, голова ×0.4 (логи: тело 47% против 81% на свежей, голова 27% против 80%);
+            //    точка, не попадающая и в модель N−1, и в N, — ещё ×0.6;
+            //  * край капсулы ×0.9, сквозь стену ×0.85.
+            // Выбор — по пользе: убить сейчас (1.5) > убить двумя пулями DT (1.1) > урон (урон/хп), всё × надёжность.
+            const bool checkSafe = !cheap && resolve;
+            static Capsules centerCaps;
+            if (checkSafe) {
+                buildCapsules(*set, record.bones, centerCaps);
+                buildCapsules(*set, record.plus, plusCaps);
+                buildCapsules(*set, record.minus, minusCaps);
+            }
+            // Точка головы безопасна, только если луч в каждой модели первым входит именно в голову.
+            // Раньше хватало любой капсулы: луч в голову одной модели и в плечо другой считался безопасным,
+            // и по логам 31.10 так вышло 16 выстрелов «в голову», попавших в тело.
+            const auto hitsAs = [&](const Capsules& caps, const csgo::Vector& end, bool head) {
+                return head ? firstHitGroup(caps, eye, end) == HITGROUP_HEAD : rayHits(eye, end, caps);
             };
-            buildCapsules(*set, bones, aimCapsules);
+            const auto isSafe = [&](const csgo::Vector& point, bool head) {
+                if (!checkSafe)
+                    return true;
+                const auto end = eye + normalized(point - eye) * weaponData->range;
+                return hitsAs(centerCaps, end, head) && hitsAs(plusCaps, end, head) && hitsAs(minusCaps, end, head);
+            };
+            // Слои: сторону находят надёжнее, чем величину (4 из 5 доказанных промахов в голову — сторона
+            // верна, ноги дальше). Точка, общая для найденного угла и полного десинка той же стороны,
+            // от величины не зависит — ей доверяем как стороне, а не как стороне и углу сразу.
+            const bool layerSide = checkSafe && source == SideSource::Layers && side != 0.0f;
+            const csgo::matrix3x4* sideExtreme = side > 0.0f ? record.plus : record.minus;
+            static Capsules sideCaps;
+            if (layerSide)
+                buildCapsules(*set, sideExtreme, sideCaps);
+            const auto isSideSafe = [&](const csgo::Vector& point, bool head) {
+                if (!layerSide)
+                    return false;
+                const auto end = eye + normalized(point - eye) * weaponData->range;
+                return hitsAs(aimCaps, end, head) && hitsAs(sideCaps, end, head);
+            };
+            buildCapsules(*set, bones, aimCaps);
 
-            // Край капсулы прощает только тогда, когда сторона десинка известна: при низкой уверенности
-            // резольвера «край» — это промах по чужой стороне, а центр той же капсулы попадает при любой.
-            // По логам 29.10 основная масса промахов — «голова (край)» / «тело (край)» после угаданной стороны.
-            float sideScale = 1.0f;
-            if (rage.resolver && !isBot[i]) {
-                if (layerResolved)
-                    sideScale = record.remembered ? 0.5f : std::clamp(hvh::resolver::confidence(i) * 1.4f, 0.35f, 1.0f);
-                else if (mode >= 0 && side == 0.0f)
-                    sideScale = 0.0f;    // десинкает, а сторона не выбрана — точки только по центру
-                else if (mode >= 0 && sideUncertain)
-                    sideScale = 0.45f;   // сторона под вопросом — бьём ближе к центру капсулы
-            }
-
-            // Предсказанная запись: сервер мог успеть принять на обновление больше или меньше, чем мы
-            // насчитали (чок врага плавает, наша команда ждёт в очереди). Точки, которые попадают и в модель,
-            // сдвинутую на шаг назад/вперёд, берём в первую очередь: на бегу поперёк это обычно тело,
-            // при беге на нас/от нас — и голова. Нет таких — стреляем как раньше, не стоим.
-            const bool checkSteps = predictedRecord && !cheapScan && aheadStep.squareLength() > 1.0f;
+            const bool checkSteps = predictedRecord && !cheap && aheadStep.squareLength() > 1.0f;
             if (checkSteps) {
-                earlierCapsules = aimCapsules;
-                laterCapsules = aimCapsules;
-                for (int k = 0; k < aimCapsules.count; ++k) {
-                    earlierCapsules.items[k].a -= aheadStep;
-                    earlierCapsules.items[k].b -= aheadStep;
-                    laterCapsules.items[k].a += aheadStep;
-                    laterCapsules.items[k].b += aheadStep;
+                earlierCaps = aimCaps;
+                laterCaps = aimCaps;
+                for (int k = 0; k < aimCaps.count; ++k) {
+                    earlierCaps.items[k].a -= aheadStep;
+                    earlierCaps.items[k].b -= aheadStep;
+                    laterCaps.items[k].a += aheadStep;
+                    laterCaps.items[k].b += aheadStep;
                 }
             }
             const auto stepSafe = [&](const csgo::Vector& point) {
-                if (!checkSteps)
-                    return false;
                 const auto end = eye + normalized(point - eye) * weaponData->range;
-                return rayHitsPlayer(eye, end, earlierCapsules) && rayHitsPlayer(eye, end, laterCapsules);
+                return rayHits(eye, end, earlierCaps) && rayHits(eye, end, laterCaps);
             };
 
-            // steady — устойчивые к ±1 обновлению; sure — ещё и общие для обеих сторон десинка
-            AimPoint bestHead, bestBody, steadyHead, steadyBody, sureHead, sureBody;
-            AimPoint weakHead, weakBody;   // лучший достижимый урон без порога — для форсшута
-            // разброс в долях дистанции: радиус пятна пуль на d юнитах ≈ d * cone
-            const float cone = std::max(weapon.getInaccuracy(), 0.0f)
-                + std::clamp(weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread, 0.0f, 0.2f);
-            const auto scanPoints = [&](bool requireDesyncSafe, bool noHead) {
-                for (const auto& [flag, hitboxes] : hitboxGroups) {
-                    if (!(settings.hitboxes & flag))
+            // край капсулы прощает только при известной стороне: иначе «край» — промах по чужой стороне
+            float sideScale = 1.0f;
+            if (source == SideSource::Layers)
+                sideScale = std::clamp(record.resolvedConfidence * 1.4f, 0.35f, 1.0f);
+            else if (resolve && !sideCertain)
+                sideScale = side == 0.0f ? 0.0f : 0.45f;
+
+            struct Scored {
+                AimPoint point;
+                float score = -1.0f;
+                bool safe = false;
+            };
+            Scored head, body, any;
+            const auto offer = [](Scored& slot, const AimPoint& point, float score, bool safe) {
+                if (score > slot.score)
+                    slot = { point, score, safe };
+            };
+            viewPointCount = 0;
+
+            for (const auto& [flag, hitboxes] : hitboxGroups) {
+                // тело наповал по надёжной точке — лучше уже не будет (голова может только сравняться)
+                if (!viewOnly && body.score >= 1.5f * 0.99f)
+                    break;
+                if (!(settings.hitboxes & flag))
+                    continue;
+                const bool isHead = flag == HB_Head;
+                if (isHead && forceBody)
+                    continue;
+                const bool isLimb = flag == HB_Arms || flag == HB_Legs || flag == HB_Feet;
+                if (isLimb && (!limbsLethal || cheap))
+                    continue;
+                const bool multipoint = (settings.multipoint & flag) && (!cheap || viewOnly);
+                // каждый промах прижимает точки к центру; прогноз — тоже
+                const float shrink = (brain.misses >= 2 ? 0.4f : brain.misses == 1 ? 0.7f : 1.0f) * (predictedRecord ? 0.75f : 1.0f);
+                const float maxScale = (isHead ? settings.headScale : settings.bodyScale) * sideScale;
+                float trust = 1.0f;
+                if (predictedRecord)
+                    trust *= isHead ? 0.4f : 0.7f;
+                if (isHead && headUnlucky)
+                    trust *= 0.6f;
+                if (!isHead && settings.preferBody)
+                    trust *= 1.3f;
+                const float sideFactor = isHead ? sideTrust * sideTrust : sideTrust;
+
+                for (const auto hitboxId : hitboxes) {
+                    if (hitboxId == Hitbox::Max)
+                        break;
+                    const auto hitbox = set->getHitbox(hitboxId);
+                    if (!hitbox || hitbox->bone < 0 || hitbox->bone >= RECORD_BONES)
                         continue;
-                    if ((bodyOnly || noHead) && flag == HB_Head)
-                        continue;
-                    const bool isLimb = flag == HB_Arms || flag == HB_Legs || flag == HB_Feet;
-                    if (isLimb && (!limbsLethal || cheapScan))
-                        continue;
+                    const auto min = transform(hitbox->bbMin, bones[hitbox->bone]);
+                    const auto max = transform(hitbox->bbMax, bones[hitbox->bone]);
+                    const auto center = (min + max) * 0.5f;
 
-                    const bool isHead = flag == HB_Head;
-                    const bool multipoint = (settings.multipoint & flag) && !cheapScan;
-                    // каждый промах по игроку прижимает точки к центру; предсказанная запись — тоже
-                    const float shrink = (misses[i] >= 2 ? 0.4f : misses[i] == 1 ? 0.7f : 1.0f) * (predictedRecord ? 0.75f : 1.0f);
-                    const float maxScale = (isHead ? settings.headScale : settings.bodyScale) * sideScale;
-
-                    for (const auto hitboxId : hitboxes) {
-                        if (hitboxId == Hitbox::Max)
-                            break;
-                        const auto hitbox = set->getHitbox(hitboxId);
-                        if (!hitbox || hitbox->bone < 0 || hitbox->bone >= RECORD_BONES)
-                            continue;
-
-                        const auto min = transform(hitbox->bbMin, bones[hitbox->bone]);
-                        const auto max = transform(hitbox->bbMax, bones[hitbox->bone]);
-                        const auto center = (min + max) * 0.5f;
-
-                        // Мультипоинт: центр, края капсулы поперёк взгляда (лево/право), верх у головы и точки
-                        // по оси капсулы у вытянутых хитбоксов (конечности, таз). Размер: вручную — ползунок,
-                        // авто — сколько влезает, чтобы пятно разброса на этой дистанции не вылезало за капсулу:
-                        // смещение s·r плюс половина пятна не больше 0.95·r.
-                        std::array<csgo::Vector, 6> points{ center };
-                        std::size_t count = 1;
-                        const float radius = hitbox->capsuleRadius;
-                        if (multipoint && radius > 0.0f) {
-                            float scale = maxScale;
-                            if (settings.autoScale) {
-                                const float blur = (center - eye).length() * cone * 0.5f;
-                                // клиентская анимация бегущего расходится с серверной (покачивание головы, фаза шага)
-                                // на 1-3 ед.: по ботам без десинка 29.10 — серии промахов в голову «сквозь точку»
-                                // на бегу. Край капсулы держим дальше от этой погрешности.
-                                const float animError = 0.5f + std::min(record.velocity.length2D(), 300.0f) * 0.006f;
-                                scale = std::min(scale, (radius * 0.95f - blur - animError) / radius);
-                            }
-                            scale *= shrink;
-                            if (scale >= 0.2f) {
-                                const auto view = normalized(center - eye);
-                                csgo::Vector side{ view.y, -view.x, 0.0f };   // горизонтальный перпендикуляр к лучу
-                                side = side.squareLength() > 0.0001f ? normalized(side) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
-                                const float offset = radius * scale;
-                                points[count++] = center + side * offset;
-                                points[count++] = center - side * offset;
-                                if (isHead)
-                                    points[count++] = center + worldUp * offset;
-                            }
-                            // ось капсулы лежит внутри хитбокса при любом разбросе — концы тянем к центру тем же scale
-                            const auto axis = max - min;
-                            if (!isHead && flag != HB_Chest && axis.length() > radius && scale > 0.0f) {
-                                points[count++] = center + axis * (0.5f * std::min(scale + 0.3f, 0.9f));
-                                points[count++] = center - axis * (0.5f * std::min(scale + 0.3f, 0.9f));
-                            }
+                    // мультипоинт: центр, края поперёк взгляда, верх головы, точки по оси вытянутых хитбоксов;
+                    // размер — ползунок или авто: пятно разброса + погрешность анимации бегущего внутри капсулы
+                    std::array<csgo::Vector, 6> points{ center };
+                    std::size_t count = 1;
+                    const float radius = hitbox->capsuleRadius;
+                    if (multipoint && radius > 0.0f) {
+                        float scale = maxScale;
+                        if (settings.autoScale) {
+                            const float blur = (center - eye).length() * cone * 0.5f;
+                            const float animError = 0.5f + std::min(record.velocity.length2D(), 300.0f) * 0.006f;
+                            scale = std::min(scale, (radius * 0.95f - blur - animError) / radius);
                         }
-
-                        for (std::size_t p = 0; p < count; ++p) {
-                            if (p > 0 && pointBudget-- <= 0)
-                                break;
-                            if (requireDesyncSafe && !isSafe(points[p]))
-                                continue;
-                            // стены — по пути к точке записи: сервер откатит игрока именно туда
-                            const float baseDamage = autowall::getDamageToPoint(engineInterfaces, interfaces, points[p], weaponData, rage.autowall);
-                            if (baseDamage < 1.0f)
-                                continue;
-                            // куда пуля попадёт на самом деле: первый хитбокс на луче (рука перед животом и т.п.)
-                            int group = firstHitGroup(aimCapsules, eye, points[p] + normalized(points[p] - eye) * 2.0f);
-                            if (group < 0)
-                                group = hitbox->group;
-                            const float damage = autowall::scaleDamage(entity, group, weaponData, baseDamage);
-                            // форсшут: лучший урон запоминаем до проверки порога — если настройку
-                            // выбить нечем, стреляем сюда и опускаем порог до этого урона
-                            auto& weak = isHead ? weakHead : weakBody;
-                            if (damage > weak.damage)
-                                weak = { points[p], damage, baseDamage, isHead, p > 0 };
-                            if (damage < static_cast<float>(minDamage) || (isLimb && damage < static_cast<float>(health)))
-                                continue;
-                            auto& slot = isHead ? bestHead : bestBody;
-                            if (damage > slot.damage)
-                                slot = { points[p], damage, baseDamage, isHead, p > 0 };
-                            if (predictedRecord) {
-                                const bool steps = checkSteps && stepSafe(points[p]);
-                                auto& steady = isHead ? steadyHead : steadyBody;
-                                if (steps && damage > steady.damage)
-                                    steady = { points[p], damage, baseDamage, isHead, p > 0 };
-                                auto& sure = isHead ? sureHead : sureBody;
-                                if ((steps || !checkSteps) && (!preferDesyncSafe || isSafe(points[p])) && damage > sure.damage)
-                                    sure = { points[p], damage, baseDamage, isHead, p > 0 };
-                            }
+                        scale *= shrink;
+                        if (scale >= 0.2f) {
+                            const auto view = normalized(center - eye);
+                            csgo::Vector across{ view.y, -view.x, 0.0f };
+                            across = across.squareLength() > 0.0001f ? normalized(across) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
+                            const float offset = radius * scale;
+                            points[count++] = center + across * offset;
+                            points[count++] = center - across * offset;
+                            if (isHead)
+                                points[count++] = center + worldUp * offset;
+                        }
+                        const auto axis = max - min;
+                        if (!isHead && flag != HB_Chest && axis.length() > radius && scale > 0.0f) {
+                            points[count++] = center + axis * (0.5f * std::min(scale + 0.3f, 0.9f));
+                            points[count++] = center - axis * (0.5f * std::min(scale + 0.3f, 0.9f));
                         }
                     }
+                    // сторона не доказана: середина между тем же хитбоксом в крайних скелетах — если капсулы
+                    // перекрываются, точка попадает при любой стороне (проверка безопасности её подтвердит)
+                    const auto centerOf = [&](const csgo::matrix3x4* skeleton) {
+                        return (transform(hitbox->bbMin, skeleton[hitbox->bone]) + transform(hitbox->bbMax, skeleton[hitbox->bone])) * 0.5f;
+                    };
+                    if (checkSafe && !sideCertain && (isHead || flag == HB_Chest) && count < points.size()) {
+                        const auto middle = (centerOf(record.plus) + centerOf(record.minus)) * 0.5f;
+                        if ((middle - center).squareLength() > 1.0f)
+                            points[count++] = middle;
+                    }
+                    // голова по слоям: середина между найденным углом и максимумом той же стороны —
+                    // самая вероятная точка, общая для обеих моделей
+                    if (layerSide && isHead && count < points.size()) {
+                        const auto middle = (center + centerOf(sideExtreme)) * 0.5f;
+                        if ((middle - center).squareLength() > 1.0f)
+                            points[count++] = middle;
+                    }
+
+                    for (std::size_t p = 0; p < count; ++p) {
+                        if (p > 0 && pointBudget-- <= 0)
+                            break;
+                        const bool safe = isSafe(points[p], isHead);
+                        if (safeRequired && checkSafe && !safe)
+                            continue;
+                        const bool sideSafe = !safe && isSideSafe(points[p], isHead);
+                        // дальность оружия автоволл не проверяет (у зевса ~183 ед.)
+                        if ((points[p] - eye).squareLength() > weaponData->range * weaponData->range)
+                            continue;
+                        const float baseDamage = autowall::getDamageToPoint(engineInterfaces, interfaces, points[p], weaponData, rage.autowall);
+                        if (baseDamage < 1.0f)
+                            continue;
+                        int group = firstHitGroup(aimCaps, eye, points[p] + normalized(points[p] - eye) * 2.0f);
+                        if (group < 0)
+                            group = hitbox->group;
+                        float damage = autowall::scaleDamage(entity, group, weaponData, baseDamage);
+                        // дробовик: дробины × доля, что ляжет в тело (пятно ~d·cone против ~8 ед. корпуса);
+                        // точный ответ потом даст хитшанс с суммой по дробинам
+                        if (weaponData->bullets > 1) {
+                            const float blur = (points[p] - eye).length() * cone + 0.001f;
+                            damage *= static_cast<float>(weaponData->bullets) * std::clamp(8.0f * 8.0f / (blur * blur), 0.1f, 1.0f);
+                        }
+                        const bool lethal = damage >= hp;
+                        if (isLimb && !lethal)
+                            continue;
+                        const bool qualified = damage >= static_cast<float>(minDamage);
+                        if ((lethal || qualified) && viewPointCount < static_cast<int>(viewPoints.size()))
+                            viewPoints[viewPointCount++] = { points[p], static_cast<std::uint8_t>(lethal ? 2 : 1) };
+
+                        float reliability = trust * (p > 0 ? 0.9f : 1.0f);
+                        if (sideSafe)
+                            reliability *= sideTrust;
+                        else if (!safe)
+                            reliability *= sideFactor * (isHead && layerSide && !hvh::resolver::extremeActive(i) ? 0.85f : 1.0f);
+                        // Прогноз: точка, не попадающая в обе соседние модели (N−1 и N), по логам 31.10 — больше
+                        // половины промахов «прогноз». Голову и врага в воздухе (стрейф меняет курс между
+                        // обновлениями) по таким точкам не бьём вовсе, тело — с сильной скидкой.
+                        if (checkSteps && !stepSafe(points[p])) {
+                            if (isHead || airborne)
+                                continue;
+                            reliability *= 0.45f;
+                        }
+                        // сквозь стену: автоволл иногда переоценивает пробитие (логи: 51 «пуля застряла»)
+                        const float openDamage = static_cast<float>(weaponData->damage) * std::pow(weaponData->rangeModifier, (points[p] - eye).length() / 500.0f);
+                        if (baseDamage < openDamage * 0.97f)
+                            reliability *= 0.85f;
+                        // польза: убить сейчас 1.5; при заряженном DT пол-хп — убийство двумя пулями 1.1; иначе доля хп
+                        const float value = lethal ? 1.5f : doubleTapKill && damage * 2.0f >= hp ? 1.1f : damage / hp;
+                        const float score = value * reliability;
+                        const AimPoint point{ points[p], damage, baseDamage, isHead, p > 0, group, sideSafe };
+                        offer(any, point, score, safe);
+                        if (qualified)
+                            offer(isHead ? head : body, point, score, safe);
+                        // центр уже убивает надёжно — края хуже по хитшансу, автоволл на них не тратим
+                        if (p == 0 && lethal && reliability >= trust * 0.99f && !viewOnly)
+                            break;
+                    }
                 }
-            };
-            // Голова — капсула радиусом ~5 юнитов, и промах по ней стоит всего размена. По логам 29.10
-            // прицельная стрельба в голову дала 0 попаданий из 29, причём 19 попыток были по
-            // предсказанной записи; тело в тех же условиях попадало 47%. Берём голову только когда
-            // сняты обе неизвестности: момент настоящий (не предсказанный) и сторона десинка доказана
-            // слоями с хорошей уверенностью — либо враг вовсе не десинкает. Все 5 состоявшихся
-            // хедшотов за вечер прилетели именно так, и 4 из них убили сразу.
-            // Слои с хорошей уверенностью пускают голову и на предсказанную запись: ноги на сервере
-            // поворачиваются медленно (движок доворачивает их к взгляду с ограниченной скоростью),
-            // так что за одно-два обновления скелет, собранный под найденный угол, ещё годится —
-            // «вперёд + слои» попадало 49% против 29% у «вперёд + угадано». Но не у джиттерящего:
-            // у него взгляд за те же два обновления перекидывается на 60°, и ноги за ним.
-            const bool resolvedWell = layerResolved && !record.remembered && hvh::resolver::confidence(i) >= 0.5f;
-            const bool headAllowed = isBot[i] || mode < 0
-                || (resolvedWell && (!predictedRecord || (!isJittering(state) && candidates[c].updatesAhead <= 2)));
-            scanPoints(desyncSafe, !headAllowed);
-            // Сторона не доказана, а общих для обеих сторон точек под мин. урон нет — лучше стрелять
-            // по угаданной стороне, чем не стрелять вовсе. Настройка safePoint при этом уважается.
-            if (desyncSafe && !safeBySetting && bestHead.damage <= 0.0f && bestBody.damage <= 0.0f)
-                scanPoints(false, !headAllowed);
-            const bool safeOnly = desyncSafe && (bestHead.damage > 0.0f || bestBody.damage > 0.0f);
-            if (sureHead.damage > 0.0f || sureBody.damage > 0.0f) {
-                bestHead = sureHead;
-                bestBody = sureBody;
-            } else if (steadyHead.damage > 0.0f || steadyBody.damage > 0.0f) {
-                bestHead = steadyHead;
-                bestBody = steadyBody;
             }
 
-            bool headOk = bestHead.damage > 0.0f;
-            bool bodyOk = bestBody.damage > 0.0f;
+            // ---- выбор точки на этой записи ----
+            // при равной пользе — тело: отдача та же, а хитбокс больше и хитшанс выше
+            const bool headFirst = head.score > body.score && !(settings.bodyIfLethal && body.score >= 0.0f && body.point.damage >= hp);
+            Scored chosen = headFirst ? head : body;
+            Scored other = headFirst ? body : head;
             int effectiveMinDamage = minDamage;
-            bool forced = false;
-            if (!headOk && !bodyOk) {
-                if (!forceShot || (weakHead.damage <= 0.0f && weakBody.damage <= 0.0f)) {
-                    statusText = safeOnly ? "нет безопасных точек" : "мало урона";
+            if (chosen.score < 0.0f) {
+                // мин. урон не набран. Ждать удобного момента рейдж не должен:
+                //  порог требует убийства — бьём от пол-хп (вторая пуля DT добьёт); форсшут — в лучшую точку
+                const bool halfKill = minDamage >= health && any.point.damage >= static_cast<float>((health + 1) / 2);
+                if (any.score < 0.0f || (!halfKill && !forceShot)) {
+                    statusText = safeRequired ? "нет безопасных точек" : "мало урона";
+                    if (c == 0) {
+                        shownPoints = viewPoints;
+                        shownPointCount = viewPointCount;
+                        shownResolver = resolverText;
+                    }
                     continue;
                 }
-                // Форсшут: заданный мин. урон недостижим — берём лучшую точку и порог по её урону,
-                // иначе цель просто не обстреливается. Хитшанс потом считается уже от этого порога.
-                bestHead = weakHead;
-                bestBody = weakBody;
-                headOk = bestHead.damage > 0.0f;
-                bodyOk = bestBody.damage > 0.0f;
-                forced = true;
-                statusText = "форсшут";
+                chosen = any;
+                other = {};
+                effectiveMinDamage = std::max(1, static_cast<int>(std::floor(any.point.damage)));
             }
 
-            // Было ещё «вперёд + джиттер → тело»: по логам 29.10 тело попадало 36%, голова 42%, а скаут в тело
-            // почти не убивает с выстрела — враг успевал ответить. Тело теперь только по настройкам/если убивает.
-            // Плюс своя статистика по игроку: если по голове мы у него мажем, а по телу попадаем — бьём тело.
-            const float headRate = (state.headHits + 0.5f) / (state.headShots + 1.0f);
-            const float bodyRate = (state.bodyHits + 0.5f) / (state.bodyShots + 1.0f);
-            const bool adaptiveBody = state.bodyShots >= 4 && bodyRate > headRate + 0.1f;
-            // Одним выстрелом убивает только голова (AK, дигл, скаут по телу не добивают) — такую
-            // точку нельзя отдавать ни статистике «по телу чаще попадаем», ни настройке «тело».
-            // Размен выигрывает тот, кто убил с первой пули, а не тот, кто снял 35 хп.
-            const bool headOnlyLethal = headOk && bestHead.damage >= static_cast<float>(health)
-                && bestBody.damage < static_cast<float>(health);
-            AimPoint chosen;
-            if (forced && bodyOk && bestBody.damage > bestHead.damage)
-                chosen = bestBody;   // форсшут: бьём туда, где урона больше
-            else if (bodyOk && !headOnlyLethal && (bodyOnly || settings.preferBody || adaptiveBody
-                    || (settings.bodyIfLethal && bestBody.damage >= static_cast<float>(health))))
-                chosen = bestBody;
-            else
-                chosen = headOk ? bestHead : bestBody;
-            // порог хитшанса — по выбранной точке: иначе он окажется выше её урона и выстрела не будет
-            if (forced)
-                effectiveMinDamage = std::max(1, static_cast<int>(std::floor(chosen.damage)));
-            const AimPoint& other = chosen.isHead ? bestBody : bestHead;
+            if (c == 0 || chosen.score > playerBest.score) {
+                shownPoints = viewPoints;
+                shownPointCount = viewPointCount;
+                shownResolver = resolverText;
+            }
+            // при равной пользе — запись раньше по приоритету (onshot, стоит, свежая, старая)
+            if (chosen.score > playerBest.score) {
+                auto& t = playerBest;
+                t.index = i;
+                t.point = chosen.point;
+                t.fallback = other.score >= 0.0f ? other.point : AimPoint{};
+                t.score = chosen.score;
+                t.fov = fov;
+                t.minDamage = effectiveMinDamage;
+                t.kind = candidates[c].kind;
+                t.simulationTime = record.simulationTime;
+                t.backtrackTicks = list.count && candidates[c].age > 0 ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
+                t.updatesAhead = candidates[c].updatesAhead;
+                t.choke = record.choked;
+                t.side = side;
+                t.source = source;
+                t.phase = record.jitterPhase;
+                t.guess = guess;
+                t.layerDelta = source == SideSource::Layers ? std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f) : 0.0f;
+                t.layerMax = record.maxDesync;
+                t.layerConfidence = record.resolvedConfidence;
+                t.set = set;
+                t.studio = studio;
+                std::copy(bones, bones + RECORD_BONES, t.bones);
+                t.haveVariants = record.variants;
+                if (record.variants) {
+                    std::copy(record.plus, record.plus + RECORD_BONES, t.plus);
+                    std::copy(record.minus, record.minus + RECORD_BONES, t.minus);
+                }
+            }
+            // надёжное убийство — лучше не найти, остальные записи не сканируем
+            if (playerBest.score >= 1.5f * 0.99f)
+                break;
+        }
 
-            // запись с целью нашлась — дальше по приоритету не ищем; между игроками — по урону
+        // ---- в топ целей (между игроками — по пользе выстрела) ----
+        if (playerBest.score >= 0.0f) {
             int slot = topCount;
-            while (slot > 0 && (chosen.damage > top[slot - 1].point.damage || (chosen.damage == top[slot - 1].point.damage && fov < top[slot - 1].fov)))
+            while (slot > 0 && (playerBest.score > top[slot - 1].score || (playerBest.score == top[slot - 1].score && fov < top[slot - 1].fov)))
                 --slot;
             if (slot < static_cast<int>(top.size())) {
                 for (int k = std::min(topCount, static_cast<int>(top.size()) - 1); k > slot; --k)
                     top[k] = top[k - 1];
                 topCount = std::min(topCount + 1, static_cast<int>(top.size()));
-                auto& best = top[slot];
-                best.index = i;
-                best.point = chosen;
-                best.fallback = other.damage > 0.0f ? other : AimPoint{};
-                best.fov = fov;
-                best.set = set;
-                best.simulationTime = record.simulationTime;
-                best.safe = safeOnly;
-                best.kind = candidates[c].kind;
-                best.backtrackTicks = list.count && candidates[c].age > 0
-                    ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
-                best.speed = record.velocity.length2D();
-                best.origin = record.origin;
-                best.eyeYaw = record.eyeAngles.y;
-                best.choke = record.choked;
-                best.minDamage = effectiveMinDamage;
-                best.recordCount = list.count;
-                best.updatesAhead = candidates[c].updatesAhead;
-                best.newestAge = list.count ? serverTime - list.at(0).simulationTime : 0.0f;
-                std::copy(bones, bones + RECORD_BONES, best.bones);
+                top[slot] = playerBest;
             }
-            if (layerResolved) {
-                // для индикатора: во сколько раз угол ног отличается от взгляда (в долях максимума)
-                const float limit = std::max(hvh::resolver::maxDesync(i), 1.0f);
-                resolverOffset[i] = std::clamp(std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f) / limit, -1.0f, 1.0f);
-                resolverMode[i] = record.remembered ? MemoryMode : LayerMode;
-            } else {
-                resolverOffset[i] = side * variantScale;
-                resolverMode[i] = variants ? mode : -1;
-            }
-            break;
+            std::scoped_lock lock{ viewMutex };
+            auto& view = views[i];
+            view.aimAt = realtime;
+            view.aimPoint[0] = playerBest.point.position.x;
+            view.aimPoint[1] = playerBest.point.position.y;
+            view.aimPoint[2] = playerBest.point.position.z;
+            view.aimLethal = playerBest.point.damage >= hp;
+            view.aimDamage = static_cast<int>(playerBest.point.damage);
+            view.aimGroup = playerBest.point.group;
+            view.aimedNow = false;
+        }
+
+        std::scoped_lock lock{ viewMutex };
+        auto& view = views[i];
+        view.resolver = isBot[i] ? "бот" : shownResolver;
+        view.pointsAt = realtime;
+        view.pointCount = shownPointCount;
+        for (int k = 0; k < shownPointCount; ++k) {
+            view.points[k][0] = shownPoints[k].first.x;
+            view.points[k][1] = shownPoints[k].first.y;
+            view.points[k][2] = shownPoints[k].first.z;
+            view.pointState[k] = shownPoints[k].second;
         }
     }
 
-    if (topCount == 0)
+    if (topCount == 0 || visualOnly)
         return false;
+    // оружие будет готово к следующему тику — та команда уйдёт сразу, а не через весь фейклаг
+    if (!canShoot && readyIn <= interval)
+        tickbase::sendNextPacket();
 
-    auto& best = top[0];
-    target = best.index;
-    // с нажатым прыжком тик уже воздушный: стоп и скоп в нём только ломают бхоп
+    target = top[0].index;
+    // с нажатым прыжком тик уже воздушный: стоп и скоп только ломают бхоп
     const bool onGround = (localPlayer.get().flags() & FL_ONGROUND) && !(cmd->buttons & csgo::UserCmd::IN_JUMP);
-
-    // автоскоуп раньше стопа: зум и точность скоупа набираются несколько тиков
     const bool scoping = needScope && onGround;
     if (scoping)
         cmd->buttons |= csgo::UserCmd::IN_ATTACK2;
-
-    // автостоп заранее: начинаем за столько тиков до готовности оружия, сколько нужно на торможение
     if (stopMode != AutoStop::Off && onGround && (canShoot || readySoon || settings.autoStopEarly))
         autoStop(cmd, stopMode, stopMaxSpeed, interval, moveVars);
-
     if (scoping) {
         statusText = "скоуп";
         return false;
     }
-
     if (!canShoot) {
         statusText = readySoon ? "автостоп" : "перезарядка";
         return false;
     }
 
-    // по очереди: цель, её вторая группа (голова/тело), следующая цель — первая, где набрался хитшанс
+    // ---- хитшанс: цель, её вторая группа, следующая цель — первая, где набрался ----
+    static Capsules capsules;
     csgo::Vector angle{};
     int chance = 0, firstChance = -1, chosenSlot = -1;
-    // Голова — капсула радиусом ~5 юнитов против ~18 у груди: один и тот же процент хитшанса
-    // означает для неё в разы худший реальный шанс, и именно поэтому голова мазала там, где тело
-    // попадало. С головы спрашиваем строже; не набралось — ниже по циклу всё равно пробуется тело.
-    const auto needed = [&](const AimPoint& point) {
-        return point.isHead ? std::min(settings.hitchance + 15, 95) : settings.hitchance;
-    };
     for (int k = 0; k < topCount && chosenSlot < 0; ++k) {
-        auto& candidate = top[k];
-        buildCapsules(*candidate.set, candidate.bones, aimCapsules);
-        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(candidate.index));
-        angle = (candidate.point.position - eye).toAngle();
-        chance = hitchance(weapon, weaponData, entity, eye, angle, aimCapsules, candidate.point.baseDamage, candidate.minDamage);
+        auto& t = top[k];
+        buildCapsules(*t.set, t.bones, capsules);
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(t.index));
+        angle = (t.point.position - eye).toAngle();
+        chance = hitchance(weapon, weaponData, entity, eye, angle, capsules, t.point.baseDamage, t.minDamage);
         if (firstChance < 0)
             firstChance = chance;
-        if (chance < needed(candidate.point) && candidate.fallback.damage > 0.0f) {
-            const auto fallbackAngle = (candidate.fallback.position - eye).toAngle();
-            if (const int fallbackChance = hitchance(weapon, weaponData, entity, eye, fallbackAngle, aimCapsules, candidate.fallback.baseDamage, candidate.minDamage);
-                fallbackChance >= needed(candidate.fallback)) {
-                candidate.point = candidate.fallback;
+        if (chance < settings.hitchance && t.fallback.damage > 0.0f) {
+            const auto fallbackAngle = (t.fallback.position - eye).toAngle();
+            if (const int fallbackChance = hitchance(weapon, weaponData, entity, eye, fallbackAngle, capsules, t.fallback.baseDamage, t.minDamage);
+                fallbackChance >= settings.hitchance) {
+                t.point = t.fallback;
                 angle = fallbackAngle;
                 chance = fallbackChance;
             }
         }
-        if (chance >= needed(candidate.point))
+        if (chance >= settings.hitchance)
             chosenSlot = k;
     }
     if (chosenSlot < 0) {
@@ -2437,77 +2381,93 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     }
     if (chosenSlot != 0) {
         std::swap(top[0], top[chosenSlot]);
-        buildCapsules(*best.set, best.bones, aimCapsules);
-        target = best.index;
+        buildCapsules(*top[0].set, top[0].bones, capsules);
     }
+    const auto& best = top[0];
+    target = best.index;
 
+    // ---- выстрел ----
     auto aimAngle = angle - localPlayer.get().aimPunchAngle() * 2.0f;
     aimAngle.normalize();
     cmd->viewangles = aimAngle;
     cmd->buttons |= csgo::UserCmd::IN_ATTACK;
-    // сервер откатит цель ровно в эту запись; без записи (интерполированная модель, экстраполяция) tickcount не трогаем
+    // сервер откатит цель ровно в эту запись; прогноз и живую модель — tickcount не трогаем
     if (best.kind != RecordKind::Live && best.kind != RecordKind::Extrapolated && best.kind != RecordKind::Ahead)
-        cmd->tickCount = timeToTicks(best.simulationTime + lerp, interval);
-
+        // как на сервере: targettick = tick_count − TIME_TO_TICKS(lerp), lerp округляется отдельно
+        cmd->tickCount = timeToTicks(best.simulationTime, interval) + timeToTicks(lerpTime, interval);
     firedAt = serverTime;
     firedCycle = weaponData->cycletime;
-    pendingShot[best.index] = memory.globalVars->realtime;
+
     auto& shot = shots[best.index];
     shot = {};
-    {
-        // счётчик попыток для статистики голова/тело (попадания считает onPlayerHurt)
-        auto& st = resolverStates[best.index];
-        std::uint8_t& attempts = best.point.isHead ? st.headShots : st.bodyShots;
-        attempts = static_cast<std::uint8_t>(std::min<int>(attempts + 1, 250));
-    }
+    shot.time = realtime;
     shot.eye = eye;
     shot.aimPoint = best.point.position;
     shot.isHead = best.point.isHead;
-    shot.edgePoint = best.point.edge;
-    shot.safe = best.safe;
-    shot.side = resolverOffset[best.index];
-    shot.guessedSide = resolverStates[best.index].guessedSide;
+    shot.edge = best.point.edge;
     shot.damage = static_cast<int>(best.point.damage);
-    shot.mode = resolverMode[best.index];
+    shot.hitchance = chance;
+    shot.side = best.side;
+    shot.source = best.source;
+    shot.phase = best.phase;
+    shot.guess = best.guess;
+    shot.layerDelta = best.layerDelta;
+    shot.layerMax = best.layerMax;
+    shot.layerConfidence = best.layerConfidence;
+    shot.sideSafe = best.point.sideSafe;
     shot.kind = best.kind;
     shot.backtrackTicks = best.backtrackTicks;
-    shot.hitchance = chance;
-    shot.enemySpeed = best.speed;
-    shot.enemyChoke = best.choke;
-    shot.recordCount = best.recordCount;
     shot.updatesAhead = best.updatesAhead;
-    shot.capsules = aimCapsules;
-    shot.predicted = best.kind == RecordKind::Ahead || best.kind == RecordKind::Extrapolated;
     shot.predictedSimulationTime = best.simulationTime;
-    shot.predictedOrigin = best.origin;
-    shot.usedEyeYaw = best.eyeYaw;
     shot.updateTime = static_cast<float>(std::max(best.choke, 1)) * interval;
     shot.set = best.set;
-    shot.ourClockMs = static_cast<int>((serverTime - static_cast<float>(memory.globalVars->tickCount) * interval) * 1000.0f);
-    if (records[best.index].count)
-        shot.enemyLagMs = static_cast<int>((static_cast<float>(memory.globalVars->tickCount) * interval - latencyIn - records[best.index].at(0).simulationTime) * 1000.0f);
-    shot.newestAgeMs = static_cast<int>(best.newestAge * 1000.0f);
-    shot.pingMs = static_cast<int>((latencyOut + latencyIn) * 1000.0f);
-    shot.maxUnlagMs = static_cast<int>(maxUnlag * 1000.0f);
+    shot.aimed = capsules;
+    if (best.haveVariants) {
+        buildCapsules(*best.set, best.plus, shot.plus);
+        buildCapsules(*best.set, best.minus, shot.minus);
+    }
     lastShotIndex = best.index;
-    lastShotTime = memory.globalVars->realtime;
+    {
+        auto& brain = brains[best.index];
+        std::uint8_t& attempts = best.point.isHead ? brain.headShots : brain.bodyShots;
+        attempts = static_cast<std::uint8_t>(std::min<int>(attempts + 1, 250));
+    }
+
+    {
+        std::scoped_lock lock{ viewMutex };
+        views[best.index].aimedNow = true;
+        lastShot.at = realtime;
+        lastShot.result = 0;
+        lastShot.count = 0;
+        // скелет: каждая кость хитбоксов — линия к родителю, по матрицам той записи, куда стреляли
+        if (best.studio) {
+            for (int b = 0; b < std::min(best.studio->numBones, RECORD_BONES) && lastShot.count < 64; ++b) {
+                const auto bone = best.studio->getBone(b);
+                if (!bone || bone->parent < 0 || bone->parent >= RECORD_BONES || !(bone->flags & BONE_USED_BY_HITBOX))
+                    continue;
+                const auto from = best.bones[b].origin();
+                const auto to = best.bones[bone->parent].origin();
+                auto& n = lastShot.count;
+                lastShot.a[n][0] = from.x; lastShot.a[n][1] = from.y; lastShot.a[n][2] = from.z;
+                lastShot.b[n][0] = to.x; lastShot.b[n][1] = to.y; lastShot.b[n][2] = to.z;
+                ++n;
+            }
+        }
+    }
     {
         static char text[96];
-        const float offset = resolverOffset[best.index];
-        std::snprintf(text, sizeof(text), "%s%s%s  [%s %dт]", best.point.isHead ? "выстрел: голова" : "выстрел: тело",
-            offset > 0.0f ? "  [R +]" : offset < 0.0f ? "  [R -]" : "", offset != 0.0f && std::abs(offset) < 1.0f ? " low" : "",
-            kindNames[static_cast<int>(best.kind)], best.backtrackTicks);
+        std::snprintf(text, sizeof(text), "выстрел: %s, %s, %s", best.point.isHead ? "голова" : "тело",
+            sideSourceNames[static_cast<int>(best.source)], kindNames[static_cast<int>(best.kind)]);
         statusText = text;
     }
 
     if (!rage.silent)
         engineInterfaces.getEngine().setViewAngles(cmd->viewangles);
-
     if (!tickbase::isShifting())
         tickbase::onShot();
     return true;
 }
 
-}
+} // namespace
 
 }

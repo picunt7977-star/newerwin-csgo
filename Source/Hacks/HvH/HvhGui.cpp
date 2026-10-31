@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <unordered_map>
 
@@ -17,6 +18,7 @@
 
 #include <InputUtil.h>
 #include <CSGO/LocalPlayer.h>
+#include <GameData.h>
 
 namespace hvh::ui
 {
@@ -24,8 +26,9 @@ namespace hvh::ui
 namespace
 {
 
-constexpr float rowHeight = 26.0f;
-constexpr float rounding = 6.0f;
+constexpr float rowHeight = 19.0f;
+constexpr float rounding = 0.0f;
+constexpr float indent = 20.0f;   // подписи и поля сдвинуты под чекбокс, как в gamesense
 
 ImVec4 toVec4(ImU32 col) noexcept
 {
@@ -61,8 +64,8 @@ ImU32 lerpColor(ImU32 a, ImU32 b, float t) noexcept
 void applyStyle() noexcept
 {
     auto& style = ImGui::GetStyle();
-    style.WindowRounding = 10.0f;
-    style.ChildRounding = 8.0f;
+    style.WindowRounding = 0.0f;
+    style.ChildRounding = 0.0f;
     style.FrameRounding = rounding;
     style.PopupRounding = rounding;
     style.GrabRounding = rounding;
@@ -71,10 +74,10 @@ void applyStyle() noexcept
     style.WindowBorderSize = 0.0f;
     style.ChildBorderSize = 0.0f;
     style.PopupBorderSize = 1.0f;
-    style.FrameBorderSize = 0.0f;
+    style.FrameBorderSize = 1.0f;
     style.WindowPadding = { 12.0f, 12.0f };
-    style.FramePadding = { 10.0f, 5.0f };
-    style.ItemSpacing = { 8.0f, 6.0f };
+    style.FramePadding = { 8.0f, 3.0f };
+    style.ItemSpacing = { 8.0f, 4.0f };
     style.ItemInnerSpacing = { 6.0f, 4.0f };
     style.ScrollbarSize = 6.0f;
     style.GrabMinSize = 8.0f;
@@ -84,8 +87,8 @@ void applyStyle() noexcept
     c[ImGuiCol_TextDisabled] = toVec4(color::textDim);
     c[ImGuiCol_WindowBg] = toVec4(color::windowBg);
     c[ImGuiCol_ChildBg] = toVec4(color::groupBg);
-    c[ImGuiCol_PopupBg] = toVec4(IM_COL32(16, 19, 26, 252));
-    c[ImGuiCol_Border] = toVec4(color::groupLine);
+    c[ImGuiCol_PopupBg] = toVec4(IM_COL32(29, 29, 29, 255));
+    c[ImGuiCol_Border] = toVec4(color::outline);
     c[ImGuiCol_FrameBg] = toVec4(color::frame);
     c[ImGuiCol_FrameBgHovered] = toVec4(color::frameHover);
     c[ImGuiCol_FrameBgActive] = toVec4(color::frameHover);
@@ -114,26 +117,32 @@ void applyStyle() noexcept
     c[ImGuiCol_ModalWindowDimBg] = { 0, 0, 0, 0.5f };
 }
 
-bool beginGroup(const char* title, const ImVec2& size) noexcept
+bool beginGroup(const char* title, const ImVec2& requestedSize) noexcept
 {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, toVec4(color::groupBg));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 14.0f, 10.0f });
+    // Название лежит на верхней линии и вылезает над группой — у верхнего края оставляем ему место
+    ImVec2 size = requestedSize;
+    if (const float y = ImGui::GetCursorPosY(); y < 8.0f) {
+        ImGui::SetCursorPosY(8.0f);
+        size.y -= 8.0f - y;
+    }
+    // рамка и название рисуются в окне-родителе
+    auto* parentList = ImGui::GetWindowDrawList();
+    const auto pos = ImGui::GetCursorScreenPos();
+    const ImVec2 max{ pos.x + size.x, pos.y + size.y };
+    parentList->AddRectFilled(pos, max, color::groupBg);
+    parentList->AddRect(pos, max, color::outline);
+    parentList->AddRect({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, color::groupLine);
+    ImFont* titleFont = fonts.menuBold ? fonts.menuBold : ImGui::GetFont();
+    const float titleSize = titleFont->FontSize;
+    const auto titleWidth = titleFont->CalcTextSizeA(titleSize, FLT_MAX, 0.0f, title, ImGui::FindRenderedTextEnd(title)).x;
+    parentList->AddRectFilled({ pos.x + 10.0f, pos.y - 1.0f }, { pos.x + 18.0f + titleWidth, pos.y + 2.0f }, color::groupBg);
+    parentList->AddText(titleFont, titleSize, { pos.x + 14.0f, pos.y - titleSize * 0.5f }, color::text, title, ImGui::FindRenderedTextEnd(title));
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, { 0.0f, 0.0f, 0.0f, 0.0f });
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 14.0f, 14.0f });
     const bool open = ImGui::BeginChild(title, size, false, ImGuiWindowFlags_AlwaysUseWindowPadding);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
-
-    auto* drawList = ImGui::GetWindowDrawList();
-    const auto pos = ImGui::GetWindowPos();
-    const float width = ImGui::GetWindowWidth();
-
-    // заголовок группы с акцентной точкой и линией
-    ImGui::PushFont(fonts.bold);
-    drawList->AddCircleFilled({ pos.x + 16.0f, pos.y + 19.0f }, 3.0f, color::accent);
-    drawList->AddText({ pos.x + 26.0f, pos.y + 10.0f }, color::text, title);
-    ImGui::PopFont();
-    drawList->AddLine({ pos.x, pos.y + 36.0f }, { pos.x + width, pos.y + 36.0f }, color::groupLine);
-
-    ImGui::SetCursorPosY(46.0f);
     ImGui::PushItemWidth(-1.0f);
     return open;
 }
@@ -154,18 +163,32 @@ bool colorEdit(const char* label, float* rgba) noexcept
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
     const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    window->DrawList->AddText({ pos.x, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, labelEnd);
+    window->DrawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, labelEnd);
 
-    // квадратик цвета справа, по клику — палитра ImGui
-    ImGui::SetCursorScreenPos({ pos.x + width - 32.0f, pos.y + 4.0f });
+    // прямоугольник цвета справа, по клику — палитра ImGui
+    ImGui::SetCursorScreenPos({ pos.x + width - 20.0f, pos.y + 4.0f });
     ImGui::PushID(label);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 0.0f, 0.0f });
+    ImGui::PushItemWidth(20.0f);
     const bool changed = ImGui::ColorEdit4("##color", rgba, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf);
-    ImGui::PopStyleVar();
+    ImGui::PopItemWidth();
+    ImGui::PopStyleVar(2);
     ImGui::PopID();
     ImGui::SetCursorScreenPos(pos);
     ImGui::ItemSize(ImRect{ pos, { pos.x + width, pos.y + rowHeight } });
     return changed;
+}
+
+// Квадратик 8×8 с градиентом слева, подпись справа — как в gamesense
+void checkboxBox(ImDrawList* d, const ImVec2& at, bool on, bool hovered) noexcept
+{
+    const ImVec2 max{ at.x + 8.0f, at.y + 8.0f };
+    if (on)
+        d->AddRectFilledMultiColor(at, max, color::accent, color::accent, color::accent2, color::accent2);
+    else
+        d->AddRectFilledMultiColor(at, max, hovered ? IM_COL32(80, 80, 80, 255) : IM_COL32(68, 68, 68, 255), hovered ? IM_COL32(80, 80, 80, 255) : IM_COL32(68, 68, 68, 255), IM_COL32(48, 48, 48, 255), IM_COL32(48, 48, 48, 255));
+    d->AddRect({ at.x - 1.0f, at.y - 1.0f }, { max.x + 1.0f, max.y + 1.0f }, color::outline);
 }
 
 bool toggle(const char* label, bool* value) noexcept
@@ -176,10 +199,11 @@ bool toggle(const char* label, bool* value) noexcept
 
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
-    const float width = ImGui::GetContentRegionAvail().x;
-    const ImRect bb{ pos, { pos.x + width, pos.y + rowHeight } };
+    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
+    const float labelWidth = ImGui::CalcTextSize(label, labelEnd).x;
+    const ImRect bb{ pos, { pos.x + indent + labelWidth + 4.0f, pos.y + rowHeight } };
 
-    ImGui::ItemSize(bb);
+    ImGui::ItemSize(ImRect{ pos, { pos.x + ImGui::GetContentRegionAvail().x, pos.y + rowHeight } });
     if (!ImGui::ItemAdd(bb, id))
         return false;
 
@@ -190,22 +214,9 @@ bool toggle(const char* label, bool* value) noexcept
         ImGui::MarkItemEdited(id);
     }
 
-    const float t = animate(id, *value);
-    const float h = animate(id + 1, hovered, 16.0f);
     auto* drawList = window->DrawList;
-
-    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    drawList->AddText({ pos.x, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, lerpColor(color::textDim, color::text, std::max(t, h * 0.6f)), label, labelEnd);
-
-    // переключатель-«пилюля» справа
-    const ImVec2 switchMin{ bb.Max.x - 32.0f, pos.y + 6.0f };
-    const ImVec2 switchMax{ bb.Max.x, pos.y + 20.0f };
-    drawList->AddRectFilled(switchMin, switchMax, lerpColor(lerpColor(color::frame, color::frameHover, h), withAlpha(color::accent, 0.9f), t), 7.0f);
-    const float knobX = switchMin.x + 7.0f + (switchMax.x - switchMin.x - 14.0f) * t;
-    if (t > 0.01f)
-        drawList->AddCircleFilled({ knobX, pos.y + 13.0f }, 9.0f, withAlpha(color::accent, 0.18f * t));
-    drawList->AddCircleFilled({ knobX, pos.y + 13.0f }, 5.0f, lerpColor(color::textDim, IM_COL32(255, 255, 255, 255), t));
-
+    checkboxBox(drawList, { pos.x, pos.y + (rowHeight - 8.0f) * 0.5f }, *value, hovered);
+    drawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, labelEnd);
     return pressed;
 }
 
@@ -219,9 +230,9 @@ static bool slider(const char* label, T* value, T min, T max, const char* format
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
-    const float height = 38.0f;
+    const float height = 32.0f;
     const ImRect bb{ pos, { pos.x + width, pos.y + height } };
-    const ImRect track{ { pos.x, pos.y + 26.0f }, { pos.x + width, pos.y + 30.0f } };
+    const ImRect track{ { pos.x + indent, pos.y + 18.0f }, { pos.x + width, pos.y + 24.0f } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -245,10 +256,9 @@ static bool slider(const char* label, T* value, T min, T max, const char* format
         }
     }
 
-    const float h = animate(id, hovered || held, 16.0f);
     auto* drawList = window->DrawList;
     const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    drawList->AddText({ pos.x, pos.y + 2.0f }, lerpColor(color::textDim, color::text, h * 0.7f + 0.3f), label, labelEnd);
+    drawList->AddText({ pos.x + indent, pos.y + 1.0f }, color::text, label, labelEnd);
 
     char buffer[32];
     if constexpr (std::is_integral_v<T>)
@@ -256,13 +266,16 @@ static bool slider(const char* label, T* value, T min, T max, const char* format
     else
         std::snprintf(buffer, sizeof(buffer), format, static_cast<double>(*value));
     const auto valueSize = ImGui::CalcTextSize(buffer);
-    drawList->AddText({ bb.Max.x - valueSize.x, pos.y + 2.0f }, color::accent, buffer);
 
+    // полоса с градиентом в чёрной рамке, число — на конце заливки, с тенью
     const float ratio = std::clamp(static_cast<float>(*value - min) / static_cast<float>(max - min), 0.0f, 1.0f);
     const float fillX = track.Min.x + track.GetWidth() * ratio;
-    drawList->AddRectFilled(track.Min, track.Max, color::frame, 2.0f);
-    drawList->AddRectFilledMultiColor(track.Min, { fillX, track.Max.y }, color::accent, color::accent2, color::accent2, color::accent);
-    drawList->AddCircleFilled({ fillX, track.Min.y + 2.0f }, 4.0f + 2.0f * h, IM_COL32(255, 255, 255, 255));
+    drawList->AddRectFilledMultiColor(track.Min, track.Max, IM_COL32(52, 52, 52, 255), IM_COL32(52, 52, 52, 255), IM_COL32(68, 68, 68, 255), IM_COL32(68, 68, 68, 255));
+    drawList->AddRectFilledMultiColor(track.Min, { fillX, track.Max.y }, color::accent, color::accent, color::accent2, color::accent2);
+    drawList->AddRect({ track.Min.x - 1.0f, track.Min.y - 1.0f }, { track.Max.x + 1.0f, track.Max.y + 1.0f }, hovered || held ? IM_COL32(70, 70, 70, 255) : color::outline);
+    const float textX = std::clamp(fillX - valueSize.x * 0.5f, track.Min.x, track.Max.x - valueSize.x);
+    drawList->AddText({ textX + 1.0f, track.Min.y - 3.0f }, color::outline, buffer);
+    drawList->AddText({ textX, track.Min.y - 4.0f }, IM_COL32(255, 255, 255, 255), buffer);
 
     return changed;
 }
@@ -279,9 +292,9 @@ bool sliderFloat(const char* label, float* value, float min, float max, const ch
 
 static void smallLabel(const char* label) noexcept
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, toVec4(color::textDim));
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
     ImGui::TextUnformatted(label, ImGui::FindRenderedTextEnd(label));
-    ImGui::PopStyleColor();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
 }
 
 bool combo(const char* label, int* value, const char* const items[], int count) noexcept
@@ -340,9 +353,10 @@ void keybind(const char* label, KeyBind& key) noexcept
     const ImRect bb{ pos, { pos.x + width, pos.y + rowHeight } };
 
     const bool listening = ImGui::GetActiveID() == id;
-    const char* keyName = listening ? "..." : (key.isSet() ? key.toString() : "—");
+    char keyName[48];
+    std::snprintf(keyName, sizeof(keyName), "[%s]", listening ? "..." : (key.isSet() ? key.toString() : "-"));
     const auto keySize = ImGui::CalcTextSize(keyName);
-    const ImRect button{ { bb.Max.x - keySize.x - 18.0f, pos.y + 3.0f }, { bb.Max.x, pos.y + rowHeight - 3.0f } };
+    const ImRect button{ { bb.Max.x - keySize.x - 4.0f, pos.y }, { bb.Max.x, pos.y + rowHeight } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -365,9 +379,8 @@ void keybind(const char* label, KeyBind& key) noexcept
     }
 
     auto* drawList = window->DrawList;
-    drawList->AddText({ pos.x, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::textDim, label, ImGui::FindRenderedTextEnd(label));
-    drawList->AddRectFilled(button.Min, button.Max, listening ? withAlpha(color::accent, 0.35f) : (hovered ? color::frameHover : color::frame), 5.0f);
-    drawList->AddText({ button.Min.x + 9.0f, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, listening ? color::text : color::textDim, keyName);
+    drawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, ImGui::FindRenderedTextEnd(label));
+    drawList->AddText({ button.Min.x + 4.0f, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, listening ? color::accent : (hovered ? color::text : IM_COL32(110, 110, 110, 255)), keyName);
 }
 
 bool pill(const char* label, bool selected) noexcept
@@ -376,7 +389,7 @@ bool pill(const char* label, bool selected) noexcept
     const auto id = window->GetID(label);
     const auto textSize = ImGui::CalcTextSize(label, ImGui::FindRenderedTextEnd(label));
     const auto pos = window->DC.CursorPos;
-    const ImRect bb{ pos, { pos.x + textSize.x + 24.0f, pos.y + 28.0f } };
+    const ImRect bb{ pos, { pos.x + textSize.x + 20.0f, pos.y + 24.0f } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -388,10 +401,11 @@ bool pill(const char* label, bool selected) noexcept
     const float h = animate(id + 1, hovered, 16.0f);
 
     auto* drawList = window->DrawList;
-    drawList->AddRectFilled(bb.Min, bb.Max, lerpColor(withAlpha(color::frame, 0.6f + 0.4f * h), withAlpha(color::accent, 0.2f), t), 14.0f);
-    if (t > 0.01f)
-        drawList->AddRect(bb.Min, bb.Max, withAlpha(color::accent, t), 14.0f);
-    drawList->AddText({ pos.x + 12.0f, pos.y + (28.0f - textSize.y) * 0.5f }, lerpColor(color::textDim, color::text, std::max(t, h * 0.5f)), label, ImGui::FindRenderedTextEnd(label));
+    const ImU32 top = h > 0.5f ? IM_COL32(40, 40, 40, 255) : IM_COL32(35, 35, 35, 255);
+    drawList->AddRectFilledMultiColor(bb.Min, bb.Max, top, top, IM_COL32(27, 27, 27, 255), IM_COL32(27, 27, 27, 255));
+    drawList->AddRect(bb.Min, bb.Max, color::outline);
+    drawList->AddRect({ bb.Min.x + 1.0f, bb.Min.y + 1.0f }, { bb.Max.x - 1.0f, bb.Max.y - 1.0f }, IM_COL32(50, 50, 50, 255));
+    drawList->AddText({ pos.x + 10.0f, pos.y + (24.0f - textSize.y) * 0.5f }, lerpColor(color::text, color::accent, t), label, ImGui::FindRenderedTextEnd(label));
     return pressed;
 }
 
@@ -471,7 +485,7 @@ bool sidebarTab(const char* label, Icon icon, bool selected) noexcept
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
-    const ImRect bb{ pos, { pos.x + width, pos.y + 34.0f } };
+    const ImRect bb{ pos, { pos.x + width, pos.y + 64.0f } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -479,18 +493,21 @@ bool sidebarTab(const char* label, Icon icon, bool selected) noexcept
 
     bool hovered, held;
     const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
-    const float t = animate(id, selected, 14.0f);
     const float h = animate(id + 1, hovered, 16.0f);
 
-    auto* d = window->DrawList;
-    if (t > 0.01f || h > 0.01f)
-        d->AddRectFilled(bb.Min, bb.Max, lerpColor(withAlpha(color::frame, 0.5f * h), withAlpha(color::accent, 0.13f), t), 7.0f);
-    if (t > 0.01f)
-        d->AddRectFilled({ bb.Min.x, bb.Min.y + 8.0f }, { bb.Min.x + 3.0f, bb.Max.y - 8.0f }, withAlpha(color::accent, t), 2.0f);
-
-    const auto col = lerpColor(lerpColor(color::textDim, color::text, h * 0.6f), color::accent, t);
-    drawIcon(d, icon, { bb.Min.x + 22.0f, bb.Min.y + 17.0f }, 15.0f, col);
-    d->AddText({ bb.Min.x + 40.0f, bb.Min.y + (34.0f - ImGui::GetFontSize()) * 0.5f }, lerpColor(lerpColor(color::textDim, color::text, h * 0.6f), color::text, t), label, ImGui::FindRenderedTextEnd(label));
+    // в окне-родителе: выбранная вкладка сливается с областью контента (без правой линии)
+    auto* d = window->RootWindow->DrawList;
+    if (selected) {
+        d->AddRectFilled(bb.Min, { bb.Max.x + 1.0f, bb.Max.y }, color::windowBg);
+        d->AddLine({ bb.Min.x, bb.Min.y }, { bb.Max.x + 1.0f, bb.Min.y }, color::outline);
+        d->AddLine({ bb.Min.x, bb.Min.y + 1.0f }, { bb.Max.x + 1.0f, bb.Min.y + 1.0f }, color::groupLine);
+        d->AddLine({ bb.Min.x, bb.Max.y - 1.0f }, { bb.Max.x + 1.0f, bb.Max.y - 1.0f }, color::groupLine);
+        d->AddLine({ bb.Min.x, bb.Max.y }, { bb.Max.x + 1.0f, bb.Max.y }, color::outline);
+    }
+    const ImU32 col = selected ? IM_COL32(210, 210, 210, 255) : lerpColor(IM_COL32(90, 90, 90, 255), IM_COL32(150, 150, 150, 255), h);
+    drawIcon(d, icon, { bb.Min.x + width * 0.5f, bb.Min.y + 32.0f }, 24.0f, col);
+    if (hovered)
+        ImGui::SetTooltip("%s", label);
     return pressed;
 }
 
@@ -531,6 +548,11 @@ void drawIndicators(ImDrawList* drawList) noexcept
         };
         arrow({ center.x - 50.0f, center.y }, -1.0f, manual == antiaim::Manual::Left);
         arrow({ center.x + 50.0f, center.y }, 1.0f, manual == antiaim::Manual::Right);
+        // вперёд/назад — только когда выбраны, чтобы не загромождать прицел
+        if (manual == antiaim::Manual::Forward)
+            drawList->AddTriangleFilled({ center.x, center.y - 50.0f }, { center.x - 8.0f, center.y - 38.0f }, { center.x + 8.0f, center.y - 38.0f }, color::accent);
+        else if (manual == antiaim::Manual::Back)
+            drawList->AddTriangleFilled({ center.x, center.y + 62.0f }, { center.x + 8.0f, center.y + 50.0f }, { center.x - 8.0f, center.y + 50.0f }, color::accent);
     }
 
     // список под прицелом
@@ -552,8 +574,14 @@ void drawIndicators(ImDrawList* drawList) noexcept
         line("DEF", tickbase::isCharged() ? color::good : color::bad);
     if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
         line("PEEK", color::accent);
-    if (config.antiAim.enabled && config.antiAim.desync)
-        line(antiaim::desyncSide() > 0 ? "DESYNC <" : "DESYNC >", color::accent);
+    if (config.antiAim.enabled) {
+        char text[96];
+        if (config.antiAim.desync)
+            std::snprintf(text, sizeof(text), "%s · %s", antiaim::desyncSide() > 0 ? "DESYNC <" : "DESYNC >", antiaim::stateName());
+        else
+            std::snprintf(text, sizeof(text), "AA · %s", antiaim::stateName());
+        line(text, color::accent);
+    }
     if (ragebot::minDamageOverrideActive())
         line("DMG", color::text);
     if (ragebot::forceBodyActive())
@@ -574,6 +602,80 @@ void drawIndicators(ImDrawList* drawList) noexcept
             line("R —", color::bad);
         }
     }
+}
+
+// Ватермарка как у gamesense: двойная рамка, радужная полоска сверху,
+// «newer» белым + «win» акцентом | ник | задержка | тикрейт | время
+void drawWatermark(ImDrawList* d) noexcept
+{
+    if (!config.view.watermark)
+        return;
+
+    char nick[32] = "";
+    int tickRate = 64;
+    {
+        GameData::Lock lock;
+        const auto& local = GameData::local();
+        if (local.exists) {
+            std::snprintf(nick, sizeof(nick), "%s", local.name);
+            tickRate = local.tickRate;
+        }
+    }
+
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+
+    char rest[128];
+    if (*nick)
+        std::snprintf(rest, sizeof(rest), " | %s | delay: %dms | %dtick | %02d:%02d:%02d", nick, GameData::getNetOutgoingLatency(), tickRate, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    else
+        std::snprintf(rest, sizeof(rest), " | %02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    ImFont* font = fonts.menu ? fonts.menu : ImGui::GetFont();
+    const float fontSize = font->FontSize;
+    const auto sizeOf = [&](const char* text) { return font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text); };
+    const auto wNewer = sizeOf("newer");
+    const auto wWin = sizeOf("win");
+    const auto wRest = sizeOf(rest);
+
+    constexpr float padX = 6.0f, padY = 4.0f, border = 4.0f, margin = 10.0f;
+    const float textW = wNewer.x + wWin.x + wRest.x;
+    const float textH = wNewer.y;
+    const ImVec2 size{ textW + padX * 2.0f + border * 2.0f, textH + padY * 2.0f + border * 2.0f + 2.0f };
+    const auto& display = ImGui::GetIO().DisplaySize;
+    const ImVec2 pos{ display.x - size.x - margin, margin };
+    const ImVec2 max{ pos.x + size.x, pos.y + size.y };
+
+    // рамка: чёрная, серая, полоса, серая — как у окна меню
+    d->AddRectFilled(pos, max, IM_COL32(0, 0, 0, 255));
+    d->AddRectFilled({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, IM_COL32(60, 60, 60, 255));
+    d->AddRectFilled({ pos.x + 2.0f, pos.y + 2.0f }, { max.x - 2.0f, max.y - 2.0f }, IM_COL32(40, 40, 40, 255));
+    d->AddRectFilled({ pos.x + border - 1.0f, pos.y + border - 1.0f }, { max.x - border + 1.0f, max.y - border + 1.0f }, IM_COL32(60, 60, 60, 255));
+    const ImVec2 inner{ pos.x + border, pos.y + border };
+    const ImVec2 innerMax{ max.x - border, max.y - border };
+    d->AddRectFilled(inner, innerMax, color::windowBg);
+
+    // радужная полоска (вторая строка — тёмная копия)
+    const float mid = (inner.x + innerMax.x) * 0.5f;
+    const ImU32 cyan = IM_COL32(55, 177, 218, 255), magenta = IM_COL32(204, 70, 205, 255), yellow = IM_COL32(204, 227, 54, 255);
+    const ImU32 cyanD = IM_COL32(28, 89, 109, 255), magentaD = IM_COL32(102, 35, 103, 255), yellowD = IM_COL32(102, 114, 27, 255);
+    d->AddRectFilledMultiColor(inner, { mid, inner.y + 1.0f }, cyan, magenta, magenta, cyan);
+    d->AddRectFilledMultiColor({ mid, inner.y }, { innerMax.x, inner.y + 1.0f }, magenta, yellow, yellow, magenta);
+    d->AddRectFilledMultiColor({ inner.x, inner.y + 1.0f }, { mid, inner.y + 2.0f }, cyanD, magentaD, magentaD, cyanD);
+    d->AddRectFilledMultiColor({ mid, inner.y + 1.0f }, { innerMax.x, inner.y + 2.0f }, magentaD, yellowD, yellowD, magentaD);
+
+    // текст с тенью
+    float x = inner.x + padX;
+    const float y = inner.y + 2.0f + padY;
+    const auto put = [&](const char* text, ImU32 col, float width) {
+        d->AddText(font, fontSize, { x + 1.0f, y + 1.0f }, IM_COL32(0, 0, 0, 200), text);
+        d->AddText(font, fontSize, { x, y }, col, text);
+        x += width;
+    };
+    put("newer", IM_COL32(255, 255, 255, 255), wNewer.x);
+    put("win", color::accent, wWin.x);
+    put(rest, color::text, wRest.x);
 }
 
 static int selectedWeapon = 0;
@@ -602,7 +704,8 @@ void drawRageTab() noexcept
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Стрелять, даже если заданный «Мин. урон» по этой цели недостижим:\n"
                               "порог опускается до лучшего достижимого урона, и выстрел всё равно идёт.\n"
-                              "Без него рейдж в такой ситуации просто не стреляет («фотка»).");
+                              "Без него не стреляет — кроме случая, когда порог требует убийства, а набирается\n"
+                              "хотя бы половина хп (вторая пуля DT добьёт).");
         if (rage.forceShot)
             keybind("Клавиша форсшута", rage.forceShotKey);
         toggle("Резольвер", &rage.resolver);
@@ -622,16 +725,33 @@ void drawRageTab() noexcept
             }
             static constexpr const char* safeModes[]{ "Выкл", "После промаха", "Всегда" };
             combo("Безопасные точки", &rage.safePoint, safeModes, IM_ARRAYSIZE(safeModes));
-            toggle("Точки, общие для обеих сторон", &rage.resolverSafeWhenUnsure);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Сторона десинка не доказана (нет находки по слоям, режим ещё не попадал):\n"
-                                  "бить только точки, которые попадают в ОБЕ стороны — обычно это тело.\n"
-                                  "Попадание почти гарантировано, а «край головы» при неверной стороне — промах.\n"
-                                  "Если таких точек под мин. урон нет, стрельба по угаданной стороне остаётся.");
+                ImGui::SetTooltip("Выкл — точки, общие для всех сторон десинка, просто в приоритете\n"
+                                  "(остальные оцениваются по доверию к стороне, голова — строже).\n"
+                                  "После промаха / Всегда — стрелять ТОЛЬКО в такие точки.");
         }
         sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
         keybind("Мин. урон (override)", rage.minDamageOverrideKey);
         keybind("Только в тело", rage.forceBodyKey);
+
+        ImGui::Dummy({ 0.0f, 6.0f });
+        ImGui::PushFont(fonts.bold);
+        ImGui::TextUnformatted("Нож и зевс");
+        ImGui::PopFont();
+        toggle("Кнайфбот", &rage.knifeBot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("С ножом в руке сам бьёт врага в радиусе удара (с учётом бектрека):\n"
+                              "ПКМ (до 32 ед.) — 65 урона, в спину 180; ЛКМ (до 48 ед.) — 25, в спину 90.\n"
+                              "Броня режет урон на 15%%. Сначала смертельный ПКМ, потом смертельный ЛКМ.");
+        if (rage.knifeBot) {
+            static constexpr const char* knifeModes[]{ "Только наповал", "Любой удар" };
+            combo("Когда бить", &rage.knifeBotMode, knifeModes, IM_ARRAYSIZE(knifeModes));
+        }
+        toggle("Зевсбот", &rage.zeusBot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("С зевсом в руке стреляет только наверняка: грудь/живот/таз,\nурон должен убивать, автостоп по точности.");
+        if (rage.zeusBot)
+            sliderInt("Хитшанс зевса", &rage.zeusHitchance, 30, 100, "%d%%");
 
         ImGui::Dummy({ 0.0f, 6.0f });
         ImGui::PushFont(fonts.bold);
@@ -646,6 +766,10 @@ void drawRageTab() noexcept
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Враг только что увидел тебя — рывок на заряженные тики:\nего лагкомп и бектрек по тебе ломаются. Нужен заряд (DT/телепорт).");
         keybind("Автопик", config.movement.autoPeekKey);
+        {
+            static constexpr const char* peekModes[]{ "После выстрела", "Выстрел или отпустил WASD" };
+            combo("Возврат автопика", &config.movement.autoPeekMode, peekModes, IM_ARRAYSIZE(peekModes));
+        }
         keybind("Фейкдак", config.movement.fakeDuckKey);
         if (!tickbase::isInstalled()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::bad));
@@ -693,11 +817,31 @@ void drawRageTab() noexcept
     endGroup();
 }
 
-void drawAntiAimTab() noexcept
+static void sectionTitle(const char* title) noexcept
+{
+    ImGui::Dummy({ 0.0f, 6.0f });
+    ImGui::PushFont(fonts.bold);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+}
+
+static void hint(const char* text) noexcept
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+
+static void tooltip(const char* text) noexcept
+{
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", text);
+}
+
+// Вкладка «Основное»: углы, фристенд, edge, ручной AA, roll, safe head, легит AA, десинк, фейклаг
+static void drawAntiAimMain(float width, float height) noexcept
 {
     auto& aa = config.antiAim;
-    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    const float height = ImGui::GetContentRegionAvail().y;
 
     if (beginGroup("Углы", { width, height })) {
         toggle("Включить", &aa.enabled);
@@ -705,71 +849,43 @@ void drawAntiAimTab() noexcept
         combo("Pitch", &aa.pitch, pitches, IM_ARRAYSIZE(pitches));
         static constexpr const char* bases[]{ "Выкл", "Назад", "На врагов" };
         combo("Yaw", &aa.yawBase, bases, IM_ARRAYSIZE(bases));
-        sliderInt("Смещение yaw", &aa.yawOffset, -180, 180, "%d°");
+
+        sectionTitle("Фристенд и стены");
         toggle("Фристенд", &aa.freestanding);
-        if (aa.freestanding)
+        if (aa.freestanding) {
             keybind("Клавиша фристенда", aa.freestandKey);
-        static constexpr const char* modifiers[]{ "Выкл", "Джиттер", "Центр-джиттер", "Спин", "Рандом", "5-way" };
-        combo("Модификатор", &aa.yawModifier, modifiers, IM_ARRAYSIZE(modifiers));
-        if (aa.yawModifier == static_cast<int>(YawModifier::Spin))
-            sliderInt("Скорость спина", &aa.spinSpeed, 1, 60);
-        else if (aa.yawModifier != static_cast<int>(YawModifier::Off))
-            sliderInt("Диапазон", &aa.modifierRange, 0, 180, "%d°");
-
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Флики (дефенсив AA)");
-        ImGui::PopFont();
-        toggle("Флики", &aa.flicks);
-        if (aa.flicks) {
-            static constexpr const char* triggers[]{ "При дефенсиве", "Всегда" };
-            combo("Когда", &aa.flickTrigger, triggers, IM_ARRAYSIZE(triggers));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("«При дефенсиве» — на тиках рывка (дефенсив, телепорт, сдвиг DT) и пару тиков после:\n"
-                    "в это время его лагкомп по тебе не работает, а модель на сервере смотрит вбок.\n"
-                    "Нужен включённый «Дефенсив» в эксплойтах или DT. «Всегда» — ещё и раз в N пакетов.");
-            static constexpr const char* sides[]{ "Влево/вправо", "Рандом", "Свой yaw" };
-            combo("Сторона", &aa.flickSide, sides, IM_ARRAYSIZE(sides));
-            if (aa.flickSide == static_cast<int>(FlickSide::Custom)) {
-                sliderInt("Yaw флика", &aa.flickYaw, -180, 180, "%+d°");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Смещение от обычного yaw AA на тике флика. Минус — влево, плюс — вправо, 180 — назад.");
-            } else {
-                sliderInt("Угол флика", &aa.flickAngle, 30, 180, "%d°");
-            }
-            toggle("Свой pitch на флике", &aa.flickPitchOverride);
-            if (aa.flickPitchOverride) {
-                sliderInt("Pitch флика", &aa.flickPitch, -89, 89, "%d°");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("-89 — вверх, 0 — прямо, 89 — вниз.");
-            }
-            if (aa.flickTrigger == static_cast<int>(FlickTrigger::Always))
-                sliderInt("Раз в N пакетов", &aa.flickEvery, 3, 32);
+            toggle("Статика на фристенде", &aa.freestandStatic);
+            tooltip("Пока фристенд прячет голову — без модификатора и джиттера десинка:\nголова уже за укрытием, джиттер только выдал бы её.");
+        }
+        toggle("Edge yaw", &aa.edgeYaw);
+        tooltip("Стена вплотную (до ~32 ед. от глаз) — встаём лицом в неё, голова уходит в стену.\nРаботает, когда нет ручного AA и фристенда.");
+        if (aa.edgeYaw) {
+            keybind("Клавиша edge yaw", aa.edgeKey);
+            toggle("Статика на edge yaw", &aa.edgeStatic);
         }
 
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Дефенсив AA");
-        ImGui::PopFont();
-        toggle("Включить дефенсив", &aa.defensive);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Пока враг целится в тебя (его взгляд в пределах «FOV» от направления на нас):\n"
-                              "pitch вниз, тело уведено вбок от его прицела, сторона дёргается на каждом пакете.\n"
-                              "Его резольвер и бектрек по тебе сбиваются.");
-        if (aa.defensive) {
-            sliderInt("FOV обнаружения", &aa.defensiveFov, 1, 90, "%d°");
-            sliderInt("Увод yaw", &aa.defensiveYaw, 0, 180, "%d°");
-            sliderInt("Pitch", &aa.defensivePitch, -89, 89, "%d°");
-            toggle("Дёргать сторону", &aa.defensiveJitter);
-        }
-
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Ручной AA");
-        ImGui::PopFont();
+        sectionTitle("Ручной AA");
         keybind("Влево", aa.manualLeft);
         keybind("Вправо", aa.manualRight);
         keybind("Назад", aa.manualBack);
+        keybind("Вперёд", aa.manualForward);
+        toggle("Статика на ручном", &aa.staticOnManual);
+        tooltip("На ручном AA — без модификатора и джиттера десинка, десинк на полную.");
+
+        sectionTitle("Прочее");
+        sliderInt("Roll", &aa.roll, -50, 50, aa.roll ? "%+d°" : "выкл");
+        tooltip("Наклон головы вбок (roll). Знак — сторона, инвертер меняет её.\nВ движении и в воздухе ограничен ±40°. Пока roll включён — модификатор и дефенсив-углы выключены.\nНа валв-серверах roll режется — для комьюнити-HvH.");
+        static constexpr const char* safeHeads[]{ "Выкл", "Обычный", "Умный" };
+        combo("Safe head", &aa.safeHead, safeHeads, IM_ARRAYSIZE(safeHeads));
+        tooltip("Обычный — прыжок с ножом, враг не сильно ниже: голова прямо, без десинка.\n"
+                "Умный — по углу, под которым враг видит голову: в «опасной» полосе десинк выключается,\n"
+                "чтобы голова не уезжала вбок, где её проще задеть.");
+        toggle("Легит AA на E", &aa.legitAa);
+        tooltip("Пока зажата E — смотрим, куда смотрим (можно поднимать/дефьюзить), десинк остаётся.\nНе мешает дефьюзу и подбору оружия.");
+        toggle("Плавные переходы", &aa.naturality);
+        tooltip("При смене состояния (стоя → бег → прыжок) углы билдера плавно перетекают\nвместо резкого скачка, по которому его резольвер ловит смену.");
+        if (aa.naturality)
+            sliderFloat("Время перехода", &aa.naturalityTime, 0.05f, 1.0f, "%.2f с");
     }
     endGroup();
 
@@ -777,26 +893,332 @@ void drawAntiAimTab() noexcept
 
     if (beginGroup("Десинк и фейклаг", { width, height })) {
         toggle("Десинк", &aa.desync);
-        sliderInt("Влево", &aa.desyncLeft, 0, 60, "%d°");
-        sliderInt("Вправо", &aa.desyncRight, 0, 60, "%d°");
-        toggle("Джиттер десинка", &aa.desyncJitter);
-        toggle("Анти-брутфорс", &aa.antiBrute);
         keybind("Инвертер", aa.inverter);
         sliderInt("Фейклаг", &aa.fakeLag, 1, 14, "%d тик.");
         toggle("Слайд-волк", &aa.slideWalk);
 
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Вид");
-        ImGui::PopFont();
+        sectionTitle("Вид");
         toggle("Показывать AA в 3-м лице", &config.view.showFakeAngles);
 
         ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-        ImGui::TextWrapped("При включённом DT фейклаг автоматически ограничен 1 тиком.");
-        ImGui::PopStyleColor();
+        hint("При включённом DT фейклаг автоматически ограничен 1 тиком.\n\n"
+             "Углы, модификаторы и десинк по состояниям — во вкладке «Билдер».\n"
+             "Скрытые углы на тиках дефенсива — во вкладке «Дефенсив».");
     }
     endGroup();
+}
+
+// Вкладка «Билдер»: настройки по состояниям + флики и старый дефенсив по прицелу врага
+static void drawAntiAimBuilder(float width, float height) noexcept
+{
+    auto& aa = config.antiAim;
+
+    if (beginGroup("Билдер по состояниям", { width, height })) {
+        static int selected = 0;
+        static AntiAimState clipboard;
+        static bool haveClipboard = false;
+        combo("Состояние", &selected, aaStateNames.data(), static_cast<int>(aaStateNames.size()));
+        selected = std::clamp(selected, 0, static_cast<int>(aaStateNames.size()) - 1);
+        auto& st = aa.states[selected];
+        const bool isDefault = selected == static_cast<int>(AaState::Default);
+        if (!isDefault)
+            toggle("Свои настройки", &st.override);
+
+        const float third = (ImGui::GetContentRegionAvail().x - 8.0f) / 3.0f;
+        if (ImGui::Button("Копировать", { third, 0.0f })) {
+            clipboard = st;
+            haveClipboard = true;
+        }
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::Button("Вставить", { third, 0.0f }) && haveClipboard) {
+            st = clipboard;
+            st.override = !isDefault;   // вставили в состояние — значит, хотят свои настройки
+        }
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::Button("Сброс", { third, 0.0f })) {
+            const bool keep = st.override;
+            st = {};
+            st.override = keep;
+        }
+
+        if (!isDefault && !st.override) {
+            hint("Своих настроек нет — в этом состоянии работает «Общее».");
+        } else {
+            ImGui::Dummy({ 0.0f, 4.0f });
+            sliderInt("Смещение yaw", &st.yawOffset, -180, 180, "%d°");
+            sliderInt("Добавка (десинк влево)", &st.addLeft, -90, 90, "%+d°");
+            sliderInt("Добавка (десинк вправо)", &st.addRight, -90, 90, "%+d°");
+            tooltip("Сдвиг yaw в зависимости от текущей стороны десинка.\n"
+                    "С джиттер-десинком голова уходит за телом, а не стоит посередине.");
+
+            static constexpr const char* modifiers[]{ "Выкл", "Джиттер", "Центр-джиттер", "Спин", "Рандом", "N-way", "Вращение", "Скиттер" };
+            combo("Модификатор", &st.modifier, modifiers, IM_ARRAYSIZE(modifiers));
+            const auto modifier = static_cast<YawModifier>(st.modifier);
+            if (modifier == YawModifier::Spin) {
+                sliderInt("Скорость спина", &st.spinSpeed, 1, 60);
+            } else if (modifier != YawModifier::Off) {
+                sliderInt("Размах", &st.degree, 0, 180, "%d°");
+                if (modifier == YawModifier::FiveWay)
+                    sliderInt("Положений", &st.ways, 3, 8);
+                if (modifier == YawModifier::Rotate)
+                    sliderInt("Скорость вращения", &st.spinSpeed, 1, 60);
+                sliderInt("Рандомизация", &st.randomize, 0, 45, "±%d°");
+                tooltip("На каждом переключении размах меняется на случайную величину в этих пределах.");
+            }
+
+            static constexpr const char* desyncModes[]{ "Выкл", "Статика", "Джиттер", "Рандом" };
+            combo("Десинк", &st.desyncMode, desyncModes, IM_ARRAYSIZE(desyncModes));
+            if (st.desyncMode != static_cast<int>(DesyncMode::Off)) {
+                sliderInt("Влево", &st.desyncLeft, 0, 60, "%d°");
+                sliderInt("Вправо", &st.desyncRight, 0, 60, "%d°");
+                if (st.desyncMode == static_cast<int>(DesyncMode::Static))
+                    toggle("Другая сторона", &st.desyncInvert);
+            }
+
+            static constexpr const char* delays[]{ "Нет", "Статичная", "Плавающая", "Случайная", "Качели" };
+            combo("Задержка переключения", &st.delayMode, delays, IM_ARRAYSIZE(delays));
+            tooltip("Модификатор и джиттер десинка шагают раз в N отправленных пакетов.\n"
+                    "«Плавающая» — 1, 2, … N по кругу; «Случайная» — от 1 до N; «Качели» — N и 1 по очереди.\n"
+                    "Сбивает ритм, по которому его резольвер угадывает фазу.");
+            if (st.delayMode != static_cast<int>(SwitchDelay::None))
+                sliderInt("Пакетов", &st.delayTicks, 1, 16);
+        }
+    }
+    endGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    if (beginGroup("Флики и увод от прицела", { width, height })) {
+        toggle("Флики", &aa.flicks);
+        if (aa.flicks) {
+            static constexpr const char* triggers[]{ "При дефенсиве", "Всегда" };
+            combo("Когда", &aa.flickTrigger, triggers, IM_ARRAYSIZE(triggers));
+            tooltip("«При дефенсиве» — на тиках рывка (дефенсив, телепорт, сдвиг DT) и пару тиков после:\n"
+                    "в это время его лагкомп по тебе не работает, а модель на сервере смотрит вбок.\n"
+                    "Нужен включённый «Дефенсив» в эксплойтах или DT. «Всегда» — ещё и раз в N пакетов.");
+            static constexpr const char* sides[]{ "Влево/вправо", "Рандом", "Свой yaw" };
+            combo("Сторона", &aa.flickSide, sides, IM_ARRAYSIZE(sides));
+            if (aa.flickSide == static_cast<int>(FlickSide::Custom)) {
+                sliderInt("Yaw флика", &aa.flickYaw, -180, 180, "%+d°");
+                tooltip("Смещение от обычного yaw AA на тике флика. Минус — влево, плюс — вправо, 180 — назад.");
+            } else {
+                sliderInt("Угол флика", &aa.flickAngle, 30, 180, "%d°");
+            }
+            toggle("Свой pitch на флике", &aa.flickPitchOverride);
+            if (aa.flickPitchOverride) {
+                sliderInt("Pitch флика", &aa.flickPitch, -89, 89, "%d°");
+                tooltip("-89 — вверх, 0 — прямо, 89 — вниз.");
+            }
+            if (aa.flickTrigger == static_cast<int>(FlickTrigger::Always))
+                sliderInt("Раз в N пакетов", &aa.flickEvery, 3, 32);
+        }
+
+        sectionTitle("Увод от прицела врага");
+        toggle("Включить увод", &aa.defensive);
+        tooltip("Пока враг целится в тебя (его взгляд в пределах «FOV» от направления на нас):\n"
+                "pitch вниз, тело уведено вбок от его прицела, сторона дёргается на каждом пакете.\n"
+                "Его резольвер и бектрек по тебе сбиваются.");
+        if (aa.defensive) {
+            sliderInt("FOV обнаружения", &aa.defensiveFov, 1, 90, "%d°");
+            sliderInt("Увод yaw", &aa.defensiveYaw, 0, 180, "%d°");
+            sliderInt("Pitch", &aa.defensivePitch, -89, 89, "%d°");
+            toggle("Дёргать сторону", &aa.defensiveJitter);
+        }
+    }
+    endGroup();
+}
+
+// Вкладка «Дефенсив»: скрытые углы на тиках, когда лагкомп по нам не пишется
+static void drawAntiAimDefensive(float width, float height) noexcept
+{
+    auto& aa = config.antiAim;
+
+    if (beginGroup("Дефенсив AA", { width, height })) {
+        toggle("Включить дефенсив AA", &aa.defensiveAa);
+        tooltip("Пока тикбейс откатился после рывка (дефенсив/DT), сервер не пишет лагкомп по нам:\n"
+                "враг видит эти углы, но ни бектрекнуть, ни разрезольвить их не может.\n"
+                "Здесь задаётся, какие pitch и yaw показывать в это окно.\n"
+                "Нужен заряд: «Дефенсив» или DT в эксплойтах, либо «Ломать лагкомп» ниже.");
+
+        static int selected = 0;
+        static DefensiveSnap clipboard;
+        static bool haveClipboard = false;
+        combo("Состояние##snap", &selected, snapStateNames.data(), static_cast<int>(snapStateNames.size()));
+        selected = std::clamp(selected, 0, static_cast<int>(snapStateNames.size()) - 1);
+        auto& s = aa.snaps[selected];
+        const bool isDefault = selected == static_cast<int>(SnapState::Default);
+
+        if (isDefault) {
+            static constexpr const char* modes[]{ "Выкл", "Своё" };
+            int mode = s.mode == static_cast<int>(SnapMode::Custom) ? 1 : 0;
+            if (combo("Режим", &mode, modes, IM_ARRAYSIZE(modes)))
+                s.mode = mode ? static_cast<int>(SnapMode::Custom) : static_cast<int>(SnapMode::Default);
+        } else {
+            static constexpr const char* modes[]{ "Как общее", "Выкл", "Своё" };
+            combo("Режим", &s.mode, modes, IM_ARRAYSIZE(modes));
+        }
+
+        const float half = (ImGui::GetContentRegionAvail().x - 4.0f) * 0.5f;
+        if (ImGui::Button("Копировать##snap", { half, 0.0f })) {
+            clipboard = s;
+            haveClipboard = true;
+        }
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::Button("Вставить##snap", { half, 0.0f }) && haveClipboard)
+            s = clipboard;
+
+        if (s.mode != static_cast<int>(SnapMode::Custom)) {
+            hint(isDefault ? "Выкл — в окне дефенсива обычные углы AA."
+                           : s.mode == static_cast<int>(SnapMode::Off) ? "В этом состоянии скрытых углов нет."
+                                                                       : "Работают настройки «Общего».");
+        } else {
+            ImGui::Dummy({ 0.0f, 4.0f });
+            static constexpr const char* pitchTypes[]{ "Выкл", "Статика", "Джиттер", "Рандом", "Рандом-статика", "Спин", "Спин за окно", "Камера", "На цель" };
+            combo("Pitch##snap", &s.pitch, pitchTypes, IM_ARRAYSIZE(pitchTypes));
+            tooltip("Статика — угол 1. Джиттер — угол 1 / угол 2. Рандом — между ними каждый тик,\n"
+                    "Рандом-статика — один случайный на окно. Спин — от 1 к 2 по кругу,\n"
+                    "Спин за окно — от 1 к 2 ровно за окно дефенсива. Камера / На цель — куда смотришь / на врага.");
+            const auto pitch = static_cast<SnapPitch>(s.pitch);
+            if (pitch != SnapPitch::Off && pitch != SnapPitch::Camera && pitch != SnapPitch::AtTarget) {
+                sliderInt("Pitch: угол 1", &s.pitchAngle, -89, 89, "%d°");
+                if (pitch != SnapPitch::Static)
+                    sliderInt("Pitch: угол 2", &s.pitchAngle2, -89, 89, "%d°");
+                if (pitch == SnapPitch::Spin)
+                    sliderInt("Pitch: скорость", &s.pitchSpeed, 1, 100);
+            }
+
+            static constexpr const char* yawTypes[]{ "Выкл", "Статика", "Джиттер", "Рандом", "Рандом-джиттер", "Рандом-статика", "Спин", "Спин за окно", "Спин-джиттер", "90 качели", "180 волна", "Наоборот (у стены)" };
+            combo("Yaw##snap", &s.yaw, yawTypes, IM_ARRAYSIZE(yawTypes));
+            tooltip("Угол считается от направления на врага: 180 — спиной (обычный AA), 0 — лицом.\n"
+                    "«Наоборот (у стены)» — голова с открытой стороны, пока обычный фристенд прячет её:\n"
+                    "приманка для его резольвера, а настоящие тики — за стеной.");
+            const auto yaw = static_cast<SnapYaw>(s.yaw);
+            if (yaw != SnapYaw::Off && yaw != SnapYaw::Opposite) {
+                sliderInt(yaw == SnapYaw::Static ? "Yaw: угол" : "Yaw: размах", &s.yawAngle, 0, 360, "%d°");
+                if (yaw == SnapYaw::Jitter || yaw == SnapYaw::SpinJitter)
+                    sliderInt("Yaw: задержка", &s.yawDelay, 0, 10, "%d пак.");
+                if (yaw == SnapYaw::Spin || yaw == SnapYaw::SpinJitter || yaw == SnapYaw::Way90 || yaw == SnapYaw::Sway180)
+                    sliderInt("Yaw: скорость", &s.yawSpeed, 1, 100);
+            }
+
+            toggle("Ломать лагкомп (Force LC)", &s.forceLc);
+            tooltip("В этом состоянии самим запрашивать рывок тикбейса — окно дефенсива\nбудет и без врага в прицеле. Тратит заряд DT.");
+            sliderInt("Длительность", &s.duration, 1, 13, "%d тик.");
+            tooltip("Сколько тиков окна дефенсива занимать скрытыми углами (13 — всё окно).");
+        }
+
+        ImGui::Dummy({ 0.0f, 4.0f });
+        if (aa.defensiveAa) {
+            char text[64];
+            std::snprintf(text, sizeof(text), "Сейчас окно: %d тик.", tickbase::defensiveTicksLeft());
+            hint(text);
+        }
+    }
+    endGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    if (beginGroup("Ломать лагкомп", { width, height })) {
+        toggle("LC-триггеры", &aa.lcTriggers);
+        tooltip("В выбранных состояниях билдера постоянно ломать лагкомп по себе:\n"
+                "по нам нельзя бектрекнуть, а дефенсив-углы работают всё время.\nТратит заряд DT между выстрелами.");
+        if (aa.lcTriggers)
+            multiCombo("Состояния", &aa.lcTriggerStates, aaStateNames.data(), static_cast<int>(aaStateNames.size()));
+
+        ImGui::Dummy({ 0.0f, 6.0f });
+        hint("Окно дефенсива открывается, когда сервер откатил наш тикбейс: после рывка «Дефенсива»\n"
+             "из эксплойтов, сдвига DT, телепорта или по запросу Force LC / LC-триггеров.\n\n"
+             "Состояние выбирается так: воздух+присед → воздух → у стены → присед в движении →\n"
+             "присед → шаг; если у состояния «Как общее» — берётся «Общее».");
+    }
+    endGroup();
+}
+
+// Вкладка «Анти-брут»
+static void drawAntiAimAntiBrute(float width, float height) noexcept
+{
+    auto& aa = config.antiAim;
+
+    if (beginGroup("Анти-брутфорс", { width, height })) {
+        toggle("Анти-брутфорс", &aa.antiBrute);
+        tooltip("Враг выстрелил рядом с нами (пуля прошла в 80 ед.) или мы выстрелили сами —\nего резольвер подбирал сторону под наш AA, меняем AA.");
+        if (aa.antiBrute) {
+            static constexpr const char* triggers[]{ "Враг выстрелил", "Мы выстрелили" };
+            multiCombo("Когда", &aa.antiBruteTriggers, triggers, IM_ARRAYSIZE(triggers));
+            static constexpr const char* modes[]{ "Смена стороны", "Подстройка", "Стойка пресетов" };
+            combo("Что делать", &aa.antiBruteMode, modes, IM_ARRAYSIZE(modes));
+            tooltip("Смена стороны — десинк на другую сторону.\n"
+                    "Подстройка — углы билдера сдвигаются на случайную долю (до «Силы»).\n"
+                    "Стойка пресетов — загружается следующий пресет из стойки справа.");
+            if (aa.antiBruteMode == static_cast<int>(AntiBruteMode::Adjust))
+                sliderInt("Сила", &aa.antiBrutePower, 1, 100, "%d%%");
+            if (aa.antiBruteMode == static_cast<int>(AntiBruteMode::PresetRack)) {
+                static constexpr const char* orders[]{ "Случайно", "По очереди" };
+                combo("Порядок", &aa.antiBruteOrder, orders, IM_ARRAYSIZE(orders));
+            }
+            sliderFloat("Вернуть как было через", &aa.antiBruteReset, 0.0f, 15.0f, aa.antiBruteReset > 0.0f ? "%.1f с" : "никогда");
+        }
+    }
+    endGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    if (beginGroup("Стойка пресетов", { width, height })) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "Пресетов в стойке: %d", static_cast<int>(aa.presetRack.size()));
+        ImGui::TextUnformatted(text);
+        const float half = (ImGui::GetContentRegionAvail().x - 4.0f) * 0.5f;
+        if (ImGui::Button("Добавить текущий", { half, 0.0f }) && aa.presetRack.size() < 16)
+            aa.presetRack.push_back({ aa.states, aa.snaps });
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::Button("Очистить", { half, 0.0f }))
+            aa.presetRack.clear();
+
+        static int remove = 0;
+        if (!aa.presetRack.empty()) {
+            remove = std::clamp(remove, 0, static_cast<int>(aa.presetRack.size()) - 1);
+            sliderInt("Пресет №", &remove, 0, static_cast<int>(aa.presetRack.size()) - 1, "%d");
+            const float third = (ImGui::GetContentRegionAvail().x - 8.0f) / 3.0f;
+            if (ImGui::Button("Загрузить", { third, 0.0f })) {
+                aa.states = aa.presetRack[remove].states;
+                aa.snaps = aa.presetRack[remove].snaps;
+            }
+            ImGui::SameLine(0.0f, 4.0f);
+            if (ImGui::Button("Заменить", { third, 0.0f }))
+                aa.presetRack[remove] = { aa.states, aa.snaps };
+            ImGui::SameLine(0.0f, 4.0f);
+            if (ImGui::Button("Удалить", { third, 0.0f }))
+                aa.presetRack.erase(aa.presetRack.begin() + remove);
+        }
+
+        ImGui::Dummy({ 0.0f, 6.0f });
+        hint("Пресет — снимок всего билдера и дефенсив-углов. Настрой билдер, нажми «Добавить текущий»,\n"
+             "перенастрой — добавь ещё. В режиме «Стойка пресетов» каждый промах врага загружает следующий.\n"
+             "Стойка сохраняется в конфиг.");
+    }
+    endGroup();
+}
+
+void drawAntiAimTab() noexcept
+{
+    static int page = 0;
+    static constexpr const char* pages[]{ "Основное", "Билдер", "Дефенсив", "Анти-брут" };
+    for (int i = 0; i < IM_ARRAYSIZE(pages); ++i) {
+        if (i)
+            ImGui::SameLine(0.0f, 6.0f);
+        if (pill(pages[i], page == i))
+            page = i;
+    }
+    ImGui::Dummy({ 0.0f, 4.0f });
+
+    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    const float height = ImGui::GetContentRegionAvail().y;
+    switch (page) {
+    case 1: drawAntiAimBuilder(width, height); break;
+    case 2: drawAntiAimDefensive(width, height); break;
+    case 3: drawAntiAimAntiBrute(width, height); break;
+    default: drawAntiAimMain(width, height); break;
+    }
 }
 
 void drawWorldGroup() noexcept
@@ -811,6 +1233,7 @@ void drawWorldGroup() noexcept
     toggle("Траектория гранаты", &view.grenadePrediction);
     sliderFloat("ESP дормантов", &view.dormantTime, 1.5f, 20.0f, "%.1f сек");
     toggle("Логи выстрелов на экране", &view.screenLogs);
+    toggle("Ватермарка", &view.watermark);
     toggle("Ровный ESP", &view.syncRender);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Однопоточный рендер (mat_queue_mode 0): ESP рисуется по тому же кадру,\nчто на экране, и не дёргается. Может немного снизить FPS.");
@@ -819,6 +1242,51 @@ void drawWorldGroup() noexcept
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
     ImGui::TextWrapped("Дальность ESP ограничена тем, что присылает сервер. Игроки вне видимости показываются по последней позиции и по звукам шагов/выстрелов.");
     ImGui::PopStyleColor();
+}
+
+void drawEspFlagsSetting() noexcept
+{
+    static constexpr const char* flagNames[]{ "Броня (HK/K)", "Деньги", "Кит / дефьюз", "Скоуп", "Перезарядка",
+        "Ослеплён", "Бомба", "DT заряжен", "Ломает лагкомп", "Режим резольвера", "Убивает (LETHAL)" };
+    multiCombo("Флаги ESP", &config.view.espFlags, flagNames, IM_ARRAYSIZE(flagNames));
+}
+
+void drawEspRageGroup(const ImVec2& size) noexcept
+{
+    auto& view = config.view;
+    if (beginGroup("ESP и рейдж", size)) {
+        drawEspFlagsSetting();
+        toggle("Точки мультипоинта", &view.aimDot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Точки мультипоинта, куда рейдж может выстрелить:\nзелёные — убивает, жёлтые — урон не ниже мин.\nКольцо — выбранная точка, красное — сюда выстрелил.");
+        toggle("Скелет при выстреле", &view.shotCapsules);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Скелет цели в момент выстрела (2.5 с):\nзелёный — попал, красный — мимо, белый — ждём ответа сервера.");
+        toggle("Снаряжение по Tab", &view.tabLoadout);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Иконки оружия, гранат, брони и бомбы/кусачек в строках врагов в таблице (Tab).");
+    }
+    endGroup();
+}
+
+void drawVisualsTab() noexcept
+{
+    auto& view = config.view;
+    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    const float height = ImGui::GetContentRegionAvail().y;
+
+    if (beginGroup("Приколюхи", { width, height })) {
+        toggle("Цифры урона", &view.damageNumbers);
+        toggle("Кольца шагов врагов", &view.footsteps);
+        toggle("Вспышка при убийстве", &view.killFlash);
+        toggle("Таймеры дыма и огня", &view.grenadeTimers);
+        toggle("Круг разброса", &view.spreadCircle);
+        ImGui::Dummy({ 0.0f, 6.0f });
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
+        ImGui::TextWrapped("Флаги ESP, точка прицела, скелет при выстреле и Tab — во вкладке «Визуалы».");
+        ImGui::PopStyleColor();
+    }
+    endGroup();
 }
 
 void drawAutoBuyTab() noexcept
@@ -849,7 +1317,8 @@ void drawMovementTab() noexcept
 
     if (beginGroup("Пик и присед", { width, height })) {
         keybind("Автопик", m.autoPeekKey);
-        toggle("Возврат, когда отпустил WASD", &m.autoPeekOnRelease);
+        static constexpr const char* peekModes[]{ "После выстрела", "Выстрел или отпустил WASD" };
+        combo("Возврат", &m.autoPeekMode, peekModes, IM_ARRAYSIZE(peekModes));
         ImGui::Dummy({ 0.0f, 6.0f });
         keybind("Фейкдак", m.fakeDuckKey);
         if (!tickbase::isInstalled()) {
@@ -860,7 +1329,7 @@ void drawMovementTab() noexcept
 
         ImGui::Dummy({ 0.0f, 6.0f });
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-        ImGui::TextWrapped("Автопик: держи клавишу — точка запоминается, после выстрела персонаж сам бежит назад. Фейкдак на время удержания выключает DT.");
+        ImGui::TextWrapped("Автопик: держи клавишу — точка запоминается, после выстрела персонаж сам бежит назад. С включённым DT — разгон и телепорт назад на его заряде, без DT — просто бег назад. Фейкдак на время удержания выключает DT.");
         ImGui::PopStyleColor();
     }
     endGroup();

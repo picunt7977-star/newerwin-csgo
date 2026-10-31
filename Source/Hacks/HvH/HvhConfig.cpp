@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <charconv>
 #include <string>
 
@@ -21,6 +22,104 @@ static void writeKey(json& j, const char* name, const KeyBind& key)
         j[name] = key.toString();
 }
 
+static void writeStates(json& j, const std::array<AntiAimState, static_cast<int>(AaState::Count)>& states)
+{
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        const auto& st = states[i];
+        auto& js = j[i];
+        js["Override"] = st.override;
+        js["Yaw offset"] = st.yawOffset;
+        js["Add left"] = st.addLeft;
+        js["Add right"] = st.addRight;
+        js["Modifier"] = st.modifier;
+        js["Degree"] = st.degree;
+        js["Ways"] = st.ways;
+        js["Spin speed"] = st.spinSpeed;
+        js["Randomize"] = st.randomize;
+        js["Desync mode"] = st.desyncMode;
+        js["Desync left"] = st.desyncLeft;
+        js["Desync right"] = st.desyncRight;
+        js["Desync invert"] = st.desyncInvert;
+        js["Delay mode"] = st.delayMode;
+        js["Delay ticks"] = st.delayTicks;
+    }
+}
+
+static void readStates(const json& j, std::array<AntiAimState, static_cast<int>(AaState::Count)>& states)
+{
+    if (!j.is_array())
+        return;
+    for (std::size_t i = 0; i < std::min(j.size(), states.size()); ++i) {
+        const auto& js = j[i];
+        auto& st = states[i];
+        read(js, "Override", st.override);
+        read(js, "Yaw offset", st.yawOffset);
+        read(js, "Add left", st.addLeft);
+        read(js, "Add right", st.addRight);
+        read(js, "Modifier", st.modifier);
+        read(js, "Degree", st.degree);
+        read(js, "Ways", st.ways);
+        read(js, "Spin speed", st.spinSpeed);
+        read(js, "Randomize", st.randomize);
+        read(js, "Desync mode", st.desyncMode);
+        read(js, "Desync left", st.desyncLeft);
+        read(js, "Desync right", st.desyncRight);
+        read(js, "Desync invert", st.desyncInvert);
+        read(js, "Delay mode", st.delayMode);
+        read(js, "Delay ticks", st.delayTicks);
+        st.modifier = std::clamp(st.modifier, 0, static_cast<int>(YawModifier::Count) - 1);
+        st.desyncMode = std::clamp(st.desyncMode, 0, static_cast<int>(DesyncMode::Count) - 1);
+        st.delayMode = std::clamp(st.delayMode, 0, static_cast<int>(SwitchDelay::Count) - 1);
+        st.ways = std::clamp(st.ways, 3, 8);
+        st.delayTicks = std::clamp(st.delayTicks, 1, 16);
+    }
+}
+
+static void writeSnaps(json& j, const std::array<DefensiveSnap, static_cast<int>(SnapState::Count)>& snaps)
+{
+    for (std::size_t i = 0; i < snaps.size(); ++i) {
+        const auto& sn = snaps[i];
+        auto& js = j[i];
+        js["Mode"] = sn.mode;
+        js["Pitch"] = sn.pitch;
+        js["Pitch angle"] = sn.pitchAngle;
+        js["Pitch angle 2"] = sn.pitchAngle2;
+        js["Pitch speed"] = sn.pitchSpeed;
+        js["Yaw"] = sn.yaw;
+        js["Yaw angle"] = sn.yawAngle;
+        js["Yaw delay"] = sn.yawDelay;
+        js["Yaw speed"] = sn.yawSpeed;
+        js["Force LC"] = sn.forceLc;
+        js["Duration"] = sn.duration;
+    }
+}
+
+static void readSnaps(const json& j, std::array<DefensiveSnap, static_cast<int>(SnapState::Count)>& snaps)
+{
+    if (!j.is_array())
+        return;
+    for (std::size_t i = 0; i < std::min(j.size(), snaps.size()); ++i) {
+        const auto& js = j[i];
+        auto& sn = snaps[i];
+        read(js, "Mode", sn.mode);
+        read(js, "Pitch", sn.pitch);
+        read(js, "Pitch angle", sn.pitchAngle);
+        read(js, "Pitch angle 2", sn.pitchAngle2);
+        read(js, "Pitch speed", sn.pitchSpeed);
+        read(js, "Yaw", sn.yaw);
+        read(js, "Yaw angle", sn.yawAngle);
+        read(js, "Yaw delay", sn.yawDelay);
+        read(js, "Yaw speed", sn.yawSpeed);
+        read(js, "Force LC", sn.forceLc);
+        read(js, "Duration", sn.duration);
+        sn.mode = std::clamp(sn.mode, 0, 2);
+        sn.pitch = std::clamp(sn.pitch, 0, static_cast<int>(SnapPitch::Count) - 1);
+        sn.yaw = std::clamp(sn.yaw, 0, static_cast<int>(SnapYaw::Count) - 1);
+        sn.duration = std::clamp(sn.duration, 1, 13);
+        sn.yawDelay = std::clamp(sn.yawDelay, 0, 14);
+    }
+}
+
 json toJson() noexcept
 {
     json j;
@@ -37,6 +136,10 @@ json toJson() noexcept
     r["Resolver safe when unsure"] = rage.resolverSafeWhenUnsure;
     r["Resolver steps"] = rage.resolverSteps;
     r["Safe point"] = rage.safePoint;
+    r["Knife bot"] = rage.knifeBot;
+    r["Knife bot mode"] = rage.knifeBotMode;
+    r["Zeus bot"] = rage.zeusBot;
+    r["Zeus hitchance"] = rage.zeusHitchance;
     r["FOV"] = rage.fov;
     writeKey(r, "Min damage override key", rage.minDamageOverrideKey);
     writeKey(r, "Force body key", rage.forceBodyKey);
@@ -65,14 +168,32 @@ json toJson() noexcept
     a["Enabled"] = aa.enabled;
     a["Pitch"] = aa.pitch;
     a["Yaw base"] = aa.yawBase;
-    a["Yaw offset"] = aa.yawOffset;
-    a["Yaw modifier"] = aa.yawModifier;
-    a["Modifier range"] = aa.modifierRange;
-    a["Spin speed"] = aa.spinSpeed;
+    writeStates(a["States"], aa.states);
+    writeSnaps(a["Snaps"], aa.snaps);
+    for (std::size_t i = 0; i < aa.presetRack.size(); ++i) {
+        writeStates(a["Preset rack"][i]["States"], aa.presetRack[i].states);
+        writeSnaps(a["Preset rack"][i]["Snaps"], aa.presetRack[i].snaps);
+    }
+    a["Defensive AA"] = aa.defensiveAa;
+    a["LC triggers"] = aa.lcTriggers;
+    a["LC trigger states"] = aa.lcTriggerStates;
+    a["Anti bruteforce triggers"] = aa.antiBruteTriggers;
+    a["Anti bruteforce mode"] = aa.antiBruteMode;
+    a["Anti bruteforce power"] = aa.antiBrutePower;
+    a["Anti bruteforce order"] = aa.antiBruteOrder;
+    a["Freestand static"] = aa.freestandStatic;
+    a["Edge yaw"] = aa.edgeYaw;
+    writeKey(a, "Edge key", aa.edgeKey);
+    a["Edge static"] = aa.edgeStatic;
+    a["Roll"] = aa.roll;
+    a["Safe head"] = aa.safeHead;
+    a["Legit AA"] = aa.legitAa;
+    a["Naturality"] = aa.naturality;
+    a["Naturality time"] = aa.naturalityTime;
+    writeKey(a, "Manual forward", aa.manualForward);
     a["Desync"] = aa.desync;
-    a["Desync left"] = aa.desyncLeft;
-    a["Desync right"] = aa.desyncRight;
-    a["Desync jitter"] = aa.desyncJitter;
+    a["Anti bruteforce reset"] = aa.antiBruteReset;
+    a["Static on manual"] = aa.staticOnManual;
     a["Defensive"] = aa.defensive;
     a["Defensive fov"] = aa.defensiveFov;
     a["Defensive yaw"] = aa.defensiveYaw;
@@ -104,10 +225,20 @@ json toJson() noexcept
     j["View"]["Dormant time"] = config.view.dormantTime;
     j["View"]["Sync render"] = config.view.syncRender;
     j["View"]["Screen logs"] = config.view.screenLogs;
+    j["View"]["Watermark"] = config.view.watermark;
+    j["View"]["ESP flags"] = config.view.espFlags;
+    j["View"]["Aim dot"] = config.view.aimDot;
+    j["View"]["Tab loadout"] = config.view.tabLoadout;
+    j["View"]["Damage numbers"] = config.view.damageNumbers;
+    j["View"]["Spread circle"] = config.view.spreadCircle;
+    j["View"]["Footsteps"] = config.view.footsteps;
+    j["View"]["Kill flash"] = config.view.killFlash;
+    j["View"]["Grenade timers"] = config.view.grenadeTimers;
+    j["View"]["Shot capsules"] = config.view.shotCapsules;
 
     auto& m = j["Movement"];
     writeKey(m, "Auto peek key", config.movement.autoPeekKey);
-    m["Auto peek on release"] = config.movement.autoPeekOnRelease;
+    m["Auto peek mode"] = config.movement.autoPeekMode;
     writeKey(m, "Fake duck key", config.movement.fakeDuckKey);
     m["Fast ladder"] = config.movement.fastLadder;
     m["Bunny hop"] = config.movement.bunnyHop;
@@ -162,6 +293,10 @@ void fromJson(const json& j) noexcept
         read(r, "Resolver safe when unsure", rage.resolverSafeWhenUnsure);
         read(r, "Resolver steps", rage.resolverSteps);
         read(r, "Safe point", rage.safePoint);
+        read(r, "Knife bot", rage.knifeBot);
+        read(r, "Knife bot mode", rage.knifeBotMode);
+        read(r, "Zeus bot", rage.zeusBot);
+        read(r, "Zeus hitchance", rage.zeusHitchance);
         read(r, "FOV", rage.fov);
         read(r, "Min damage override key", rage.minDamageOverrideKey);
         read(r, "Force body key", rage.forceBodyKey);
@@ -196,14 +331,59 @@ void fromJson(const json& j) noexcept
         read(a, "Enabled", aa.enabled);
         read(a, "Pitch", aa.pitch);
         read(a, "Yaw base", aa.yawBase);
-        read(a, "Yaw offset", aa.yawOffset);
-        read(a, "Yaw modifier", aa.yawModifier);
-        read(a, "Modifier range", aa.modifierRange);
-        read(a, "Spin speed", aa.spinSpeed);
+        // Старый конфиг (до билдера по состояниям): его углы становятся «Общим» состоянием
+        {
+            auto& def = aa.states[static_cast<int>(AaState::Default)];
+            read(a, "Yaw offset", def.yawOffset);
+            read(a, "Yaw modifier", def.modifier);
+            read(a, "Modifier range", def.degree);
+            read(a, "Spin speed", def.spinSpeed);
+            read(a, "Desync left", def.desyncLeft);
+            read(a, "Desync right", def.desyncRight);
+            bool oldJitter = false;
+            read(a, "Desync jitter", oldJitter);
+            if (a.contains("Desync jitter"))
+                def.desyncMode = static_cast<int>(oldJitter ? DesyncMode::Jitter : DesyncMode::Static);
+            // старый «5-way» (±½ и ±¼ диапазона) — ровно N-way на 5 с тем же размахом: ways по умолчанию 5
+        }
+        if (a.contains("States"))
+            readStates(a["States"], aa.states);
+        if (a.contains("Snaps"))
+            readSnaps(a["Snaps"], aa.snaps);
+        aa.presetRack.clear();
+        if (a.contains("Preset rack") && a["Preset rack"].is_array()) {
+            for (const auto& jp : a["Preset rack"]) {
+                AntiAimPreset preset;
+                if (jp.contains("States"))
+                    readStates(jp["States"], preset.states);
+                if (jp.contains("Snaps"))
+                    readSnaps(jp["Snaps"], preset.snaps);
+                aa.presetRack.push_back(preset);
+            }
+        }
+        read(a, "Defensive AA", aa.defensiveAa);
+        read(a, "LC triggers", aa.lcTriggers);
+        read(a, "LC trigger states", aa.lcTriggerStates);
+        read(a, "Anti bruteforce triggers", aa.antiBruteTriggers);
+        read(a, "Anti bruteforce mode", aa.antiBruteMode);
+        aa.antiBruteMode = std::clamp(aa.antiBruteMode, 0, 2);
+        read(a, "Anti bruteforce power", aa.antiBrutePower);
+        read(a, "Anti bruteforce order", aa.antiBruteOrder);
+        read(a, "Freestand static", aa.freestandStatic);
+        read(a, "Edge yaw", aa.edgeYaw);
+        read(a, "Edge key", aa.edgeKey);
+        read(a, "Edge static", aa.edgeStatic);
+        read(a, "Roll", aa.roll);
+        aa.roll = std::clamp(aa.roll, -50, 50);
+        read(a, "Safe head", aa.safeHead);
+        aa.safeHead = std::clamp(aa.safeHead, 0, 2);
+        read(a, "Legit AA", aa.legitAa);
+        read(a, "Naturality", aa.naturality);
+        read(a, "Naturality time", aa.naturalityTime);
+        read(a, "Manual forward", aa.manualForward);
         read(a, "Desync", aa.desync);
-        read(a, "Desync left", aa.desyncLeft);
-        read(a, "Desync right", aa.desyncRight);
-        read(a, "Desync jitter", aa.desyncJitter);
+        read(a, "Anti bruteforce reset", aa.antiBruteReset);
+        read(a, "Static on manual", aa.staticOnManual);
         read(a, "Defensive", aa.defensive);
         read(a, "Defensive fov", aa.defensiveFov);
         read(a, "Defensive yaw", aa.defensiveYaw);
@@ -245,12 +425,27 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Dormant time", config.view.dormantTime);
         read(j["View"], "Sync render", config.view.syncRender);
         read(j["View"], "Screen logs", config.view.screenLogs);
+        read(j["View"], "Watermark", config.view.watermark);
+        read(j["View"], "ESP flags", config.view.espFlags);
+        read(j["View"], "Aim dot", config.view.aimDot);
+        read(j["View"], "Tab loadout", config.view.tabLoadout);
+        read(j["View"], "Damage numbers", config.view.damageNumbers);
+        read(j["View"], "Spread circle", config.view.spreadCircle);
+        read(j["View"], "Footsteps", config.view.footsteps);
+        read(j["View"], "Kill flash", config.view.killFlash);
+        read(j["View"], "Grenade timers", config.view.grenadeTimers);
+        read(j["View"], "Shot capsules", config.view.shotCapsules);
     }
 
     if (j.contains("Movement") && j["Movement"].is_object()) {
         const auto& m = j["Movement"];
         read(m, "Auto peek key", config.movement.autoPeekKey);
-        read(m, "Auto peek on release", config.movement.autoPeekOnRelease);
+        // старый конфиг: флаг «возврат по отпусканию WASD» → режим
+        bool onRelease = false;
+        read(m, "Auto peek on release", onRelease);
+        config.movement.autoPeekMode = onRelease ? static_cast<int>(AutoPeekMode::ShotOrRelease) : static_cast<int>(AutoPeekMode::Shot);
+        read(m, "Auto peek mode", config.movement.autoPeekMode);
+        config.movement.autoPeekMode = std::clamp(config.movement.autoPeekMode, 0, 1);
         read(m, "Fake duck key", config.movement.fakeDuckKey);
         read(m, "Fast ladder", config.movement.fastLadder);
         read(m, "Bunny hop", config.movement.bunnyHop);

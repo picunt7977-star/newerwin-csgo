@@ -2,6 +2,7 @@
 #include "Hacks/HvH/Movement.h"
 #include "Hacks/HvH/Ragebot.h"
 #include "Hacks/HvH/HvhGui.h"
+#include "Hacks/HvH/HvhVisuals.h"
 #include "Hacks/HvH/Tickbase.h"
 #include "GlobalContext.h"
 
@@ -129,9 +130,11 @@ void GlobalContext::renderFrame()
         features->visuals.drawMolotovHull(ImGui::GetBackgroundDrawList());
         features->misc.watermark();
         hvh::gui::drawIndicators(ImGui::GetBackgroundDrawList());
+        hvh::gui::drawWatermark(ImGui::GetBackgroundDrawList());
         hvh::movement::draw(ImGui::GetBackgroundDrawList());
         hvh::ragebot::drawLogs(ImGui::GetBackgroundDrawList());
         hvh::grenade::draw(ImGui::GetBackgroundDrawList());
+        hvh::visuals::draw(ImGui::GetBackgroundDrawList(), memory->globalVars->realtime);
 
         features->aimbot.updateInput(*config);
         features->visuals.updateInput();

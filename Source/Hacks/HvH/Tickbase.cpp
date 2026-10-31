@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -44,6 +45,12 @@ int rechargeDelay = 0;
 bool shotPending = false;
 bool shiftRequested = false;
 bool shifting = false;
+bool holdShot = false;
+bool sendNext = false;
+int maxTickBase = 0;
+int lagCompLeft = 0;
+int shiftWindow = 0;            // тиков после нашего сдвига, пока сервер ещё не прислал откат тикбейса
+int breakLcFrames = 0;          // AA просил ломать лагкомп недавно — заряд нужен
 
 std::uint8_t* find(std::span<const std::byte> code, const std::uint8_t* pattern, std::size_t size) noexcept
 {
@@ -88,11 +95,12 @@ void setSendPacket(bool value) noexcept
     return active && !fakeDuck && ex.doubleTap && (!ex.doubleTapKey.isSet() || ex.doubleTapKey.isToggled());
 }
 
-// заряд нужен и для DT, и для телепорта/дефенсива
+// заряд нужен и для DT, и для телепорта/дефенсива. Автопик своего заряда не копит: телепорт на
+// возврате берёт заряд DT, только если DT включён (иначе назначенная клавиша автопика держала DT всегда)
 [[nodiscard]] bool wantCharge() noexcept
 {
     const auto& ex = config.exploits;
-    return wantDoubleTap() || (active && !fakeDuck && (ex.teleportKey.isSet() || ex.defensive));
+    return wantDoubleTap() || (active && !fakeDuck && (ex.teleportKey.isSet() || ex.defensive || breakLcFrames > 0));
 }
 
 [[nodiscard]] int chokeLimit() noexcept
@@ -135,15 +143,19 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         charged = 0;
     } else if (rechargeDelay > 0) {
         --rechargeDelay;
-    } else if (charged < maxShift && !shotPending && !shiftRequested) {
+    } else if (charged < maxShift && !shotPending && !shiftRequested && !(holdShot && charged >= 4)) {
+        // (на выглядывании с автопиком, если на телепорт уже хватает, не замираем ради полного заряда)
         // зарядка: пропускаем тик, команда не создаётся — сервер потом примет пачку
         ++charged;
         return;
     }
 
-    setSendPacket(choked >= chokeLimit() || choked >= 14);
+    // выстрел (или тик сразу после него) в чоке не держим; фейкдаку чок нужен целиком
+    setSendPacket((sendNext && !fakeDuck) || choked >= chokeLimit() || choked >= 14);
+    sendNext = false;
     callOriginal(extraSamples, finalTick);
 
+    // DT сдвигает сразу на выстреле — второй выстрел не ждёт (с автопиком возврат идёт в этих же командах)
     if (((shotPending && wantDoubleTap()) || shiftRequested) && charged > 0) {
         // сдвиг: прогоняем заряженные тики подряд, уходят одним пакетом с последним
         shifting = true;
@@ -154,6 +166,11 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         }
         shifting = false;
         rechargeDelay = 16;
+        shiftWindow = 3;
+    } else if (shotPending && rechargeDelay > 2) {
+        // Второй выстрел DT уже ушёл (сдвиг был недавно, заряд пуст) — ждать остаток 16 тиков незачем:
+        // следующий выстрел всё равно через перезарядку оружия. Заряд снова готов через ~16 тиков, а не ~30.
+        rechargeDelay = 2;
     }
     shotPending = false;
     shiftRequested = false;
@@ -168,7 +185,7 @@ bool install(std::span<const std::byte> engineCode) noexcept
 
     const auto function = find(engineCode, clMovePrologue, sizeof(clMovePrologue));
     if (!function) {
-        std::fputs("[csgo-hvh] CL_Move не найден — DT и десинк выключены\n", stderr);
+        std::fputs("[newerwin] CL_Move не найден — DT и десинк выключены\n", stderr);
         return false;
     }
 
@@ -181,7 +198,7 @@ bool install(std::span<const std::byte> engineCode) noexcept
         }
     }
     if (!imm) {
-        std::fputs("[csgo-hvh] bSendPacket не найден — DT и десинк выключены\n", stderr);
+        std::fputs("[newerwin] bSendPacket не найден — DT и десинк выключены\n", stderr);
         return false;
     }
 
@@ -246,6 +263,13 @@ int chokedCommands() noexcept
 void onShot() noexcept
 {
     shotPending = true;
+    // если тик выстрела уже был в чоке — отправляем его со следующим, не ждём конца фейклага
+    sendNext = true;
+}
+
+void sendNextPacket() noexcept
+{
+    sendNext = true;
 }
 
 void requestShift() noexcept
@@ -264,14 +288,56 @@ int chargedTicks() noexcept
     return charged;
 }
 
+bool doubleTapEnabled() noexcept
+{
+    return wantDoubleTap();
+}
+
 bool isCharged() noexcept
 {
     return charged >= std::clamp(config.exploits.shiftTicks, 1, 14);
 }
 
+void holdShotShift(bool hold) noexcept
+{
+    holdShot = hold;
+}
+
 void setActive(bool value) noexcept
 {
     active = value;
+    if (!value) {
+        maxTickBase = 0;
+        lagCompLeft = 0;
+        shiftWindow = 0;
+        breakLcFrames = 0;
+    }
+}
+
+void updateLagComp(int tickBase) noexcept
+{
+    // большой скачок — респаун/смена карты/реконнект, а не дефенсив
+    if (std::abs(tickBase - maxTickBase) > 64)
+        maxTickBase = 0;
+    maxTickBase = std::max(maxTickBase, tickBase);
+    lagCompLeft = std::clamp(maxTickBase - tickBase - 1, 0, 14);
+    if (shiftWindow > 0)
+        --shiftWindow;
+    if (breakLcFrames > 0)
+        --breakLcFrames;
+}
+
+int defensiveTicksLeft() noexcept
+{
+    return std::max(lagCompLeft, shiftWindow);
+}
+
+void requestBreakLc() noexcept
+{
+    breakLcFrames = 8;
+    // уже в окне — второй сдвиг ничего не добавит, только потратит заряд
+    if (defensiveTicksLeft() == 0 && isCharged() && !shifting)
+        shiftRequested = true;
 }
 
 }

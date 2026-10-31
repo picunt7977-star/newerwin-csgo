@@ -17,6 +17,7 @@ struct UserCmd {
         IN_MOVERIGHT = 1 << 10,
         IN_ATTACK2 = 1 << 11,
         IN_SCORE = 1 << 16,
+        IN_SPEED = 1 << 17,     // шаг (shift)
         IN_BULLRUSH = 1 << 22
     };
     void* vmt;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Сборка и подсказка по запуску ECLIPSE (CS:GO legacy, Linux, только -insecure)
+# Сборка и подсказка по запуску newerwin (CS:GO legacy, Linux, только -insecure)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"

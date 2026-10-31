@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -169,6 +170,9 @@ struct Mesh {
     std::vector<Matrix> poseToBone;
     std::vector<std::uint8_t> triangleImage;  // индекс в images для каждого треугольника
     std::vector<Image> images;                // базовые текстуры материалов (может быть пусто)
+    // стойка из главного меню (idle с ножом из animset_uiplayer_loadout): кость->модель на каждый кадр
+    std::vector<std::vector<Matrix>> idleFrames;
+    float idleFps = 30.0f;
 };
 
 template <typename T>
@@ -388,6 +392,224 @@ void loadTextures(const Vpk& vpk, const std::string& mdl, Mesh& mesh) noexcept
     }
 }
 
+// ---------- анимация главного меню: студийная анимация Source (mstudioanim_t), только целые кадры ----------
+
+struct BoneInfo {
+    std::string name;
+    std::int32_t parent = -1;
+    float pos[3]{};
+    float quat[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
+    float rot[3]{};
+    float posScale[3]{};
+    float rotScale[3]{};
+};
+
+[[nodiscard]] std::vector<BoneInfo> readBones(const std::string& mdl) noexcept
+{
+    std::int32_t numBones = 0, boneIndex = 0;
+    if (!get(mdl, 156, numBones) || !get(mdl, 160, boneIndex) || numBones <= 0 || numBones > MAXSTUDIOBONES)
+        return {};
+    std::vector<BoneInfo> bones(numBones);
+    for (int i = 0; i < numBones; ++i) {
+        const std::size_t o = boneIndex + 216 * static_cast<std::size_t>(i);
+        std::int32_t nameOffset = 0;
+        auto& bone = bones[i];
+        if (!get(mdl, o, nameOffset) || !get(mdl, o + 4, bone.parent) || !get(mdl, o + 32, bone.pos) || !get(mdl, o + 44, bone.quat)
+            || !get(mdl, o + 60, bone.rot) || !get(mdl, o + 72, bone.posScale) || !get(mdl, o + 84, bone.rotScale))
+            return {};
+        bone.name = readCString(mdl, o + nameOffset);
+        if (bone.parent >= i)
+            bone.parent = -1;
+    }
+    return bones;
+}
+
+[[nodiscard]] float halfToFloat(std::uint16_t h) noexcept
+{
+    const int exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+    float value = exponent == 0 ? std::ldexp(static_cast<float>(mantissa), -24)
+        : exponent == 31 ? 0.0f : std::ldexp(static_cast<float>(mantissa | 0x400), exponent - 25);
+    return (h & 0x8000) ? -value : value;
+}
+
+void quaternionMatrix(const float q[4], const float p[3], Matrix& m) noexcept
+{
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    m.m[0][0] = 1.0f - 2.0f * y * y - 2.0f * z * z; m.m[0][1] = 2.0f * x * y - 2.0f * w * z; m.m[0][2] = 2.0f * x * z + 2.0f * w * y; m.m[0][3] = p[0];
+    m.m[1][0] = 2.0f * x * y + 2.0f * w * z; m.m[1][1] = 1.0f - 2.0f * x * x - 2.0f * z * z; m.m[1][2] = 2.0f * y * z - 2.0f * w * x; m.m[1][3] = p[1];
+    m.m[2][0] = 2.0f * x * z - 2.0f * w * y; m.m[2][1] = 2.0f * y * z + 2.0f * w * x; m.m[2][2] = 1.0f - 2.0f * x * x - 2.0f * y * y; m.m[2][3] = p[2];
+}
+
+[[nodiscard]] Matrix concat(const Matrix& a, const Matrix& b) noexcept
+{
+    Matrix r;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 4; ++j)
+            r.m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] + a.m[i][2] * b.m[2][j] + (j == 3 ? a.m[i][3] : 0.0f);
+    }
+    return r;
+}
+
+// значение из RLE-потока mstudioanimvalue_t на кадре frame
+[[nodiscard]] float animValue(const std::string& data, std::size_t p, int frame, float scale) noexcept
+{
+    int k = frame;
+    for (int guard = 0; guard < 4096; ++guard) {
+        std::uint8_t valid = 0, total = 0;
+        if (!get(data, p, valid) || !get(data, p + 1, total) || total == 0)
+            return 0.0f;
+        if (total > k) {
+            std::int16_t value = 0;
+            get(data, p + 2 * (valid > k ? k + 1 : valid), value);
+            return value * scale;
+        }
+        k -= total;
+        p += 2 * (valid + 1);
+    }
+    return 0.0f;
+}
+
+// Кадры последовательности seqName из animMdl, наложенные на кости модели (сопоставление по имени).
+// Кости без анимации стоят в своей базовой позе — как в движке (CalcVirtualAnimation).
+[[nodiscard]] std::vector<std::vector<Matrix>> bakeSequence(const std::string& animMdl, const std::vector<BoneInfo>& animBones,
+    const std::vector<BoneInfo>& bones, std::string_view seqName, float& fps) noexcept
+{
+    std::int32_t numSeq = 0, seqIndex = 0, animIndex = 0, numAnim = 0;
+    if (!get(animMdl, 188, numSeq) || !get(animMdl, 192, seqIndex) || !get(animMdl, 184, animIndex) || !get(animMdl, 180, numAnim))
+        return {};
+    std::size_t animDesc = 0;
+    for (int k = 0; k < numSeq && !animDesc; ++k) {
+        const std::size_t o = seqIndex + 212 * static_cast<std::size_t>(k);
+        std::int32_t label = 0, indexIndex = 0;
+        if (!get(animMdl, o + 4, label) || readCString(animMdl, o + label) != seqName || !get(animMdl, o + 60, indexIndex))
+            continue;
+        std::int16_t anim = -1;
+        if (get(animMdl, o + indexIndex, anim) && anim >= 0 && anim < numAnim)
+            animDesc = animIndex + 100 * static_cast<std::size_t>(anim);
+    }
+    std::int32_t numFrames = 0, animBlock = 0, dataIndex = 0, sectionIndex = 0, sectionFrames = 0;
+    if (!animDesc || !get(animMdl, animDesc + 8, fps) || !get(animMdl, animDesc + 16, numFrames) || !get(animMdl, animDesc + 52, animBlock)
+        || !get(animMdl, animDesc + 56, dataIndex) || !get(animMdl, animDesc + 80, sectionIndex) || !get(animMdl, animDesc + 84, sectionFrames)
+        || numFrames <= 0 || numFrames > 2000 || animBlock != 0)
+        return {};
+    if (!(fps > 1.0f && fps < 120.0f))
+        fps = 30.0f;
+
+    std::vector<int> toTarget(animBones.size(), -1);
+    for (std::size_t a = 0; a < animBones.size(); ++a) {
+        for (std::size_t b = 0; b < bones.size(); ++b) {
+            if (animBones[a].name == bones[b].name) {
+                toTarget[a] = static_cast<int>(b);
+                break;
+            }
+        }
+    }
+
+    std::vector<std::vector<Matrix>> frames;
+    frames.reserve(numFrames);
+    std::vector<std::array<float, 3>> pos(bones.size());
+    std::vector<std::array<float, 4>> quat(bones.size());
+    for (int frame = 0; frame < numFrames; ++frame) {
+        for (std::size_t b = 0; b < bones.size(); ++b) {
+            std::memcpy(pos[b].data(), bones[b].pos, sizeof(bones[b].pos));
+            std::memcpy(quat[b].data(), bones[b].quat, sizeof(bones[b].quat));
+        }
+        int local = frame;
+        std::size_t p = animDesc + dataIndex;
+        if (sectionFrames > 0) {
+            const int section = frame / sectionFrames;
+            local = frame - section * sectionFrames;
+            std::int32_t block = 0, index = 0;
+            if (!get(animMdl, animDesc + sectionIndex + 8 * static_cast<std::size_t>(section), block)
+                || !get(animMdl, animDesc + sectionIndex + 8 * static_cast<std::size_t>(section) + 4, index) || block != 0)
+                return {};
+            p = animDesc + index;
+        }
+        for (std::size_t guard = 0; guard <= animBones.size(); ++guard) {
+            std::uint8_t boneNumber = 0, flags = 0;
+            std::int16_t next = 0;
+            if (!get(animMdl, p, boneNumber) || !get(animMdl, p + 1, flags) || !get(animMdl, p + 2, next) || boneNumber >= animBones.size())
+                break;
+            const auto& bone = animBones[boneNumber];
+            const int target = toTarget[boneNumber];
+            std::size_t d = p + 4;
+            float q[4]{}, v[3]{};
+            bool haveQuat = false, havePos = false;
+            if (flags & 0x02) {   // Quaternion48
+                std::uint16_t raw[3];
+                if (get(animMdl, d, raw)) {
+                    q[0] = (raw[0] - 32768) / 32768.0f;
+                    q[1] = (raw[1] - 32768) / 32768.0f;
+                    q[2] = ((raw[2] & 0x7FFF) - 16384) / 16384.0f;
+                    q[3] = std::sqrt(std::max(0.0f, 1.0f - q[0] * q[0] - q[1] * q[1] - q[2] * q[2])) * ((raw[2] & 0x8000) ? -1.0f : 1.0f);
+                    haveQuat = true;
+                }
+                d += 6;
+            }
+            if (flags & 0x20) {   // Quaternion64
+                std::uint64_t raw = 0;
+                if (get(animMdl, d, raw)) {
+                    for (int i = 0; i < 3; ++i)
+                        q[i] = (static_cast<float>((raw >> (21 * i)) & 0x1FFFFF) - 1048576.0f) / 1048576.5f;
+                    q[3] = std::sqrt(std::max(0.0f, 1.0f - q[0] * q[0] - q[1] * q[1] - q[2] * q[2])) * ((raw >> 63) ? -1.0f : 1.0f);
+                    haveQuat = true;
+                }
+                d += 8;
+            }
+            if (flags & 0x01) {   // Vector48
+                std::uint16_t raw[3];
+                if (get(animMdl, d, raw)) {
+                    for (int i = 0; i < 3; ++i)
+                        v[i] = halfToFloat(raw[i]);
+                    havePos = true;
+                }
+                d += 6;
+            }
+            const bool delta = flags & 0x10;
+            if (flags & 0x08) {   // углы RLE: значение * rotscale (+ базовый поворот кости)
+                std::int16_t offsets[3]{};
+                get(animMdl, d, offsets);
+                float angle[3];
+                for (int i = 0; i < 3; ++i)
+                    angle[i] = (offsets[i] > 0 ? animValue(animMdl, d + offsets[i], local, bone.rotScale[i]) : 0.0f) + (delta ? 0.0f : bone.rot[i]);
+                const float sy = std::sin(angle[2] * 0.5f), cy = std::cos(angle[2] * 0.5f);
+                const float sp = std::sin(angle[1] * 0.5f), cp = std::cos(angle[1] * 0.5f);
+                const float sr = std::sin(angle[0] * 0.5f), cr = std::cos(angle[0] * 0.5f);
+                q[0] = sr * cp * cy - cr * sp * sy;
+                q[1] = cr * sp * cy + sr * cp * sy;
+                q[2] = cr * cp * sy - sr * sp * cy;
+                q[3] = cr * cp * cy + sr * sp * sy;
+                haveQuat = true;
+                d += 6;
+            }
+            if (flags & 0x04) {   // позиция RLE
+                std::int16_t offsets[3]{};
+                get(animMdl, d, offsets);
+                for (int i = 0; i < 3; ++i)
+                    v[i] = (offsets[i] > 0 ? animValue(animMdl, d + offsets[i], local, bone.posScale[i]) : 0.0f) + (delta ? 0.0f : bone.pos[i]);
+                havePos = true;
+            }
+            if (target >= 0 && !delta) {
+                if (haveQuat)
+                    std::memcpy(quat[target].data(), q, sizeof(q));
+                if (havePos)
+                    std::memcpy(pos[target].data(), v, sizeof(v));
+            }
+            if (next <= 0)
+                break;
+            p += next;
+        }
+        std::vector<Matrix> world(bones.size());
+        for (std::size_t b = 0; b < bones.size(); ++b) {
+            Matrix local;
+            quaternionMatrix(quat[b].data(), pos[b].data(), local);
+            world[b] = bones[b].parent >= 0 ? concat(world[bones[b].parent], local) : local;
+        }
+        frames.push_back(std::move(world));
+    }
+    return frames;
+}
+
 [[nodiscard]] std::shared_ptr<Mesh> loadMesh(const Vpk& vpk, const std::string& modelPath, int body) noexcept
 {
     const auto stem = modelPath.substr(0, modelPath.size() - 4);  // без «.mdl»
@@ -528,6 +750,17 @@ void loadTextures(const Vpk& vpk, const std::string& mdl, Mesh& mesh) noexcept
     if (mesh->triangles.empty())
         return nullptr;
     loadTextures(vpk, mdl, *mesh);
+
+    // стойка как в главном меню: у CT и T свои idle с ножом
+    {
+        static const std::string animMdl = vpk.read("models/player/custom_player/uiplayer/animset_uiplayer_loadout.mdl");
+        static const auto animBones = readBones(animMdl);
+        const auto bones = readBones(mdl);
+        if (!animBones.empty() && static_cast<int>(bones.size()) == numBones) {
+            const bool ct = modelPath.find("/ctm_") != std::string::npos;
+            mesh->idleFrames = bakeSequence(animMdl, animBones, bones, ct ? "ct_loadout_knife_idle1" : "t_loadout_knife_idle1", mesh->idleFps);
+        }
+    }
     return mesh;
 }
 
@@ -680,13 +913,52 @@ void captureMenu(bool pin) noexcept
     }
     Snapshot result;
     {
-        // главное меню: выбранный агент (или модель по умолчанию) в базовой позе
+        // выбранный агент (или модель по умолчанию) в стойке из главного меню, анимация идёт по кругу
         if (auto mesh = requestMesh(modelPath, 0)) {
-            result.positions.reserve(mesh->vertices.size());
-            for (const auto& vertex : mesh->vertices) {
-                // в позе привязки: y — вверх, z — вперёд, x — вбок
-                result.positions.push_back({ vertex.position.z, vertex.position.x, vertex.position.y });
-                result.normals.push_back({ vertex.normal.z, vertex.normal.x, vertex.normal.y });
+            const int numBones = static_cast<int>(mesh->poseToBone.size());
+            if (const int numFrames = static_cast<int>(mesh->idleFrames.size()); numFrames > 1) {
+                // между кадрами — линейно: анимация 30 к/с, меню рисуется чаще
+                const double time = static_cast<double>(nowMs()) / 1000.0 * mesh->idleFps;
+                const int frame = static_cast<int>(std::fmod(time, static_cast<double>(numFrames)));
+                const float t = static_cast<float>(time - std::floor(time));
+                const auto& a = mesh->idleFrames[frame];
+                const auto& b = mesh->idleFrames[(frame + 1) % numFrames];
+                static Matrix skin[MAXSTUDIOBONES];
+                for (int i = 0; i < numBones; ++i) {
+                    Matrix boneToModel;
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c)
+                            boneToModel.m[r][c] = a[i].m[r][c] + (b[i].m[r][c] - a[i].m[r][c]) * t;
+                    }
+                    skin[i] = concat(boneToModel, mesh->poseToBone[i]);
+                }
+                result.positions.resize(mesh->vertices.size());
+                result.normals.resize(mesh->vertices.size());
+                for (std::size_t v = 0; v < mesh->vertices.size(); ++v) {
+                    const auto& vertex = mesh->vertices[v];
+                    csgo::Vector position{}, normal{};
+                    for (int k = 0; k < vertex.numBones; ++k) {
+                        const auto& m = skin[vertex.bone[k]].m;
+                        const float w = vertex.weight[k];
+                        const auto& p = vertex.position;
+                        const auto& n = vertex.normal;
+                        position.x += w * (m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3]);
+                        position.y += w * (m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3]);
+                        position.z += w * (m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3]);
+                        normal.x += w * (m[0][0] * n.x + m[0][1] * n.y + m[0][2] * n.z);
+                        normal.y += w * (m[1][0] * n.x + m[1][1] * n.y + m[1][2] * n.z);
+                        normal.z += w * (m[2][0] * n.x + m[2][1] * n.y + m[2][2] * n.z);
+                    }
+                    result.positions[v] = position;
+                    result.normals[v] = normal;
+                }
+            } else {
+                result.positions.reserve(mesh->vertices.size());
+                for (const auto& vertex : mesh->vertices) {
+                    // в позе привязки: y — вверх, z — вперёд, x — вбок
+                    result.positions.push_back({ vertex.position.z, vertex.position.x, vertex.position.y });
+                    result.normals.push_back({ vertex.normal.z, vertex.normal.x, vertex.normal.y });
+                }
             }
             result.mesh = std::move(mesh);
         }

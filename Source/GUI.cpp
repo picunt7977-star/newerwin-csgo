@@ -41,6 +41,7 @@
 #include "Hacks/HvH/AntiAim.h"
 #include "Hacks/HvH/HvhConfig.h"
 #include "Hacks/HvH/HvhGui.h"
+#include "Hacks/HvH/HvhVisuals.h"
 #include "Hacks/HvH/ModelPreview.h"
 
 #include "Hooks.h"
@@ -109,6 +110,11 @@ GUI::GUI() noexcept
     hvh::ui::fonts.regular = fonts.normal15px;
     hvh::ui::fonts.bold = addFontFromVFONT("csgo/panorama/fonts/notosans-bold.vfont", 15.0f, Helpers::getFontGlyphRanges(), false);
     hvh::ui::fonts.logo = addFontFromVFONT("csgo/panorama/fonts/notosans-bold.vfont", 28.0f, io.Fonts->GetGlyphRangesDefault(), false);
+    // меню в стиле gamesense — мелкий шрифт рисунка Verdana (DejaVu Sans из неё и вырос); нет файла — обычный
+    if (std::filesystem::exists("/usr/share/fonts/TTF/DejaVuSans.ttf"))
+        hvh::ui::fonts.menu = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/TTF/DejaVuSans.ttf", 12.0f, nullptr, Helpers::getFontGlyphRanges());
+    if (std::filesystem::exists("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"))
+        hvh::ui::fonts.menuBold = io.Fonts->AddFontFromFileTTF("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 12.0f, nullptr, Helpers::getFontGlyphRanges());
     hvh::ui::applyStyle();
 }
 
@@ -658,15 +664,6 @@ constexpr TabInfo tabs[]{
 
 Tab currentTab = Tab::Rage;
 
-void sectionLabel(const char* text) noexcept
-{
-    ImGui::Dummy({ 0.0f, 4.0f });
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(IM_COL32(80, 86, 102, 255)));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f);
-    ImGui::TextUnformatted(text);
-    ImGui::PopStyleColor();
-}
-
 // старые вкладки Osiris внутри группы новой темы
 template <typename Draw>
 void legacyGroup(const char* title, Draw draw) noexcept
@@ -695,7 +692,8 @@ void legacyGroupSized(const char* title, const ImVec2& size, Draw draw) noexcept
     return ImGui::ColorConvertFloat4ToU32({ c[0], c[1], c[2], c[3] * alphaScale });
 }
 
-// Упрощённые чамсы: слой 1 — сквозь стены (цвет 1), слой 2 — видимая часть (цвет 2), один материал
+// Упрощённые чамсы. Слои: 0 — сквозь стены, 1 — видимая часть (вместо обычной модели),
+// 2 — свечение поверх видимой, 3 — свечение сквозь стены. У стены и видимой части свой материал.
 template <typename Advanced>
 void simpleChams(Config& config, Advanced advancedUi) noexcept
 {
@@ -709,21 +707,86 @@ void simpleChams(Config& config, Advanced advancedUi) noexcept
     auto& layers = config.getFeatures().chams.chamsMaterials[target].materials;
     auto& hidden = layers[0];
     auto& visible = layers[1];
-
-    // два слоя включаются отдельно: раньше общий переключатель показывал «вкл», когда работал только один
-    toggle("Сквозь стены", &hidden.enabled);
-    toggle("Видимые", &visible.enabled);
+    auto& glow = layers[2];
+    auto& glowHidden = layers[3];
     hidden.ignorez = true;
     visible.ignorez = false;
+    glow.ignorez = false;
+    glowHidden.ignorez = true;
+    glow.material = glowHidden.material = ChamsMaterial::Glow;
+    // свечение без видимого слоя рисуется поверх обычной модели, а не вместо неё
+    glow.cover = !visible.enabled;
+
+    const auto setColor = [](ChamsLayer& layer, float r, float g, float b, float a) {
+        layer.color.color = { r, g, b, a };
+        layer.color.rainbow = false;
+        layer.healthBased = false;
+        layer.wireframe = false;
+        layer.blinking = false;
+    };
+    // Готовые наборы — чтобы не собирать вид руками из 13 материалов
+    ImGui::TextDisabled("Пресет");
+    if (pill("Неон", false)) {
+        hidden.enabled = visible.enabled = glow.enabled = true;
+        glowHidden.enabled = false;
+        hidden.material = ChamsMaterial::Flat;
+        visible.material = ChamsMaterial::Metallic;
+        setColor(hidden, 0.55f, 0.35f, 1.0f, 0.55f);
+        setColor(visible, 0.62f, 0.45f, 1.0f, 1.0f);
+        setColor(glow, 0.80f, 0.60f, 1.0f, 0.85f);
+    }
+    ImGui::SameLine(0.0f, 6.0f);
+    if (pill("Мягкий", false)) {
+        hidden.enabled = visible.enabled = glow.enabled = true;
+        glowHidden.enabled = false;
+        hidden.material = ChamsMaterial::Flat;
+        visible.material = ChamsMaterial::Normal;
+        setColor(hidden, 0.30f, 0.62f, 1.0f, 0.40f);
+        setColor(visible, 0.85f, 0.92f, 1.0f, 1.0f);
+        setColor(glow, 0.45f, 0.75f, 1.0f, 0.60f);
+    }
+    ImGui::SameLine(0.0f, 6.0f);
+    if (pill("Призрак", false)) {
+        hidden.enabled = false;
+        visible.enabled = glow.enabled = glowHidden.enabled = true;
+        visible.material = ChamsMaterial::Glass;
+        setColor(visible, 0.70f, 0.90f, 1.0f, 0.35f);
+        setColor(glow, 0.55f, 0.85f, 1.0f, 0.90f);
+        setColor(glowHidden, 0.55f, 0.85f, 1.0f, 0.60f);
+    }
+    ImGui::SameLine(0.0f, 6.0f);
+    if (pill("Классика", false)) {
+        hidden.enabled = visible.enabled = true;
+        glow.enabled = glowHidden.enabled = false;
+        hidden.material = visible.material = ChamsMaterial::Flat;
+        setColor(hidden, 1.0f, 0.0f, 0.0f, 1.0f);
+        setColor(visible, 0.25f, 1.0f, 0.0f, 1.0f);
+    }
+    ImGui::Dummy({ 0.0f, 4.0f });
 
     static constexpr const char* materials[]{ "Обычный", "Плоский", "Анимированный", "Платина", "Стекло", "Кристалл", "Хром", "Серебро", "Золото", "Пластик", "Свечение", "Перламутр", "Металлик" };
-    int material = static_cast<int>(visible.material);
-    if (combo("Вид чамсов", &material, materials, IM_ARRAYSIZE(materials)))
-        hidden.material = visible.material = static_cast<ChamsMaterial>(material);
-    hidden.material = visible.material;
+    const auto materialCombo = [&](const char* label, ChamsLayer& layer) {
+        int material = static_cast<int>(layer.material);
+        if (combo(label, &material, materials, IM_ARRAYSIZE(materials)))
+            layer.material = static_cast<ChamsMaterial>(material);
+    };
 
-    colorEdit("Цвет 1 (за стеной)", hidden.color.color.data());
-    colorEdit("Цвет 2 (видимый)", visible.color.color.data());
+    toggle("Сквозь стены", &hidden.enabled);
+    if (hidden.enabled) {
+        materialCombo("Материал за стеной", hidden);
+        colorEdit("Цвет за стеной", hidden.color.color.data());
+    }
+    toggle("Видимые", &visible.enabled);
+    if (visible.enabled) {
+        materialCombo("Материал видимых", visible);
+        colorEdit("Цвет видимых", visible.color.color.data());
+    }
+    toggle("Свечение поверх", &glow.enabled);
+    if (glow.enabled)
+        colorEdit("Цвет свечения (прозрачность = сила)", glow.color.color.data());
+    toggle("Свечение сквозь стены", &glowHidden.enabled);
+    if (glowHidden.enabled)
+        colorEdit("Цвет свечения за стеной", glowHidden.color.color.data());
 
     ImGui::Dummy({ 0.0f, 6.0f });
     static bool advanced = false;
@@ -788,6 +851,9 @@ void playerPreview(Config& config) noexcept
         boxMin = { center.x - shoulder - unit * 0.9f, top - unit * 0.15f };
         boxMax = { center.x + shoulder + unit * 0.9f, top + h + unit * 0.3f };
     }
+
+    // флаги HvH рисуются и без обычного ESP — как в игре
+    hvh::visuals::drawPreviewFlags(d, { boxMax.x + 6.0f, boxMin.y });
 
     if (!esp.enabled) {
         const char* text = "ESP врагов выключен";
@@ -868,9 +934,9 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
 {
     using namespace hvh::ui;
 
-    const ImVec2 size{ 920.0f, 620.0f };
-    constexpr float sidebarWidth = 210.0f;
-    constexpr float headerHeight = 60.0f;
+    const ImVec2 size{ 820.0f, 600.0f };
+    constexpr float sidebarWidth = 80.0f;     // колонка иконок
+    constexpr float border = 6.0f;            // многослойная рамка окна
 
     const auto& display = ImGui::GetIO().DisplaySize;
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
@@ -878,97 +944,55 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 0.0f, 0.0f });
     ImGui::PushStyleColor(ImGuiCol_WindowBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-    ImGui::Begin("##eclipse", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
+    ImGui::Begin("##newerwin", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+    if (hvh::ui::fonts.menu)
+        ImGui::PushFont(hvh::ui::fonts.menu);
 
     auto* d = ImGui::GetWindowDrawList();
     const auto pos = ImGui::GetWindowPos();
     const ImVec2 max{ pos.x + size.x, pos.y + size.y };
 
-    // мягкая тень и фон
-    for (int i = 1; i <= 8; ++i)
-        d->AddRect({ pos.x - i * 1.5f, pos.y - i * 1.5f }, { max.x + i * 1.5f, max.y + i * 1.5f }, IM_COL32(0, 0, 0, 36 - i * 4), 10.0f + i * 1.5f, ImDrawFlags_None, 2.0f);
-    d->AddRectFilled(pos, max, color::windowBg, 12.0f);
-    d->AddRectFilled(pos, { pos.x + sidebarWidth, max.y }, color::sidebarBg, 12.0f, ImDrawFlags_RoundCornersLeft);
-    d->AddLine({ pos.x + sidebarWidth, pos.y }, { pos.x + sidebarWidth, max.y }, color::groupLine);
-    d->AddLine({ pos.x + sidebarWidth, pos.y + headerHeight }, { max.x, pos.y + headerHeight }, color::groupLine);
-    // тонкая акцентная полоса сверху
-    d->AddRectFilledMultiColor({ pos.x + sidebarWidth, pos.y }, { max.x - 12.0f, pos.y + 2.0f }, color::accent, color::accent2, color::accent2, color::accent);
-
-    // логотип со свечением
+    // Рамка как у gamesense: чёрная, серая, полоса, серая, чёрная — и радужная линия сверху внутри
+    d->AddRectFilled(pos, max, IM_COL32(0, 0, 0, 255));
+    d->AddRectFilled({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, IM_COL32(60, 60, 60, 255));
+    d->AddRectFilled({ pos.x + 2.0f, pos.y + 2.0f }, { max.x - 2.0f, max.y - 2.0f }, IM_COL32(40, 40, 40, 255));
+    d->AddRectFilled({ pos.x + border - 1.0f, pos.y + border - 1.0f }, { max.x - border + 1.0f, max.y - border + 1.0f }, IM_COL32(60, 60, 60, 255));
+    const ImVec2 inner{ pos.x + border, pos.y + border };
+    const ImVec2 innerMax{ max.x - border, max.y - border };
+    d->AddRectFilled(inner, innerMax, color::windowBg);
     {
-        const char* logo = "ECLIPSE";
-        const ImVec2 logoPos{ pos.x + 24.0f, pos.y + 20.0f };
-        const float logoSize = 28.0f;
-        for (int i = 3; i >= 1; --i)
-            d->AddText(hvh::ui::fonts.logo, logoSize, { logoPos.x, logoPos.y + i * 0.5f }, IM_COL32(77, 163, 255, 25 * i), logo);
-        d->AddText(hvh::ui::fonts.logo, logoSize, logoPos, color::accent, logo);
-        const auto logoWidth = (hvh::ui::fonts.logo ? hvh::ui::fonts.logo : ImGui::GetFont())->CalcTextSizeA(logoSize, FLT_MAX, 0.0f, logo).x;
-        d->AddCircleFilled({ logoPos.x + logoWidth + 6.0f, logoPos.y + logoSize - 8.0f }, 3.0f, color::accent2);
-        d->AddText({ logoPos.x + 1.0f, logoPos.y + logoSize + 2.0f }, IM_COL32(80, 86, 102, 255), "legacy  ·  hvh");
+        const float mid = (inner.x + innerMax.x) * 0.5f;
+        const ImU32 cyan = IM_COL32(55, 177, 218, 255), magenta = IM_COL32(204, 70, 205, 255), yellow = IM_COL32(204, 227, 54, 255);
+        d->AddRectFilledMultiColor(inner, { mid, inner.y + 1.0f }, cyan, magenta, magenta, cyan);
+        d->AddRectFilledMultiColor({ mid, inner.y }, { innerMax.x, inner.y + 1.0f }, magenta, yellow, yellow, magenta);
+        d->AddRectFilledMultiColor({ inner.x, inner.y + 1.0f }, { mid, inner.y + 2.0f }, IM_COL32(28, 89, 109, 255), IM_COL32(102, 35, 103, 255), IM_COL32(102, 35, 103, 255), IM_COL32(28, 89, 109, 255));
+        d->AddRectFilledMultiColor({ mid, inner.y + 1.0f }, { innerMax.x, inner.y + 2.0f }, IM_COL32(102, 35, 103, 255), IM_COL32(102, 114, 27, 255), IM_COL32(102, 114, 27, 255), IM_COL32(102, 35, 103, 255));
     }
+    // колонка вкладок: темнее, справа двойная линия (выбранная вкладка её разрывает)
+    d->AddRectFilled({ inner.x, inner.y + 2.0f }, { inner.x + sidebarWidth, innerMax.y }, color::sidebarBg);
+    d->AddLine({ inner.x + sidebarWidth, inner.y + 2.0f }, { inner.x + sidebarWidth, innerMax.y }, color::outline);
+    d->AddLine({ inner.x + sidebarWidth + 1.0f, inner.y + 2.0f }, { inner.x + sidebarWidth + 1.0f, innerMax.y }, color::groupLine);
 
-    // навигация
-    ImGui::SetCursorPos({ 12.0f, 86.0f });
+    // навигация: только иконки, название — подсказкой
+    ImGui::SetCursorPos({ border, border + 22.0f });
     ImGui::PushStyleColor(ImGuiCol_ChildBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-    ImGui::BeginChild("##sidebar", { sidebarWidth - 24.0f, size.y - 86.0f - 76.0f }, false, ImGuiWindowFlags_NoScrollbar);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 0.0f, 0.0f });
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, { 0.0f, 0.0f });
+    ImGui::BeginChild("##sidebar", { sidebarWidth, size.y - border * 2.0f - 22.0f }, false, ImGuiWindowFlags_NoScrollbar);
     for (const auto& info : tabs) {
-        if (info.tab == Tab::Rage) sectionLabel("AIMBOT");
-        if (info.tab == Tab::Players) sectionLabel("VISUALS");
-        if (info.tab == Tab::Misc) sectionLabel("MISC");
         if (sidebarTab(info.name, info.icon, currentTab == info.tab))
             currentTab = info.tab;
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
 
-    // профиль внизу
-    {
-        const ImVec2 footer{ pos.x + 14.0f, max.y - 62.0f };
-        d->AddRectFilled(footer, { pos.x + sidebarWidth - 14.0f, max.y - 14.0f }, IM_COL32(18, 21, 28, 255), 10.0f);
-        const ImVec2 avatar{ footer.x + 24.0f, footer.y + 24.0f };
-        d->AddCircleFilled(avatar, 15.0f, color::accent);
-        d->AddCircleFilled({ avatar.x + 4.0f, avatar.y + 4.0f }, 11.0f, IM_COL32(0, 212, 255, 120));
-        const char* user = std::getenv("USER");
-        char initial[2]{ static_cast<char>(user && *user ? std::toupper(*user) : 'U'), 0 };
-        ImGui::PushFont(hvh::ui::fonts.bold);
-        const auto initialSize = ImGui::CalcTextSize(initial);
-        d->AddText({ avatar.x - initialSize.x * 0.5f, avatar.y - initialSize.y * 0.5f }, IM_COL32(255, 255, 255, 255), initial);
-        d->AddText({ footer.x + 48.0f, footer.y + 8.0f }, color::text, user && *user ? user : "user");
-        ImGui::PopFont();
-        d->AddCircleFilled({ footer.x + 52.0f, footer.y + 33.0f }, 3.0f, color::good);
-        d->AddText({ footer.x + 60.0f, footer.y + 25.0f }, color::textDim, "-insecure");
-    }
-
-    // шапка
-    const auto& info = tabs[static_cast<int>(currentTab)];
-    ImGui::PushFont(hvh::ui::fonts.bold);
-    d->AddText({ pos.x + sidebarWidth + 24.0f, pos.y + 13.0f }, color::text, info.name);
-    ImGui::PopFont();
-    d->AddText({ pos.x + sidebarWidth + 24.0f, pos.y + 32.0f }, color::textDim, info.subtitle);
-
-    // статус справа в шапке
-    {
-        const bool dtOn = hvh::config.exploits.doubleTap && (!hvh::config.exploits.doubleTapKey.isSet() || hvh::config.exploits.doubleTapKey.isToggled());
-        const char* chips[]{ "RAGE", "AA", "DT" };
-        const bool states[]{ hvh::config.rage.enabled, hvh::config.antiAim.enabled, dtOn };
-        float x = max.x - 24.0f;
-        for (int i = 2; i >= 0; --i) {
-            const auto textSize = ImGui::CalcTextSize(chips[i]);
-            const ImVec2 chipMin{ x - textSize.x - 26.0f, pos.y + 17.0f };
-            const ImVec2 chipMax{ x, pos.y + 43.0f };
-            d->AddRectFilled(chipMin, chipMax, states[i] ? IM_COL32(77, 163, 255, 40) : color::frame, 13.0f);
-            d->AddCircleFilled({ chipMin.x + 11.0f, pos.y + 30.0f }, 3.0f, states[i] ? color::accent : IM_COL32(80, 86, 102, 255));
-            d->AddText({ chipMin.x + 19.0f, pos.y + 30.0f - textSize.y * 0.5f }, states[i] ? color::text : color::textDim, chips[i]);
-            x = chipMin.x - 8.0f;
-        }
-    }
-
     // содержимое вкладки
-    ImGui::SetCursorPos({ sidebarWidth + 16.0f, headerHeight + 14.0f });
+    ImGui::SetCursorPos({ border + sidebarWidth + 20.0f, border + 22.0f });
     ImGui::PushStyleColor(ImGuiCol_ChildBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-    ImGui::BeginChild("##content", { size.x - sidebarWidth - 32.0f, size.y - headerHeight - 30.0f }, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginChild("##content", { size.x - sidebarWidth - border * 2.0f - 40.0f, size.y - border * 2.0f - 42.0f }, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleColor();
 
     auto& features = config.getFeatures();
@@ -995,7 +1019,7 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
         const auto avail = ImGui::GetContentRegionAvail();
         const ImVec2 left{ avail.x - previewWidth - 12.0f, avail.y };
         switch (sub) {
-        case 0: legacyGroupSized("ESP", left, [&] { StreamProofESP::drawGUI(config, true); }); break;
+        case 0: legacyGroupSized("ESP", left, [&] { StreamProofESP::drawGUI(config, true); hvh::gui::drawEspFlagsSetting(); }); break;
         case 1: legacyGroupSized("Чамсы", left, [&] { simpleChams(config, [&] { renderChamsWindow(config, true); }); }); break;
         case 2: legacyGroupSized("Глоу", left, [&] { features.glow.drawGUI(true); }); break;
         }
@@ -1010,8 +1034,16 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
     }
     case Tab::World: {
         static int sub = 0;
-        switch (subTabs({ "Визуалы", "Скоуп и гранаты" }, sub)) {
-        case 0: legacyGroup("Визуалы", [&] { features.visuals.drawGUI(true); }); break;
+        switch (subTabs({ "Визуалы", "Скоуп и гранаты", "Приколюхи" }, sub)) {
+        case 0: {
+            constexpr float rightWidth = 260.0f;
+            const auto avail = ImGui::GetContentRegionAvail();
+            legacyGroupSized("Визуалы", { avail.x - rightWidth - 12.0f, avail.y }, [&] { features.visuals.drawGUI(true); });
+            ImGui::SameLine(0.0f, 12.0f);
+            hvh::gui::drawEspRageGroup({ rightWidth, avail.y });
+            break;
+        }
+        case 2: hvh::gui::drawVisualsTab(); break;
         case 1: {
             const auto avail = ImGui::GetContentRegionAvail();
             if (beginGroup("Скоуп и гранаты", { (avail.x - 12.0f) * 0.5f, avail.y }))
@@ -1046,5 +1078,7 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
     }
 
     ImGui::EndChild();
+    if (hvh::ui::fonts.menu)
+        ImGui::PopFont();
     ImGui::End();
 }

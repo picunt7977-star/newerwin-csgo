@@ -136,7 +136,7 @@ void simulate(const EngineInterfaces& engineInterfaces, const Memory& memory, We
             path.bounces.push_back(src);
 
             if (normal.z > 0.7f && dot(velocity, velocity) < 20.0f * 20.0f)
-                velocity = {};
+                velocity = csgo::Vector{};
         }
 
         // дым и декой срабатывают, когда граната остановилась

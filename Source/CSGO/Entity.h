@@ -293,6 +293,7 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(clip, "CBaseCombatWeapon", "m_iClip1", int)
     NETVAR2(reserveAmmoCount, "CBaseCombatWeapon", "m_iPrimaryReserveAmmoCount", int)
     NETVAR2(nextPrimaryAttack, "CBaseCombatWeapon", "m_flNextPrimaryAttack", float)
+    NETVAR2(nextSecondaryAttack, "CBaseCombatWeapon", "m_flNextSecondaryAttack", float)
     // CS-оружие: режим (1 — второй, у снайперок в скоупе), время последнего выстрела, индекс отдачи
     NETVAR2(weaponMode, "CWeaponCSBase", "m_weaponMode", int)
     NETVAR2(lastShotTime, "CWeaponCSBase", "m_fLastShotTime", float)
@@ -334,6 +335,9 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(fireZDelta, "CInferno", "m_fireZDelta", int[100])
     NETVAR2(fireIsBurning, "CInferno", "m_bFireIsBurning", bool[100])
     NETVAR2(fireCount, "CInferno", "m_fireCount", int)
+    NETVAR2(fireEffectTickBegin, "CInferno", "m_nFireEffectTickBegin", int)
+    NETVAR2(smokeEffectTickBegin, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin", int)
+    NETVAR2(didSmokeEffect, "CSmokeGrenadeProjectile", "m_bDidSmokeEffect", bool)
 
     bool isFlashed() const noexcept
     {

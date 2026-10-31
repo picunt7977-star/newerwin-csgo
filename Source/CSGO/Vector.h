@@ -27,7 +27,7 @@ struct Vector {
         return !(a == b);
     }
 
-    constexpr Vector& operator=(const float array[3]) noexcept
+    constexpr Vector& operator=(const float (&array)[3]) noexcept
     {
         x = array[0];
         y = array[1];

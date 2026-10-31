@@ -154,6 +154,11 @@ float Visuals::fov() noexcept
     return static_cast<float>(visualsConfig.fov);
 }
 
+float Visuals::thirdpersonDistance() noexcept
+{
+    return static_cast<float>(visualsConfig.thirdpersonDistance > 0 ? visualsConfig.thirdpersonDistance : 150);
+}
+
 float Visuals::farZ() noexcept
 {
     return static_cast<float>(visualsConfig.farZ);
@@ -217,10 +222,10 @@ void Visuals::thirdperson() noexcept
         return;
 
     memory.input->isCameraInThirdPerson = (!visualsConfig.thirdpersonKey.isSet() || visualsConfig.thirdpersonKey.isToggled()) && localPlayer && localPlayer.get().isAlive();
-    if (static const bool debug = std::getenv("ECLIPSE_DEBUG"); debug) {
+    if (static const bool debug = std::getenv("NEWERWIN_DEBUG"); debug) {
         static int frame = 0;
         if (++frame % 300 == 1)
-            std::fprintf(stderr, "[eclipse] thirdperson: input=%p flag=%d alive=%d cameraThink=%p\n", static_cast<void*>(memory.input), memory.input->isCameraInThirdPerson, localPlayer && localPlayer.get().isAlive(), *reinterpret_cast<const void* const*>(&cameraThink));
+            std::fprintf(stderr, "[newerwin] thirdperson: input=%p flag=%d alive=%d cameraThink=%p\n", static_cast<void*>(memory.input), memory.input->isCameraInThirdPerson, localPlayer && localPlayer.get().isAlive(), *reinterpret_cast<const void* const*>(&cameraThink));
     }
     memory.input->cameraOffset.z = static_cast<float>(visualsConfig.thirdpersonDistance > 0 ? visualsConfig.thirdpersonDistance : 150);
 }

@@ -23,17 +23,20 @@ void afterClientAnimation(const EngineInterfaces& engineInterfaces, const Client
 [[nodiscard]] bool available() noexcept;          // функция и офсеты найдены, сервер шлёт слои
 [[nodiscard]] bool valid(int index) noexcept;     // по этому игроку есть угол ног
 [[nodiscard]] float footYaw(int index) noexcept;  // угол ног на сервере, с коррекцией по промахам
-[[nodiscard]] float rawFootYaw(int index) noexcept;
 [[nodiscard]] float delta(int index) noexcept;    // footYaw - взгляд, с учётом режима
 [[nodiscard]] float maxDesync(int index) noexcept;
 [[nodiscard]] float confidence(int index) noexcept;
 // последний угол, найденный по слоям (не доведённый): simtime находки и дельта в долях максимума
 [[nodiscard]] bool lastFound(int index, float& simulationTime, float& ratio) noexcept;
-[[nodiscard]] const char* modeName(int index) noexcept;
 [[nodiscard]] const char* statusLine(int index) noexcept;
 
 void onHit(int index) noexcept;                   // попали — режим коррекции хорош
-void onMiss(int index) noexcept;                  // промах по вине резольвера
+// промах по вине резольвера; proven — импакт доказал, что сторона была неверной (весит вдвое)
+void onMiss(int index, bool proven = false) noexcept;
+// промах, где импакт доказал, что сторона была ВЕРНОЙ, а модель стояла дальше: ноги на полном десинке.
+// Зеркалить тут нечего — резольвер для этого игрока начинает доводить угол до максимума по найденной стороне.
+void onMagnitudeMiss(int index) noexcept;
+[[nodiscard]] bool extremeActive(int index) noexcept;   // угол доводится до полного десинка (выучено промахами)
 void onRoundStart() noexcept;
 void clear() noexcept;
 

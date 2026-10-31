@@ -75,6 +75,8 @@ struct LocalPlayerData {
     float flashDuration;
     csgo::Vector aimPunch;
     csgo::Vector origin;
+    char name[32]{};        // ник для ватермарки
+    int tickRate = 64;
 };
 
 namespace csgo { struct Entity; }
@@ -141,6 +143,16 @@ struct PlayerData : BaseData {
     csgo::Vector headMins, headMaxs;
     csgo::Vector origin;
     std::string activeWeapon;
+    // для флагов ESP и снаряжения по Tab (у дорманта — последнее известное)
+    int index = 0;
+    int armor = 0;
+    int money = 0;
+    bool helmet = false;
+    bool defuser = false;
+    bool scoped = false;
+    bool defusing = false;
+    bool reloading = false;
+    bool hasBomb = false;
     std::vector<std::pair<csgo::Vector, csgo::Vector>> bones;
     // поза скелета относительно origin прошлого кадра — для сглаживания джиттера вражеского AA
     std::vector<std::pair<csgo::Vector, csgo::Vector>> smoothedPose;

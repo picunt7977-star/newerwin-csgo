@@ -332,6 +332,7 @@ ASALocalRun/
 
 # Local History for Visual Studio
 .localhistory/
-# ECLIPSE: сборка и логи не нужны в репозитории
+# newerwin: сборка, логи и рабочие заметки не нужны в репозитории
 /build/
 /logs/
+/rage-prompt.md

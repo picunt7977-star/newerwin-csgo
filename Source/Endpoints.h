@@ -40,6 +40,8 @@
 #include "CSGO/SoundInfo.h"
 #include "CSGO/UserCmd.h"
 #include "CSGO/ViewSetup.h"
+#include "CSGO/EngineTrace.h"
+#include <cstring>
 #include "GameData.h"
 #include "GUI.h"
 #include "Hacks/EnginePrediction.h"
@@ -51,8 +53,12 @@
 #include "Hacks/HvH/ModelPreview.h"
 #include "Hacks/HvH/Movement.h"
 #include "Hacks/HvH/Ragebot.h"
+#include "Hacks/HvH/Smoothing.h"
+#include "Hacks/HvH/RadarSpotted.h"
 #include "Hacks/HvH/Resolver.h"
 #include "Hacks/HvH/Tickbase.h"
+#include "Hacks/HvH/HvhVisuals.h"
+#include "Hacks/HvH/Scoreboard.h"
 #include "Hooks.h"
 #include "Netvars.h"
 
@@ -74,6 +80,9 @@ void fireGameEvent(csgo::GameEventPOD* eventPointer)
     case fnv::hash(csgo::player_death):
         hvh::ragebot::onPlayerDeath(globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("userid")),
             localPlayer ? localPlayer.get().getNetworkable().index() : 0);
+        if (localPlayer && globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("attacker")) == localPlayer.get().getNetworkable().index()
+            && globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
+            hvh::visuals::onKill();
         globalContext->features->inventoryChanger.updateStatTrak(event);
         globalContext->features->inventoryChanger.overrideHudIcon(*globalContext->memory, event);
         globalContext->features->misc.killMessage(event);
@@ -83,6 +92,9 @@ void fireGameEvent(csgo::GameEventPOD* eventPointer)
         const auto& engine = globalContext->getEngineInterfaces().getEngine();
         hvh::ragebot::onPlayerHurt(engine.getPlayerForUserID(event.getInt("userid")), engine.getPlayerForUserID(event.getInt("attacker")), localPlayer ? localPlayer.get().getNetworkable().index() : 0,
             event.getInt("hitgroup"), event.getInt("dmg_health"), event.getInt("health"));
+        if (localPlayer && engine.getPlayerForUserID(event.getInt("attacker")) == localPlayer.get().getNetworkable().index()
+            && engine.getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
+            hvh::visuals::onDamage(engine.getPlayerForUserID(event.getInt("userid")), event.getInt("dmg_health"), event.getInt("hitgroup") == 1);
     }
         globalContext->features->misc.playHitSound(event);
         globalContext->features->visuals.hitEffect(&event);
@@ -242,12 +254,14 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     features->misc.quickReload(cmd);
     features->misc.fixTabletSignal();
     features->misc.slowwalk(cmd);
-    hvh::movement::fakeDuck(cmd);
+    hvh::movement::fakeDuck(cmd, globalContext->memory->globalVars->intervalPerTick);
 
     EnginePrediction::run(ClientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces }, *globalContext->memory, cmd);
 
     const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
     hvh::tickbase::setActive(localPlayer && localPlayer.get().isAlive());
+    if (localPlayer && localPlayer.get().isAlive())
+        hvh::tickbase::updateLagComp(localPlayer.get().tickBase());
     hvh::movement::autoBuy(globalContext->getEngineInterfaces().getEngine());
     hvh::movement::exploits(globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory);
 
@@ -260,9 +274,20 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
         Triggerbot::run(globalContext->getEngineInterfaces().engineTrace(), globalContext->getOtherInterfaces(), *globalContext->memory, *globalContext->config, cmd);
         features->backtrack.run(clientInterfaces, globalContext->getEngineInterfaces(), globalContext->getOtherInterfaces(), *globalContext->memory, cmd);
     }
-    hvh::movement::autoPeek(cmd, currentViewAngles.y, ragebotShot || (cmd->buttons & csgo::UserCmd::IN_ATTACK));
+    // ручной выстрел — только если оружие правда стреляет: зажатая ЛКМ на перезарядке возврат не запускает
+    bool manualShot = false;
+    if ((cmd->buttons & csgo::UserCmd::IN_ATTACK) && localPlayer && localPlayer.get().isAlive()) {
+        const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon());
+        const float serverTime = globalContext->memory->globalVars->serverTime();
+        manualShot = weapon.getPOD() && weapon.clip() > 0 && weapon.nextPrimaryAttack() <= serverTime && localPlayer.get().nextAttack() <= serverTime;
+    }
+    hvh::movement::autoPeek(cmd, currentViewAngles.y, ragebotShot || manualShot, globalContext->memory->globalVars->intervalPerTick);
     hvh::antiaim::run(cmd, globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory, ragebotShot);
     hvh::grenade::update(globalContext->getEngineInterfaces(), *globalContext->memory);
+    hvh::visuals::onCreateMove(cmd);
+    hvh::visuals::collectGrenades(clientInterfaces, *globalContext->memory);
+    hvh::scoreboard::update(*globalContext->memory, globalContext->getOtherInterfaces(), clientInterfaces, globalContext->getEngineInterfaces(),
+        cmd->buttons & csgo::UserCmd::IN_SCORE, globalContext->memory->globalVars->realtime);
     features->misc.edgejump(cmd);
     features->misc.moonwalk(cmd);
     features->misc.fastPlant(cmd);
@@ -276,15 +301,18 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
 
     cmd->viewangles.normalize();
     // с рейджем/антиаимом угол команды почти всегда не совпадает с камерой — движение чиним всегда
-    if (hvh::config.rage.enabled || hvh::config.antiAim.enabled)
+    if (hvh::config.rage.enabled || hvh::config.antiAim.enabled) {
         hvh::movement::fixMovement(cmd, currentViewAngles.y);
+        hvh::antiaim::fixRollMovement(cmd);
+    }
     else
         features->misc.fixMovement(cmd, currentViewAngles.y);
     hvh::movement::fastLadder(cmd, currentViewAngles.x, currentViewAngles.y);
 
     cmd->viewangles.x = std::clamp(cmd->viewangles.x, -89.0f, 89.0f);
     cmd->viewangles.y = std::clamp(cmd->viewangles.y, -180.0f, 180.0f);
-    cmd->viewangles.z = 0.0f;
+    // roll от антиаима (наклон головы), иначе 0
+    cmd->viewangles.z = hvh::config.antiAim.enabled ? hvh::antiaim::rollAngle() : 0.0f;
     cmd->forwardmove = std::clamp(cmd->forwardmove, -450.0f, 450.0f);
     cmd->sidemove = std::clamp(cmd->sidemove, -450.0f, 450.0f);
 
@@ -323,8 +351,44 @@ float FASTCALL_CONV ClientModeHooks::getViewModelFov(FASTCALL_THIS(csgo::ClientM
     return globalContext->hooks->clientModeHooks.getOriginalGetViewModelFov()(thisptr) + additionalFov;
 }
 
+// Модель чужого игрока (и то, что к нему прикреплено: оружие в руках) рисуем в сглаженной позиции (Smoothing.h):
+// сдвигаем копию костей, кэш костей игрока не трогаем — рейдж и лагкомп видят настоящую модель.
+csgo::matrix3x4* smoothedBones(const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones) noexcept
+{
+    if (!bones || !localPlayer || info.entityIndex <= 0 || !info.model)
+        return bones;
+    const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
+    auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(info.entityIndex));
+    // оружие в руках прикреплено к игроку (moveparent) — его тоже двигаем, иначе отстанет от рук
+    static const auto moveParentOffset = Netvars::get(fnv::hash("CBaseEntity->moveparent"));
+    for (int depth = 0; depth < 2 && moveParentOffset && entity.getPOD() != nullptr && !entity.isPlayer(); ++depth) {
+        const int handle = *reinterpret_cast<const int*>(std::uintptr_t(entity.getPOD()) + moveParentOffset);
+        entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(handle));
+    }
+    // все игроки, кроме нас: у союзников-хвхшников модель скачет так же
+    if (entity.getPOD() == nullptr || !entity.isPlayer() || entity.getPOD() == localPlayer.get().getPOD()
+        || entity.getNetworkable().isDormant() || !entity.isAlive())
+        return bones;
+
+    const auto raw = entity.getAbsOrigin();
+    const auto shift = hvh::smoothing::origin(entity.getNetworkable().index(), raw, entity.velocity(), globalContext->memory->globalVars->realtime) - raw;
+    if (shift.squareLength() < 0.01f)
+        return bones;
+    const auto studio = globalContext->getEngineInterfaces().getModelInfo().getStudioModel(info.model);
+    if (!studio)
+        return bones;
+    const int count = std::clamp(studio->numBones, 0, MAXSTUDIOBONES);
+    static csgo::matrix3x4 shifted[MAXSTUDIOBONES];
+    for (int i = 0; i < count; ++i) {
+        shifted[i] = bones[i];
+        shifted[i].translate(shift);
+    }
+    return shifted;
+}
+
 void FASTCALL_CONV ModelRenderHooks::drawModelExecute(FASTCALL_THIS(csgo::ModelRenderPOD* thisptr), void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* customBoneToWorld) noexcept
 {
+    customBoneToWorld = smoothedBones(info, customBoneToWorld);
     if (globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())
         return globalContext->hooks->modelRenderHooks.getOriginalDrawModelExecute()(thisptr, ctx, state, &info, customBoneToWorld);
 
@@ -341,10 +405,10 @@ void FASTCALL_CONV ModelRenderHooks::drawModelExecute(FASTCALL_THIS(csgo::ModelR
 int FASTCALL_CONV SvCheatsHooks::getInt(csgo::ConVarPOD* thisptr) noexcept
 {
     const auto original = globalContext->hooks->svCheatsHooks.getOriginalSvCheatsGetInt()(thisptr);
-    if (static const bool debug = std::getenv("ECLIPSE_DEBUG"); debug) {
+    if (static const bool debug = std::getenv("NEWERWIN_DEBUG"); debug) {
         static int calls = 0;
         if (++calls % 500 == 1)
-            std::fprintf(stderr, "[eclipse] sv_cheats getInt from %p (calls=%d)\n", __builtin_return_address(0), calls);
+            std::fprintf(stderr, "[newerwin] sv_cheats getInt from %p (calls=%d)\n", __builtin_return_address(0), calls);
     }
     if (globalContext->features->visuals.svCheatsGetBoolHook(RETURN_ADDRESS()))
         return 1;
@@ -354,6 +418,25 @@ int FASTCALL_CONV SvCheatsHooks::getInt(csgo::ConVarPOD* thisptr) noexcept
 void FASTCALL_CONV ClientHooks::frameStageNotify(FASTCALL_THIS(csgo::ClientPOD* thisptr), csgo::FrameStage stage) noexcept
 {
     auto& features = globalContext->features;
+
+    // Фейкдак: на отправленном тике присед полный (его видят враги), но своя анимация видит, как
+    // m_flDuckAmount каждые 14 тиков скачет 0.1↔1, тянется к нему плавно и застревает на полуприседе.
+    // На отрисовку кадра даём анимации полный присед, в RENDER_END возвращаем — предсказание этого не видит.
+    {
+        static csgo::EntityPOD* duckedPlayer = nullptr;
+        static float savedDuck = 0.0f;
+        static const auto duckOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckAmount"));
+        if (stage == csgo::FrameStage::RENDER_START && duckOffset && !duckedPlayer && localPlayer && hvh::movement::isFakeDucking()) {
+            duckedPlayer = localPlayer.get().getPOD();
+            auto& duck = *reinterpret_cast<float*>(std::uintptr_t(duckedPlayer) + duckOffset);
+            savedDuck = duck;
+            duck = 1.0f;
+        } else if (stage == csgo::FrameStage::RENDER_END && duckedPlayer) {
+            if (localPlayer && localPlayer.get().getPOD() == duckedPlayer)
+                *reinterpret_cast<float*>(std::uintptr_t(duckedPlayer) + duckOffset) = savedDuck;
+            duckedPlayer = nullptr;
+        }
+    }
     if (globalContext->getEngineInterfaces().getEngine().isConnected() && !globalContext->getEngineInterfaces().getEngine().isInGame())
         features->misc.changeName(true, nullptr, 0.0f);
 
@@ -450,6 +533,25 @@ void FASTCALL_CONV SurfaceHooks::setDrawColor(FASTCALL_THIS(csgo::SurfacePOD* th
     globalContext->hooks->surfaceHooks.getOriginalSetDrawColor()(thisptr, r, g, b, a);
 }
 
+// 3-е лицо: штатная коллизия камеры (CAM_Think) упирается в игроков — подошёл тиммейт, и камера влетает
+// в модель. Ставим камеру сами: хулл ±6 ед. от глаз назад, только по стенам (MASK_SOLID_BRUSHONLY).
+inline void placeThirdPersonCamera(const csgo::Vector& eye, csgo::ViewSetup* setup) noexcept
+{
+    const float distance = globalContext->features->visuals.thirdpersonDistance();
+    const float pitch = Helpers::deg2rad(setup->angles.x);
+    const float yaw = Helpers::deg2rad(setup->angles.y);
+    const csgo::Vector forward{ std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), -std::sin(pitch) };
+    csgo::Ray ray{ eye, eye - forward * distance };
+    // под csgo::Ray лежит Ray_t: m_StartOffset +32 (нули — хулл симметричный), m_Extents +48, m_IsRay +72
+    static_assert(offsetof(csgo::Ray, isRay) == WIN32_LINUX(68, 72));
+    const csgo::Vector extents{ 6.0f, 6.0f, 6.0f };
+    std::memcpy(reinterpret_cast<std::byte*>(&ray) + 48, &extents, sizeof(extents));
+    ray.isRay = false;
+    csgo::Trace trace;
+    globalContext->getEngineInterfaces().engineTrace().traceRay(ray, 0x400B, { localPlayer.get().getPOD() }, trace);
+    setup->origin = eye - forward * (distance * (trace.startSolid ? 1.0f : trace.fraction));
+}
+
 void FASTCALL_CONV ClientModeHooks::overrideView(FASTCALL_THIS(csgo::ClientMode* thisptr), csgo::ViewSetup* setup) noexcept
 {
     if (localPlayer && !localPlayer.get().isScoped())
@@ -469,7 +571,11 @@ void FASTCALL_CONV ClientModeHooks::overrideView(FASTCALL_THIS(csgo::ClientMode*
         input->cameraOffset.x = view.x;
         input->cameraOffset.y = view.y;
     }
+    const bool thirdPerson = globalContext->memory->input && globalContext->memory->input->isCameraInThirdPerson && localPlayer && localPlayer.get().isAlive();
+    const auto eye = setup->origin;
     globalContext->hooks->clientModeHooks.getOriginalOverrideView()(thisptr, setup);
+    if (thirdPerson)
+        placeThirdPersonCamera(eye, setup);
     // фейкдак: камера на высоте стоя, хотя модель приседает
     if (hvh::movement::isFakeDucking() && localPlayer && Netvars::get(fnv::hash("CBasePlayer->m_vecViewOffset[0]")))
         setup->origin.z += 64.06f - localPlayer.get().viewOffset().z;
@@ -573,6 +679,8 @@ void FASTCALL_CONV CSPlayerInventoryHooks::soUpdated(FASTCALL_THIS(csgo::CSPlaye
 bool FASTCALL_CONV ClientHooks::dispatchUserMessage(FASTCALL_THIS(csgo::ClientPOD* thisptr), csgo::UserMessageType type, int passthroughFlags, int size, const void* data) noexcept
 {
     globalContext->features->misc.dispatchUserMessageHook(type, size, data);
+    if (static_cast<int>(type) == hvh::radar::spottedEntityUpdate)
+        hvh::radar::onUserMessage(data, size, globalContext->memory->globalVars->realtime);
     if (type == csgo::UserMessageType::Text)
         globalContext->features->inventoryChanger.onUserTextMsg(*globalContext->memory, data, size);
 

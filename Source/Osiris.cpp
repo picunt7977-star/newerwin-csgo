@@ -103,7 +103,7 @@ void __attribute__((constructor)) DllEntryPoint()
         return;
 
     if (!insecure_gate::allowed()) {
-        std::fputs("[csgo-hvh] нет -insecure в параметрах запуска, чит не загружен\n", stderr);
+        std::fputs("[newerwin] нет -insecure в параметрах запуска, чит не загружен\n", stderr);
         return;
     }
 

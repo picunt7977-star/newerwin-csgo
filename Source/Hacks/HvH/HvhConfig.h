@@ -2,6 +2,7 @@
 
 #include <array>
 #include <map>
+#include <vector>
 
 #include <InputUtil.h>
 #include <JsonForward.h>
@@ -72,6 +73,13 @@ struct RageConfig {
     bool resolverSafeWhenUnsure = true;
     int resolverSteps = 9;          // сколько углов-кандидатов перебирать на обновление (5/9/17)
     int safePoint = 1;              // 0 — выкл, 1 — после промаха, 2 — всегда (по десинкерам)
+    // Нож: бьёт сам, когда враг в досягаемости (ЛКМ — 48 ед., ПКМ — 32 ед., в спину ×3).
+    // 0 — только наповал, 1 — любой удар, если враг в досягаемости
+    bool knifeBot = false;
+    int knifeBotMode = 0;
+    // Зевс: стреляет, только если убивает (тело, в пределах дальности), со своим хитшансом
+    bool zeusBot = false;
+    int zeusHitchance = 80;
     float fov = 180.0f;
     KeyBind minDamageOverrideKey;
     KeyBind forceBodyKey;
@@ -80,32 +88,114 @@ struct RageConfig {
 
 enum class Pitch { Off, Down, Up, Zero };
 enum class YawBase { Off, Backward, AtTargets };
-enum class YawModifier { Off, Jitter, CenterJitter, Spin, Random, FiveWay };
+// Модификатор yaw. Старые значения (0..5) сохранены — конфиги читаются как раньше, «5-way» стал «N-way».
+//  Джиттер — 0 / +градус; Центр — ±градус; Спин — оборот; Рандом — случайно в ±градус;
+//  N-way — N положений от −градуса до +градуса по кругу; Вращение — плавно туда-обратно в ±градус;
+//  Скиттер — рваный порядок −,+,0,−,+,0,−,0,+,−,0,+ (сторону десинка в джиттере тянет за собой)
+enum class YawModifier { Off, Jitter, CenterJitter, Spin, Random, FiveWay, Rotate, Skitter, Count };
+// Десинк: Статика — одна сторона (инвертер/анти-брут); Джиттер — смена стороны с модификатором; Рандом — случайно
+enum class DesyncMode { Off, Static, Jitter, Random, Count };
+// Задержка переключения модификатора/джиттера: каждые N отправленных пакетов; «Плавающая» — 1, 2 … N по кругу;
+// «Случайная» — от 1 до N; «Качели» — то N, то 1
+enum class SwitchDelay { None, Static, Fluctuate, Random, Switch, Count };
 // Флики (дефенсив AA): на тиках сдвига тикбейса — или раз в N пакетов — yaw дёргается вбок
 enum class FlickTrigger { Defensive, Always };
 enum class FlickSide { Alternate, Random, Custom };
+
+// Состояние игрока для билдера AA. «Общее» — запасное: состояние без своих настроек берёт его
+// («Воздух + присед» без своих — сначала «Воздух», «Присед в движении» — «Присед»).
+// «Фейклаг» — когда ни DT, ни дефенсив не включены (чок длинный): главнее состояния движения.
+enum class AaState { Default, Standing, Running, Walking, Air, AirCrouch, Crouching, Sneaking, Fakelag, Count };
+inline constexpr std::array aaStateNames{ "Общее", "Стоя", "Бег", "Шаг (shift)", "Воздух", "Воздух + присед", "Присед", "Присед в движении", "Фейклаг" };
+
+// Дефенсив AA (скрытые углы): пока тикбейс откатился (лагкомп по нам не пишется — враг видит эти углы,
+// но ни бектрекнуть, ни разрезольвить не может), pitch и yaw подменяются своими.
+enum class SnapState { Default, Air, AirCrouch, Crouching, Sneaking, Walking, EdgeBait, Count };
+inline constexpr std::array snapStateNames{ "Общее", "Воздух", "Воздух + присед", "Присед", "Присед в движении", "Шаг (shift)", "У стены (фристенд)" };
+enum class SnapMode { Default, Off, Custom };   // «Как общее» / выкл / своё
+enum class SnapPitch { Off, Static, Jitter, Random, RandomStatic, Spin, SpinFull, Camera, AtTarget, Count };
+enum class SnapYaw { Off, Static, Jitter, Random, RandomJitter, RandomStatic, Spin, SpinFull, SpinJitter, Way90, Sway180, Opposite, Count };
+
+struct DefensiveSnap {
+    int mode = static_cast<int>(SnapMode::Default);
+    int pitch = static_cast<int>(SnapPitch::Off);
+    int pitchAngle = -89;
+    int pitchAngle2 = 89;
+    int pitchSpeed = 20;            // десятые оборота в секунду (как в hysteria: 20 = 2 об/с)
+    int yaw = static_cast<int>(SnapYaw::Off);
+    int yawAngle = 180;
+    int yawDelay = 0;               // пакетов между переключениями джиттера
+    int yawSpeed = 20;
+    bool forceLc = false;           // в этом состоянии ломать лагкомп самим
+    int duration = 13;              // сколько тиков окна дефенсива занимать (13 — всё окно)
+};
+
+enum class SafeHead { Off, Basic, Smart };
+enum class AntiBruteMode { Flip, Adjust, PresetRack };
+enum AntiBruteTrigger { AbEnemyShot = 1 << 0, AbLocalShot = 1 << 1 };
+
+struct AntiAimState {
+    bool override = false;          // свои настройки (для «Общего» не используется)
+    int yawOffset = 0;
+    int addLeft = 0;                // добавка к yaw, пока десинк влево...
+    int addRight = 0;               // ...и вправо — так джиттер-десинк ведёт голову за собой
+    int modifier = static_cast<int>(YawModifier::CenterJitter);
+    int degree = 30;                // размах модификатора
+    int ways = 5;                   // для N-way
+    int spinSpeed = 10;             // для спина и вращения
+    int randomize = 0;              // ± случайно к размаху на каждом переключении, градусы
+    int desyncMode = static_cast<int>(DesyncMode::Static);
+    int desyncLeft = 58;
+    int desyncRight = 58;
+    bool desyncInvert = false;      // в «Статике» — другая сторона по умолчанию
+    int delayMode = static_cast<int>(SwitchDelay::None);
+    int delayTicks = 2;             // пакетов между переключениями
+};
+
+// Снимок билдера и дефенсива — для «стойки пресетов» анти-брутфорса
+struct AntiAimPreset {
+    std::array<AntiAimState, static_cast<int>(AaState::Count)> states{};
+    std::array<DefensiveSnap, static_cast<int>(SnapState::Count)> snaps{};
+};
 
 struct AntiAimConfig {
     bool enabled = false;
     int pitch = static_cast<int>(Pitch::Down);
     int yawBase = static_cast<int>(YawBase::AtTargets);
-    int yawOffset = 0;
-    int yawModifier = static_cast<int>(YawModifier::CenterJitter);
-    int modifierRange = 30;
-    int spinSpeed = 10;
+    std::array<AntiAimState, static_cast<int>(AaState::Count)> states{};
 
-    bool desync = true;
-    int desyncLeft = 58;
-    int desyncRight = 58;
-    bool desyncJitter = false;
-    bool antiBrute = true;          // промах врага рядом с головой — меняем сторону
+    bool desync = true;             // общий выключатель десинка (фейклаг держит ≥1 тик ради него)
+    bool antiBrute = true;          // враг стрелял в нас (или мы выстрелили) — меняем AA
+    int antiBruteTriggers = AbEnemyShot;
+    int antiBruteMode = static_cast<int>(AntiBruteMode::Flip);
+    int antiBrutePower = 25;        // «Подстройка»: насколько сдвигать углы, %
+    float antiBruteReset = 0.0f;    // через сколько секунд вернуть как было (0 — не возвращать)
+    int antiBruteOrder = 0;         // стойка: 0 — случайно, 1 — по очереди
+    std::vector<AntiAimPreset> presetRack;
     KeyBindToggle inverter;
     bool freestanding = false;      // голову — за ближайшее укрытие от врага
     KeyBind freestandKey;           // если задана — фристенд только пока клавиша зажата
+    bool staticOnManual = true;     // на ручном AA — без модификатора и джиттера десинка, десинк на полную
+    bool freestandStatic = true;    // то же на фристенде
+    bool edgeYaw = false;           // стена вплотную — лицом в неё (голова в стене)
+    KeyBind edgeKey;
+    bool edgeStatic = true;
+    int roll = 0;                   // наклон головы (roll), знак — сторона; в движении до ±40
+    int safeHead = static_cast<int>(SafeHead::Off);
+    bool legitAa = false;           // на E — смотреть куда смотришь, десинк остаётся
+    bool naturality = false;        // плавный переход между состояниями билдера
+    float naturalityTime = 0.2f;
 
     KeyBind manualLeft{ KeyBind::LEFT };
     KeyBind manualRight{ KeyBind::RIGHT };
     KeyBind manualBack{ KeyBind::DOWN };
+    KeyBind manualForward;
+
+    // Дефенсив AA (скрытые углы, как в hysteria)
+    bool defensiveAa = false;
+    std::array<DefensiveSnap, static_cast<int>(SnapState::Count)> snaps{};
+    bool lcTriggers = false;        // ломать лагкомп в выбранных состояниях
+    int lcTriggerStates = 0;        // биты AaState
 
     // Дефенсив AA: пока враг целится в нас — голова вниз, тело уведено вбок от его прицела,
     // сторона дёргается на каждом отправленном пакете, чтобы его резольвер не успевал привыкнуть
@@ -136,6 +226,12 @@ struct ExploitConfig {
     bool defensive = false;         // враг только что увидел нас — авто-рывок, его лагкомп по нам ломается
 };
 
+enum EspFlag {
+    FlagArmor = 1 << 0, FlagMoney = 1 << 1, FlagKit = 1 << 2, FlagScoped = 1 << 3, FlagReload = 1 << 4,
+    FlagFlashed = 1 << 5, FlagBomb = 1 << 6, FlagDoubleTap = 1 << 7, FlagLagComp = 1 << 8, FlagResolver = 1 << 9,
+    FlagLethal = 1 << 10, FlagAll = (1 << 11) - 1
+};
+
 struct ViewConfig {
     bool removeScopeZoom = true;    // прицел без приближения
     bool secondZoom = true;         // при «без зума»: второй уровень скопа всё же приближает
@@ -145,14 +241,26 @@ struct ViewConfig {
     float dormantTime = 6.0f;       // сколько секунд держать ESP игрока, пропавшего из PVS
     bool syncRender = true;         // mat_queue_mode 0: кадр и ESP из одного тика, без дёрганья
     bool screenLogs = true;         // попадания/промахи коротко в левом верхнем углу
+    bool watermark = true;          // ватермарка newerwin в правом верхнем углу
+    // HvH-визуалы (HvhVisuals.cpp)
+    int espFlags = FlagAll;         // EspFlag: что писать справа от ESP врага
+    bool aimDot = true;             // точка, куда рейдж может попасть
+    bool tabLoadout = true;         // по Tab — снаряжение врагов
+    bool damageNumbers = true;      // всплывающие цифры урона
+    bool spreadCircle = false;      // круг разброса вокруг прицела
+    bool footsteps = true;          // кольца там, где враг шумит
+    bool killFlash = true;          // вспышка краёв экрана при убийстве
+    bool grenadeTimers = true;      // над дымом и огнём — сколько им осталось
+    bool shotCapsules = true;       // хитбоксы цели в момент выстрела (зелёные — попал, красные — мимо)
 };
 
 // Автострейф: «По камере» — летим туда, куда смотрим (S — назад), «WASD» — направление клавишами
 enum class AutoStrafe { Off, Camera, Keys };
+enum class AutoPeekMode { Shot, ShotOrRelease };
 
 struct MovementConfig {
     KeyBind autoPeekKey;            // держать: запомнить точку, после выстрела вернуться
-    bool autoPeekOnRelease = true;  // возвращаться и когда отпустил WASD
+    int autoPeekMode = 0;           // AutoPeekMode: только после выстрела / ещё и когда отпустил WASD
     KeyBind fakeDuckKey;
     bool fastLadder = false;
     bool bunnyHop = false;

@@ -40,9 +40,10 @@ constexpr int MAX_CANDIDATES = 24;
 constexpr std::size_t STATE_SIZE = sizeof(csgo::AnimState);
 
 // Режимы коррекции поверх угла от слоёв: если слои врут (сильный джиттер, дефенсив),
-// счёт по попаданиям/промахам сам уводит на зеркальный или половинный угол.
-enum Mode { ModeLayers, ModeMirror, ModeHalf, ModeCount };
-constexpr const char* modeNames[]{ "слои", "зеркало", "половина" };
+// счёт по попаданиям/промахам уводит на зеркальный угол. «Половину» убрали: в рейджботе такой же
+// половинный угол по логам 29.10 попадал 1 из 9, а величину десинка слои и так меряют.
+enum Mode { ModeLayers, ModeMirror, ModeCount };
+constexpr const char* modeNames[]{ "слои", "зеркало" };
 // счёт держим в рамках: иначе серия промахов по чужой вине запирает режим навсегда
 constexpr int scoreLimit = 8;
 
@@ -74,9 +75,16 @@ struct PlayerState {
     float lastFoundTime = -1.0f;    // simtime, когда угол последний раз нашёлся по слоям
     float foundRatio = 0.0f;        // дельта той находки в долях максимума, без коррекции по промахам
     bool carried = false;           // угол не из слоёв, а доведён от прошлого найденного
+    bool anchored = false;          // угол по LBY — точный, зеркалить его нельзя
 
     std::array<int, ModeCount> score{};
     int mode = ModeLayers;
+    // Величина десинка, выученная промахами: импакт показал, что сторона верна, а модель стояла
+    // дальше найденного угла (логи 31.10: 4 из 5 доказанных промахов в голову по слоям — так).
+    // Пока > 0, найденный угол доводим до полного десинка той же стороны.
+    int extreme = 0;
+    bool transition = false;        // на этом обновлении слой ходьбы сменил анимацию — слои ненадёжны
+    Layers lastNet;                 // сетевые слои прошлого обновления
 
     bool haveShadow = false;
     alignas(16) std::byte shadow[STATE_SIZE]{};
@@ -98,7 +106,6 @@ bool warnedUnavailable = false;
 bool warnedOffsets = false;
 int layoutFailures = 0;
 
-bool diagnosticsPrinted = false;
 bool cleared = false;           // состояния уже сброшены (чтобы не чистить их каждый тик)
 
 void consoleWarn(const Memory& memory, const char* text) noexcept
@@ -107,40 +114,6 @@ void consoleWarn(const Memory& memory, const char* text) noexcept
     if (memory.conColorMsg)
         memory.conColorMsg(yellow, "%s\n", text);
     hvh::ragebot::logToFile(text);
-}
-
-// Где резольвер по слоям останавливается — сводка раз в 20 с только в лог-файл (в консоль не пишем).
-// По логам ни разу не было выстрела в режиме «слои», а предупреждений тоже нет — значит, выходит молча.
-enum Exit { ExitNoAnimstate, ExitNoLayers, ExitFewLayers, ExitLayout, ExitInsane, ExitUnavailable, ExitSilent, ExitLowConfidence, ExitCarried, ExitLby, ExitValid, ExitCount };
-constexpr const char* exitNames[]{ "нет animstate", "нет слоёв", "слоёв меньше 13", "раскладка не та", "слои-мусор",
-    "сервер не шлёт слои", "слои молчат", "низкая уверенность", "доведён от прошлого", "ноги по LBY", "угол найден" };
-std::array<int, ExitCount> exits{};
-float lastSummary = 0.0f;
-
-void countExit(Exit exit) noexcept
-{
-    ++exits[exit];
-}
-
-void writeSummary(const Memory& memory) noexcept
-{
-    const float now = memory.globalVars->realtime;
-    if (now - lastSummary < 20.0f)
-        return;
-    lastSummary = now;
-    int total = 0;
-    for (const int count : exits)
-        total += count;
-    if (total == 0)
-        return;
-    char text[512];
-    int length = std::snprintf(text, sizeof(text), "[ECLIPSE] резольвер по слоям за 20 с (%d разборов):", total);
-    for (int i = 0; i < ExitCount && length > 0 && length < static_cast<int>(sizeof(text)); ++i) {
-        if (exits[i])
-            length += std::snprintf(text + length, sizeof(text) - length, " %s %d;", exitNames[i], exits[i]);
-    }
-    hvh::ragebot::logToFile(text);
-    exits.fill(0);
 }
 
 [[nodiscard]] float normalizeYaw(float yaw) noexcept
@@ -255,12 +228,12 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     state.valid = false;
     state.signals = 0;
     state.carried = false;
+    state.anchored = false;
 
     auto* animstate = entity.getAnimstate();
     auto* layers = entity.animOverlays();
     const int count = std::min(entity.animOverlayCount(), LAYERS);
     if (!animstate || !layers || count < LAYERS || !memory.updateAnimationState) {
-        countExit(!animstate ? ExitNoAnimstate : !layers ? ExitNoLayers : ExitFewLayers);
         return;
     }
 
@@ -275,14 +248,13 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
         // старый предел 1.1 отбрасывал всех бегущих, а 50 таких подряд выключали резольвер насовсем
         && std::isfinite(animstate->walkSpeedPortion) && animstate->walkSpeedPortion >= 0.0f && animstate->walkSpeedPortion < 20.0f;
     if (!layoutOk) {
-        countExit(ExitLayout);
         // Один игрок мог просто не успеть обзавестись готовым animstate (только заспавнился) —
         // выключаем резольвер лишь когда не сходится подряд у всех
         if (++layoutFailures > 50) {
             offsetsBroken = true;
             if (!warnedOffsets) {
                 warnedOffsets = true;
-                consoleWarn(memory, "[ECLIPSE] animstate не совпал с разобранной раскладкой — резольвер по геометрии");
+                consoleWarn(memory, "[newerwin] animstate не совпал с разобранной раскладкой — резольвер по геометрии");
             }
         }
         return;
@@ -293,9 +265,17 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     net.count = count;
     std::copy(layers, layers + count, net.items.begin());
     if (!sane(net)) {
-        countExit(ExitInsane);
         return;
     }
+    // Слой ходьбы (6) сменил анимацию или скорость проигрывания скачком: сервер смешивал переход,
+    // а наш прогон кандидатов начинает с прошлой анимации — разница слоёв тут от перехода, а не от ног.
+    // Ту же проверку делают паблик-резольверы по movement_move перед сравнением сторон.
+    constexpr int MOVE_LAYER = 6;
+    state.transition = state.lastNet.count > MOVE_LAYER && count > MOVE_LAYER
+        && (net.items[MOVE_LAYER].sequence != state.lastNet.items[MOVE_LAYER].sequence
+            || std::abs(net.items[MOVE_LAYER].playbackRate - state.lastNet.items[MOVE_LAYER].playbackRate)
+                > 0.25f * std::max(std::abs(state.lastNet.items[MOVE_LAYER].playbackRate), 0.01f));
+    state.lastNet = net;
 
     // Шлёт ли сервер слои вообще: сравниваем с тем, что оставила клиентская анимация в прошлом кадре
     if (state.haveAfterClient) {
@@ -306,9 +286,8 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
             layersUnavailable = true;
             if (!warnedUnavailable) {
                 warnedUnavailable = true;
-                consoleWarn(memory, "[ECLIPSE] сервер не присылает слои анимации — резольвер работает по геометрии");
+                consoleWarn(memory, "[newerwin] сервер не присылает слои анимации — резольвер работает по геометрии");
             }
-            countExit(ExitUnavailable);
             return;
         }
     }
@@ -411,9 +390,9 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
         state.candidates = 1;
         state.confidence = 1.0f;
         state.valid = true;
+        state.anchored = true;
         state.lastFoundTime = entity.simulationTime();
         state.foundRatio = std::clamp(state.delta / std::max(state.maxDesync, 1.0f), -1.0f, 1.0f);
-        countExit(ExitLby);
     } else if (scored.signals == 0) {
         // Слои ни на что не отреагировали — нового угла нет. Тень двигаем от прошлого угла ног: прогон
         // анимации тот же, что у сервера, так что если раньше угол был найден, то и сейчас тень с ним
@@ -438,11 +417,9 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
             state.confidence *= 0.85f;
             state.valid = true;
             state.carried = true;
-            countExit(ExitCarried);
         } else {
             state.valid = false;
             state.confidence = 0.0f;
-            countExit(ExitSilent);
         }
     } else {
         float bestYaw = resultYaw[scored.best];
@@ -530,6 +507,8 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
         // так было почти всегда (13 разборов из 14), причём с «уверенностью» до 97%.
         const float signalTrust = scored.signals >= 3 ? 1.0f : scored.signals == 2 ? 0.85f : 0.6f;
         state.confidence = signalTrust * (sides.side != 0.0f ? sideConfidence : nodeConfidence);
+        if (state.transition)
+            state.confidence *= 0.6f;
         // Кандидаты не разошлись — считать угол найденным нельзя. Исключение только для врага, который
         // не чокает: у него ноги и правда смотрят почти туда же, куда взгляд, и ошибиться нечем.
         state.valid = state.confidence > 0.05f || (!desyncing && std::abs(state.delta) < 5.0f);
@@ -537,7 +516,6 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
             state.lastFoundTime = entity.simulationTime();
             state.foundRatio = std::clamp(state.delta / std::max(state.maxDesync, 1.0f), -1.0f, 1.0f);
         }
-        countExit(state.valid ? ExitValid : ExitLowConfidence);
 
         // Тень: состояние после найденного угла (с учётом уточнения) — с него поедет следующее
         // обновление, чтобы наша история анимации шла в ногу с серверной
@@ -545,20 +523,6 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
         std::memcpy(state.shadow, animstate, STATE_SIZE);
         captureLayers(entity, state.shadowLayers);
         state.haveShadow = true;
-    }
-
-    if (!diagnosticsPrinted) {
-        diagnosticsPrinted = true;
-        char text[320];
-        std::snprintf(text, sizeof(text),
-            "[ECLIPSE] резольвер по слоям: animstate +0x%x, слои +0x%x (%d шт.), maxBodyYaw %.0f°, "
-            "сетевые слои %s, кандидатов %d",
-            csgo::animStateOffset, csgo::animOverlayOffset, count,
-            animstate->maxBodyYawDegrees, layerDiffUpdates > 0 ? "приходят" : "пока не отличались", candidateCount);
-        static constexpr std::uint8_t grey[4]{ 190, 190, 190, 255 };
-        if (memory.conColorMsg)
-            memory.conColorMsg(grey, "%s\n", text);
-        hvh::ragebot::logToFile(text);
     }
 
     // Вернуть игре её состояние: дальше кадр считает анимацию и кости сам
@@ -583,20 +547,30 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
             candidateCount, state.maxDesync);
     } else {
         std::snprintf(state.status, sizeof(state.status),
-            "дельта %+.1f° (макс %.0f°), уверенность %.0f%%, ошибка %.2f, сигналов %d, кандидатов %d, режим %s",
+            "дельта %+.1f° (макс %.0f°), уверенность %.0f%%, ошибка %.2f, сигналов %d, кандидатов %d, режим %s%s%s",
             state.delta, state.maxDesync, state.confidence * 100.0f, state.error, state.signals, state.candidates,
-            modeNames[std::clamp(state.mode, 0, ModeCount - 1)]);
+            modeNames[std::clamp(state.mode, 0, ModeCount - 1)], state.extreme > 0 ? ", до максимума" : "",
+            state.transition ? ", переход анимации" : "");
     }
 }
 
+// Сбросить слежку за игроком, сохранив то, что выучено промахами и попаданиями
+void forget(PlayerState& state) noexcept
+{
+    const int userId = state.userId;
+    const auto score = state.score;
+    const int extreme = state.extreme;
+    state = {};
+    state.userId = userId;
+    state.score = score;
+    state.extreme = extreme;
+}
+
+// Зеркало — только с запасом в два очка: один промах по чужой вине (пинг, стена) не должен
+// переворачивать угол, который слои нашли честно
 [[nodiscard]] int bestMode(const PlayerState& state) noexcept
 {
-    int best = ModeLayers;
-    for (int mode = 1; mode < ModeCount; ++mode) {
-        if (state.score[mode] > state.score[best])
-            best = mode;
-    }
-    return best;
+    return state.score[ModeMirror] >= state.score[ModeLayers] + 2 ? ModeMirror : ModeLayers;
 }
 
 }
@@ -609,7 +583,7 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
         offsetsBroken = true;
         if (!warnedOffsets) {
             warnedOffsets = true;
-            consoleWarn(memory, "[ECLIPSE] не нашёл CCSGOPlayerAnimState::Update (игра обновилась?) — резольвер по геометрии");
+            consoleWarn(memory, "[newerwin] не нашёл CCSGOPlayerAnimState::Update (игра обновилась?) — резольвер по геометрии");
         }
         return;
     }
@@ -624,7 +598,9 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
         auto& state = states[i];
         if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
             || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get())) {
-            state = {};
+            // Слежку сбрасываем, а выученное (счёт режимов, величину десинка) оставляем: враг ушёл
+            // за стену или умер — антиаим у него тот же, а раньше каждый дормант стирал обучение.
+            forget(state);
             continue;
         }
 
@@ -641,10 +617,13 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
 
         const float simulationTime = entity.simulationTime();
         if (state.tracked && simulationTime <= state.lastSimulationTime) {
-            // время не двинулось (нет нового обновления) или ушло назад (дефенсив) — считать нечего
+            // время не двинулось (нет нового обновления) или ушло назад (дефенсив) — считать нечего.
+            // Назад: тень анимации уже не та — сбрасываем и продолжаем отсчёт от новой линии времени,
+            // иначе слои молчали бы, пока simtime не перегонит старый максимум (сдвиг 14 тиков = ~220 мс)
             if (simulationTime < state.lastSimulationTime) {
                 state.haveShadow = false;
                 state.valid = false;
+                state.lastSimulationTime = simulationTime;
             }
             continue;
         }
@@ -671,7 +650,6 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
         state.tracked = true;
         state.haveAfterClient = false;
     }
-    writeSummary(memory);
 }
 
 void afterClientAnimation(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces) noexcept
@@ -702,21 +680,19 @@ bool valid(int index) noexcept
     return index > 0 && index < MAX_PLAYERS && available() && states[index].valid;
 }
 
-float rawFootYaw(int index) noexcept
-{
-    return index > 0 && index < MAX_PLAYERS ? states[index].footYaw : 0.0f;
-}
-
 float footYaw(int index) noexcept
 {
     if (index <= 0 || index >= MAX_PLAYERS)
         return 0.0f;
     const auto& state = states[index];
-    switch (state.mode) {
-    case ModeMirror: return normalizeYaw(state.eyeYaw - state.delta);
-    case ModeHalf: return normalizeYaw(state.eyeYaw + state.delta * 0.5f);
-    default: return state.footYaw;
-    }
+    if (state.anchored)
+        return state.footYaw;
+    float delta = state.mode == ModeMirror ? -state.delta : state.delta;
+    // выучено промахами: сторону слои находят верно, а величину занижают — доводим до максимума.
+    // «Почти по взгляду» не трогаем: там сторона не определена, и полный угол был бы догадкой.
+    if (state.extreme > 0 && std::abs(delta) > 3.0f)
+        delta = delta > 0.0f ? state.maxDesync : -state.maxDesync;
+    return normalizeYaw(state.eyeYaw + delta);
 }
 
 float delta(int index) noexcept
@@ -745,13 +721,6 @@ float confidence(int index) noexcept
     return index > 0 && index < MAX_PLAYERS ? states[index].confidence : 0.0f;
 }
 
-const char* modeName(int index) noexcept
-{
-    if (index <= 0 || index >= MAX_PLAYERS)
-        return "";
-    return modeNames[std::clamp(states[index].mode, 0, ModeCount - 1)];
-}
-
 const char* statusLine(int index) noexcept
 {
     return index > 0 && index < MAX_PLAYERS ? states[index].status : "";
@@ -764,21 +733,47 @@ void onHit(int index) noexcept
     auto& state = states[index];
     auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
     score = std::min(score + 2, scoreLimit);
+    if (state.extreme > 0)
+        state.extreme = std::min(state.extreme + 1, 6);
 }
 
-void onMiss(int index) noexcept
+void onMiss(int index, bool proven) noexcept
 {
     if (index <= 0 || index >= MAX_PLAYERS)
         return;
     auto& state = states[index];
     auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
-    score = std::max(score - 1, -scoreLimit);
+    score = std::max(score - (proven ? 2 : 1), -scoreLimit);
+    // при доведении до максимума промах мог быть и перелётом (ноги были ближе к взгляду) —
+    // доведение отпускаем, иначе одна выученная серия держала бы его вечно
+    if (state.extreme > 0)
+        state.extreme = std::max(state.extreme - (proven ? 1 : 2), 0);
+}
+
+void onMagnitudeMiss(int index) noexcept
+{
+    if (index <= 0 || index >= MAX_PLAYERS)
+        return;
+    auto& state = states[index];
+    // сторона была верной — режиму это в плюс, а не в минус (раньше такие промахи уводили в зеркало)
+    auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
+    score = std::min(score + 1, scoreLimit);
+    state.extreme = std::min(state.extreme + 2, 6);
+}
+
+bool extremeActive(int index) noexcept
+{
+    return index > 0 && index < MAX_PLAYERS && states[index].extreme > 0;
 }
 
 void onRoundStart() noexcept
 {
+    // Счёт режимов гасим наполовину, а не в ноль: антиаим у врага между раундами тот же,
+    // но инвертер он мог переключить. Величину десинка тоже чуть отпускаем.
     for (auto& state : states) {
-        state.score.fill(0);
+        for (auto& score : state.score)
+            score /= 2;
+        state.extreme = std::max(state.extreme - 1, 0);
         state.haveShadow = false;
         state.valid = false;
     }

@@ -34,6 +34,7 @@ public:
     float viewModelFov() noexcept;
     float fov() noexcept;
     float farZ() noexcept;
+    float thirdpersonDistance() noexcept;
 
     void inverseRagdollGravity() noexcept;
     void colorWorld() noexcept;

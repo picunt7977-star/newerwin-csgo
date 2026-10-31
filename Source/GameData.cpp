@@ -1,4 +1,5 @@
 #include "Hacks/HvH/HvhConfig.h"
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -10,6 +11,8 @@
 
 #include "fnv.h"
 #include "GameData.h"
+#include "Hacks/HvH/Smoothing.h"
+#include "Hacks/HvH/RadarSpotted.h"
 #include "Memory.h"
 
 #include "Resources/avatar_ct.h"
@@ -95,6 +98,8 @@ void GameData::update(const ClientInterfaces& clientInterfaces, const EngineInte
     infernoData.clear();
 
     localPlayerData.update(engineInterfaces.getEngine());
+    if (memory.globalVars->intervalPerTick > 0.0f)
+        localPlayerData.tickRate = static_cast<int>(1.0f / memory.globalVars->intervalPerTick + 0.5f);
     bombData.update(memory);
 
     if (!localPlayer) {
@@ -117,10 +122,27 @@ void GameData::update(const ClientInterfaces& clientInterfaces, const EngineInte
             if (entity.getPOD() == localPlayer.get().getPOD() || entity.getPOD() == observerTarget.getPOD())
                 continue;
 
-            if (const auto player = playerByHandleWritable(entity.handle())) {
+            auto* player = playerByHandleWritable(entity.handle());
+            if (player) {
                 player->update(engineInterfaces, interfaces, memory, entity);
             } else {
                 playerData.emplace_back(engineInterfaces, interfaces, memory, entity);
+                player = &playerData.back();
+            }
+            // бомба в m_hMyWeapons — для флага ESP; у дорманта оставляем последнее известное
+            if (!entity.getNetworkable().isDormant() && entity.isAlive()) {
+                player->hasBomb = false;
+                for (const int weaponHandle : entity.weapons()) {
+                    if (weaponHandle == -1 || weaponHandle == 0)
+                        continue;
+                    const auto weapon = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(weaponHandle));
+                    if (!weapon.getPOD())
+                        continue;
+                    if (weapon.getWeaponType() == WeaponType::C4) {
+                        player->hasBomb = true;
+                        break;
+                    }
+                }
             }
 
             if (!entity.getNetworkable().isDormant() && !entity.isAlive()) {
@@ -301,6 +323,9 @@ void LocalPlayerData::update(const csgo::Engine& engine) noexcept
 
     exists = true;
     alive = localPlayer.get().isAlive();
+    if (csgo::PlayerInfo info{}; engine.getPlayerInfo(localPlayer.get().getNetworkable().index(), info)) {
+        std::snprintf(name, sizeof(name), "%s", info.name);
+    }
 
     if (const auto activeWeapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); activeWeapon.getPOD() != nullptr) {
         inReload = activeWeapon.isInReload();
@@ -419,12 +444,9 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
         // сервер перестал присылать игрока, но звуки шагов/выстрелов с координатами всё ещё приходят:
         // переносим ESP туда и продлеваем показ
         const int index = entity.getNetworkable().index();
-        for (int i = 0; i < memory.activeChannels->count; ++i) {
-            const auto& channel = memory.channels[memory.activeChannels->list[i]];
-            if (channel.soundSource != index || (channel.origin.x == 0.0f && channel.origin.y == 0.0f))
-                continue;
-            const auto shift = channel.origin - origin;
-            origin = channel.origin;
+        const auto moveTo = [&](const csgo::Vector& position) {
+            const auto shift = position - origin;
+            origin = position;
             coordinateFrame.translate(shift);
             headMins += shift;
             headMaxs += shift;
@@ -434,14 +456,27 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
             }
             if (alive)
                 lastContactTime = memory.globalVars->realtime;
+        };
+        for (int i = 0; i < memory.activeChannels->count; ++i) {
+            const auto& channel = memory.channels[memory.activeChannels->list[i]];
+            if (channel.soundSource != index || (channel.origin.x == 0.0f && channel.origin.y == 0.0f))
+                continue;
+            moveTo(channel.origin);
             break;
         }
+        // далеко за пределами нашей видимости — позиция с радара (его видит кто-то из команды)
+        if (auto radarOrigin = origin; alive && hvh::radar::origin(index, lastContactTime, radarOrigin))
+            moveTo(radarOrigin);
         return;
     }
 
     team = entity.getTeamNumber();
     static_cast<BaseData&>(*this) = { entity };
-    origin = entity.getAbsOrigin();
+    const auto rawOrigin = entity.getAbsOrigin();
+    hvh::radar::calibrate(entity.getNetworkable().index(), entity.origin(), memory.globalVars->realtime);
+    // та же сглаженная позиция, в которой рисуется модель (Smoothing.h) — ESP не скачет и совпадает с ней
+    origin = hvh::smoothing::origin(entity.getNetworkable().index(), rawOrigin, entity.velocity(), memory.globalVars->realtime);
+    const auto shownShift = origin - rawOrigin;
     // Коробка игрока (SOLID_BBOX) в мире не вращается — она выровнена по осям. toWorldTransform же
     // повёрнут по углу модели, который крутит вражеский AA: рамка ESP от этого дёргалась шириной.
     // Берём только перенос в origin.
@@ -471,9 +506,18 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
     health = entity.health();
     immune = entity.gunGameImmunity();
     flashDuration = entity.flashDuration();
+    index = entity.getNetworkable().index();
+    armor = entity.armor();
+    money = entity.account();
+    helmet = entity.hasHelmet();
+    defuser = entity.hasDefuser();
+    scoped = entity.isScoped();
+    defusing = entity.isDefusing();
+    reloading = false;
 
     if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, entity.getActiveWeapon()); weapon.getPOD() != nullptr) {
         audible = audible || isEntityAudible(weapon.getNetworkable().index());
+        reloading = weapon.isInReload();
         if (const auto weaponInfo = weapon.getWeaponData())
             activeWeapon = interfaces.getLocalize().findAsUTF8(weaponInfo->name);
     }
@@ -515,8 +559,8 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
         if (reset)
             smoothedPose.resize(bones.size());
         for (std::size_t i = 0; i < bones.size(); ++i) {
-            const auto first = bones[i].first - origin;
-            const auto second = bones[i].second - origin;
+            const auto first = bones[i].first - rawOrigin;
+            const auto second = bones[i].second - rawOrigin;
             auto& pose = smoothedPose[i];
             if (reset || (first - pose.first).length() > 40.0f) {
                 pose = { first, second };
@@ -537,6 +581,8 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
 
     headMins = transform(headBox->bbMin, boneMatrices[headBox->bone]);
     headMaxs = transform(headBox->bbMax, boneMatrices[headBox->bone]);
+    headMins += shownShift;
+    headMaxs += shownShift;
 
     if (headBox->capsuleRadius > 0.0f) {
         headMins -= headBox->capsuleRadius;

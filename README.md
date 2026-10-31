@@ -1,356 +1,123 @@
-# Osiris 
-[![C++](https://img.shields.io/badge/language-C%2B%2B-%23f34b7d.svg?style=plastic)](https://en.wikipedia.org/wiki/C%2B%2B) 
-[![CS:GO](https://img.shields.io/badge/game-CS%3AGO-yellow.svg?style=plastic)](https://store.steampowered.com/app/730/CounterStrike_Global_Offensive/) 
-[![License](https://img.shields.io/github/license/danielkrupinski/Osiris.svg?style=plastic)](LICENSE)
-[![Issues](https://img.shields.io/github/issues/danielkrupinski/Osiris.svg?style=plastic)](https://github.com/danielkrupinski/Osiris/issues)
-<br>![Windows](https://github.com/danielkrupinski/Osiris/workflows/Windows/badge.svg?branch=master&event=push)
-![Linux](https://github.com/danielkrupinski/Osiris/workflows/Linux/badge.svg?branch=master&event=push)
-
-Free open-source cross-platform cheat software for **Counter-Strike: Global Offensive** game. Designed as an internal cheat - [Dynamic-link library](https://en.wikipedia.org/wiki/Dynamic-link_library) (DLL) loadable into game process. Compatible with the Steam version of the game. Available for Windows and Linux systems.
-
-## Features
-*   **Aimbot** - aim assistance
-*   **Triggerbot** - automatically fires when crosshair is on enemy
-*   **Backtrack** - abuse lag compensation to move players back in time
-*   **Glow** - render glow effect on entities
-*   **Chams** - color player models to improve visibility
-*   **Stream Proof ESP** - show information about players, dropped weapons and projectiles
-*   **Visuals** - miscellaneous visual options
-*   [**Inventory Changer**](Source/InventoryChanger/) - add weapon skins, stickers, knives, gloves, medals and more to your in-game inventory
-*   **Sound** - modify volume of certain sound effects
-*   **Style** - select menu window layout and colors
-*   **Misc** - miscellaneous features
-*   **Config** - JSON-based configuration system
-
-<details>
-
-*   **Aimbot** - aim assistance
-    *   **Enabled** - on / off master switch
-    *   **On key \[ key \]** - aimbot works only when chosen key is being held
-    *   **Aimlock** - brings your aim to the target (affected by Smooth).
-    *   **Silent** - aimbot is not visible on your screen (client-sided only)
-    *   **Friendly fire** - treat allies as enemies
-    *   **Visible only** - aim only on visible players
-    *   **Scoped only** - aimbot works only when using scope (applies only to sniper rifles)
-    *   **Ignore flash** - ignore flashbang i.e. aim when local player is flashed
-    *   **Ignore smoke** - ignore smoke i.e. aim when target is in smoke
-    *   **Auto shot** - shoot automatically when target found
-    *   **Auto scope** - automatically scopes sniper rifle before shooting
-    *   **Bone** - bone which aimbot aims at
-    *   **Fov** - field-of-view which aimbot operates \[*0*-*255*\]
-    *   **Smooth** - smooth aimbot movement in order to seem more human-like
-    *   **Max aim inaccuracy** - maximum weapon inaccuracy allowing aimbot to run, lowering this value will e.g. disable aimbot while jumping or running
-
-*   **Triggerbot** - automatically fires when crosshair is on enemy
-    *   **Enabled** - on / off master switch
-    *   **On key \[ key \]** - triggerbot works only when chosen key is being held
-    *   **Friendly fire** - treat allies as enemies
-    *   **Scoped only** - triggerbot works only when using scope (applies only to sniper rifles)
-    *   **Ignore flash** - ignore flashbang i.e. shoot when local player is flashed
-    *   **Ignore smoke** - ignore smoke i.e. shoot when target is in smoke
-    *   **Hitgroup** - body parts on which triggerbot works
-    *   **Shot delay** - delay time in ms (milliseconds)
-    *   **Min damage** - minimal damage to fire.
-
-*   **Backtrack** - abuse lag compensation in order to move players back in time
-    *   **Enabled** - on / off master switch
-    *   **Ignore smoke** - ignore smoke i.e. backtrack when target is in smoke
-    *   **Time limit** - limit the backtracking window \[*1*-*200*ms\]
-
-*   **Glow** - render glow effect on entities
-
-    *Allies, Enemies, Planting (player planting bomb), Defusing (player defusing bomb), Local player, Weapons (dropped weapons), C4, Planted C4, Chickens, Defuse kits, Projectiles, Hostages, Ragdolls* **/** *All, Visible, Occluded*
-
-    *   **Enabled** - on / off master switch
-    *   **Health based** - color is based on player's hp
-    *   **Color** - glow color in rgba format
-    *   **Style** - glow style { `Default`, `Rim3d`, `Edge`, `Edge Pulse` }
-
-*   **Chams** - color player models to improve visibility
-
-    *Allies, Enemies, Planting (player planting bomb), Defusing (player defusing bomb), Local player, Weapons (dropped weapons), Hands (view model hands), Backtrack (requires backtrack to be enabled), Sleeves (view model)* **/** *All, Visible, Occluded*
-    *   **Enabled** - on / off master switch
-    *   **Health based** - color is based on player's hp
-    *   **Blinking** - change transparency frequently
-    *   **Material** - material applied to model { `Normal`, `Flat`, `Animated`, `Platinum`, `Glass`, `Chrome`, `Crystal`, `Silver`, `Gold`, `Plastic`, `Glow` }
-    *   **Wireframe** - render triangle mesh instead of solid material
-    *   **Cover** - draw chams material on top of the original material instead of overriding it
-    *   **Ignore-Z** - draw material through walls
-
-*   **ESP** - show additional information about players and game world
-    1.  *Allies, Enemies*
-        *   *All, Visible, Occluded*
-
-    2.  *Weapons*
-
-    3.  *Projectiles*
-        *   *Flashbang, HE Grenade, Breach Charge, Bump Mine, Decoy Grenade, Molotov, TA Grenade, Smoke Grenade, Snowball*
-
-    4.  *Danger Zone*
-        *   *Sentries, Drones, Cash, Cash Dufflebag, Pistol Case, Light Case, Heavy Case, Explosive Case, Tools Case, Full Armor, Armor, Helmet, Parachute, Briefcase, Tablet Upgrade, ExoJump, Ammobox, Radar Jammer*
-
-    *   **Enabled** - on / off master switch
-    *   **Font** - esp text font
-    *   **Snaplines** - draw snapline to player
-    *   **Eye traces** - draw player eye traces (shows where player looks)
-    *   **Box** - draw 2D box over player model
-    *   **Name** - draw player name
-    *   **Health** - draw player health
-    *   **Health bar** - draw rectangle indicating player health
-    *   **Armor** - draw player armor
-    *   **Armor bar** - draw rectangle indicating player armor
-    *   **Money** - draw player money
-    *   **Head dot** - draw dot on player's head
-    *   **Active Weapon** - draw player equipped weapon
+<div align="center">
 
-*   **Visuals** - miscellaneous visual options
-    *   **Disable post-processing** - disable post-processing effects in order to increase FPS
-    *   **Inverse ragdoll gravity** - inverse gravitational acceleration on falling player ragdoll corpse (during death sequence)
-    *   **No fog** - remove fog from map for better visibility
-    *   **No 3d sky** - remove 3d skybox from map - increases FPS
-    *   **No visual recoil** - remove visual recoil punch effect
-    *   **No hands** - remove arms / hands model from first-person view
-    *   **No sleeves** - remove sleeves model from first-person view
-    *   **No weapons** - remove weapons model from first-person view
-    *   **No smoke** - remove smoke grenade effect
-    *   **No blur** - remove blur
-    *   **No scope overlay** - remove black overlay while scoping
-    *   **No grass** - remove grass from map in Danger Zone mode (`dz_blacksite` and `dz_sirocco` maps)
-    *   **No shadows** - disable dynamic shadows
-    *   **Wireframe smoke** - render smoke skeleton instead of particle effect
-    *   **Zoom \[ key \]** - enable zoom on unzoomable weapons
-    *   **Thirdperson** - thirdperson view
-    *   **Thirdperson distance** - camera distance in thirdperson view
-    *   **View model FOV** - change view model FOV \[*-60*-*0*-*60*\] (0 - actual view model, negative values - decreased view model, positive values - increased view model)
-    *   **FOV** - change view FOV \[*-60*-*0*-*60*\] (0 - actual view fov, negative values - decreased, positive values - increased)
-    *   **Far Z** - far clipping range, useful after disabling fog on large maps (e.g `dz_sirocco`) to render distant buildings
-    *   **Flash reduction** - reduces flashbang grenade effect \[*0*-*100*%\] (0 - full flash, 100 - no flash)
-    *   **Brightness** - control game brightness \[*0.0*-*1.0*\]
-    *   **Skybox** - change sky(box)
-    *   **World color** - set world material ambient light color
-    *   **Deagle spinner** - play "spinning" inspect animation when holding Deagle
-    *   **Screen effect** - screenspace effect - *Drone cam, Drone cam with noise, Underwater, Healthboost, Dangerzone*
-    *   **Hit effect** - show screen effect on enemy hit
-    *   **Hit marker** - show a cross detail on enemy hit
+# newerwin
 
-*   **Inventory Changer** - add weapon skins, stickers, knives, gloves, medals and more to your in-game inventory
+**Опенсорс HvH-чит для CS:GO legacy под Linux**
 
-*   **Sound** - modify volume of certain sound effects
-    *   **Chicken volume** - volume of chicken sounds
+Рейджбот с резольвером по слоям анимации · гибкий билдер антиаимов · дефенсив AA · DT · меню в стиле gamesense
 
-    *Local player, Allies, Enemies*
-    *   **Master volume** - overall volume of sounds emitted by player
-    *   **Headshot volume** - volume of headshot sound (when player gets headshoted)
-    *   **Weapon volume** - volume of player weapon shots
-    *   **Footstep volume** - volume of player footsteps
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-9ac527?style=for-the-badge&logo=cplusplus&logoColor=white)](https://en.cppreference.com/w/cpp/20)
+[![Linux](https://img.shields.io/badge/Linux-x86__64-9ac527?style=for-the-badge&logo=linux&logoColor=white)](#сборка)
+[![CS:GO legacy](https://img.shields.io/badge/CS%3AGO-legacy-9ac527?style=for-the-badge&logo=counterstrike&logoColor=white)](https://store.steampowered.com/app/730/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-9ac527?style=for-the-badge)](LICENSE)
 
-*   **Misc** - miscellaneous features
-    *   **Menu key \[ key \]** - menu toggle key
+[Возможности](#возможности) · [Сборка](#сборка) · [Запуск](#запуск) · [Как устроен резольвер](docs/INTERNALS.md) · [Структура](#структура-проекта)
 
-    *   **Menu style** - menu style toggle (*Classic* **/** *One window*)
+</div>
 
-    *   **Menu colors** - menu color theme (*Dark **/** Light **/** Classic*)
+---
 
-    *   **Anti AFK kick** - avoid auto-kick by server for inactivity
+> [!IMPORTANT]
+> newerwin работает **только** в игре, запущенной с параметром `-insecure` (`Source/InsecureGate.h`).
+> С этим флагом движок сам не пускает на VAC-серверы, поэтому чит доступен лишь на insecure/HvH-серверах
+> и в локальной игре. Обхода VAC нет и не будет, репортбот вырезан.
 
-    *   **Auto strafe** - automatically strafe in air following mouse movement
+## Возможности
 
-    *   **Bunny hop** - automatically simulate space bar press / release while jump button is being held; increases movement speed
+### 🎯 Рейдж
 
-    *   **Clan tag** - set custom clan tag
+| | |
+|---|---|
+| **Рейджбот** | мультипоинт с авто-размером точек по разбросу, хитшанс по капсулам хитбоксов, мин. урон и его override на бинд, «только в тело», форсшут |
+| **Свой лагкомп** | записи на каждое обновление врага, приоритет onshot → стоит → свежая → старая, прогноз «вперёд» с самокалибровкой по промахам |
+| **Резольвер по слоям** | подставляет в animstate врага углы-кандидаты, прогоняет движковый `CCSGOPlayerAnimState::Update` и сравнивает слои с сетевыми; якорь по LBY, режим «до максимума», зеркало по счёту попаданий |
+| **Безопасные точки** | точки, общие для найденного угла и крайних сторон десинка; голова — только по доказанной стороне |
+| **Автоволл** | пробитие стен со своим `TraceToExit` |
+| **Автостоп / автоскоуп** | полный или «по точности», торможение между выстрелами |
+| **Кнайфбот** | ПКМ/ЛКМ по дистанции, удар в спину, учёт брони, бектрек |
+| **Зевсбот** | только наверняка: грудь/живот/таз, урон наповал, свой хитшанс |
+| **Логи выстрелов** | причина каждого промаха (резольвер / прогноз / разброс / автоволл / лаг) в консоли, файле и на экране |
 
-    *   **Animated clan tag** - animate clan tag
+### 🛡️ Антиаимы
 
-    *   **Fast duck** - remove crouch delay
+| | |
+|---|---|
+| **Билдер по состояниям** | общее, стоя, бег, шаг, воздух, воздух+присед, присед, присед в движении, фейклаг |
+| **Модификаторы yaw** | джиттер, центр-джиттер, спин, рандом, N-way, вращение, скиттер, рандомизация размаха |
+| **Десинк** | статика / джиттер / рандом, отдельно влево и вправо, добавки к yaw по стороне |
+| **Задержка переключения** | статичная, плавающая, случайная, качели |
+| **Дефенсив AA** | скрытые углы, пока лагкомп по нам не пишется: 9 видов pitch, 12 видов yaw, Force LC, LC-триггеры по состояниям |
+| **Анти-брутфорс** | по выстрелу врага или своему: смена стороны, подстройка, стойка пресетов |
+| **Остальное** | фристенд, edge yaw, ручной AA на 4 стороны, roll, safe head, легит AA на E, плавные переходы, флики |
 
-    *   **Sniper crosshair** - draw crosshair while holding sniper rifle
+### ⚡ Эксплойты и движение
 
-    *   **Recoil crosshair** - crosshair follows recoil pattern
+Double tap, телепорт, дефенсив по заряду, фейкдак, автопик, слайд-волк, быстрая лестница, банни-хоп, автострейф.
 
-    *   **Auto pistol** - fire pistols like automatic rifles
+### 👁️ Визуалы
 
-    *   **Auto reload** - automatically reload if weapon has empty clip
+ESP с флагами (броня, деньги, дефьюз, скоуп, бомба), точка прицела рейджа, хитбоксы на выстреле, цифры урона,
+шаги врагов, таймеры гранат, траектория гранаты, ровные линии скоупа без зума, ватермарка в стиле gamesense,
+индикаторы DT/FS/DEF/AA под прицелом, снаряжение врагов по Tab.
 
-    *   **Auto accept** - automatically accept competitive match
+Всё из Osiris тоже на месте: chams, glow, stream-proof ESP, инвентарь-ченджер, легитбот, триггербот.
 
-    *   **Radar hack** - show enemies positions on radar
+## Сборка
 
-    *   **Reveal ranks** - show player ranks in scoreboard in competitive modes
+Нужны `clang`, `cmake` ≥ 3.16, `ninja`, SDL2 и freetype.
 
-    *   **Reveal money** - show enemies' money in scoreboard
+```bash
+# Arch / CachyOS
+sudo pacman -S --needed clang cmake ninja sdl2 freetype2
 
-    *   **Spectator list** - show nicknames of players spectating you
+# Debian / Ubuntu
+sudo apt install clang cmake ninja-build libsdl2-dev libfreetype-dev
+```
 
-    *   **Watermark** - show cheat name in the upper-left screen corner and fps & ping in the upper-right corner
+```bash
+git clone https://github.com/picun7977-cell/newerwin-csgo.git
+cd newerwin-csgo
+./csgo-hvh.sh          # соберёт build/Source/libOsiris.so и покажет параметры запуска
+```
 
-    *   **Offscreen Enemies** - draw circles on the screen indicating that there are enemies behind us
+Или вручную:
 
-    *   **Fix animation LOD** - fix aimbot inaccuracy for players behind local player
+```bash
+cmake -S . -B build -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++ -D CMAKE_C_COMPILER=clang
+cmake --build build
+```
 
-    *   **Fix bone matrix** - correct client bone matrix to be closer to server one
+## Запуск
 
-    *   **Disable model occlusion** - draw player models even if they are behind thick walls
+Steam → CS:GO (legacy) → Свойства → Параметры запуска:
 
-    *   **Kill message** - print message to chat after killing an enemy
+```
+SDL_VIDEODRIVER=x11 LD_PRELOAD="$LD_PRELOAD:/путь/к/newerwin-csgo/build/Source/libOsiris.so" %command% -insecure
+```
 
-    *   **Name stealer** - mimic other players names
+- `SDL_VIDEODRIVER=x11` нужен, если в системе задан синтаксис SDL3 (например, в Hyprland `wayland,x11,windows`) —
+  встроенная в игру SDL2 его не понимает и падает на старте, даже без чита.
+- Меню — **Insert**. Чит поднимается через несколько секунд после главного меню игры.
+- Логи выстрелов пишутся в `~/csgo-hvh/logs/ГГГГ-ММ-ДД.log`.
 
-    *   **Custom clantag** - set a custom clantag
+## Структура проекта
 
-    *   **Fast plant** - plants bomb on bombsite border, when holding <kbd>LMB</kbd> or <kbd>E</kbd> key
+| Путь | Что там |
+|---|---|
+| [`Source/Hacks/HvH/Ragebot.cpp`](Source/Hacks/HvH/Ragebot.cpp) | рейджбот, лагкомп, прогноз, кнайфбот, зевсбот, разбор промахов |
+| [`Source/Hacks/HvH/Resolver.cpp`](Source/Hacks/HvH/Resolver.cpp) | резольвер по слоям анимации |
+| [`Source/Hacks/HvH/AntiAim.cpp`](Source/Hacks/HvH/AntiAim.cpp) | билдер AA, дефенсив AA, анти-брутфорс, фристенд, edge yaw, roll |
+| [`Source/Hacks/HvH/Tickbase.cpp`](Source/Hacks/HvH/Tickbase.cpp) | детур `CL_Move`, DT, окно дефенсива |
+| [`Source/Hacks/HvH/Autowall.cpp`](Source/Hacks/HvH/Autowall.cpp) | пробитие стен |
+| [`Source/Hacks/HvH/HvhGui.cpp`](Source/Hacks/HvH/HvhGui.cpp) | виджеты меню, вкладки, индикаторы, ватермарка |
+| [`Source/Hacks/HvH/HvhConfig.h`](Source/Hacks/HvH/HvhConfig.h) | все настройки и их сохранение в конфиг |
+| [`docs/INTERNALS.md`](docs/INTERNALS.md) | как работает резольвер, офсеты, разбор логов |
 
-    *   **Fast Stop** - stops the player faster than normal
+## Благодарности
 
-    *   **Quick reload** - perform quick weapon switch during reload for faster reload
+- [**Osiris**](https://github.com/danielkrupinski/Osiris) Даниэля Крупиньского — основа: хуки, интерфейсы движка, визуалы, инвентарь-ченджер.
+- [**Dear ImGui**](https://github.com/ocornut/imgui) — меню.
 
-    *   **Prepare revolver \[ key \]** - keep revolver cocked, optionally on key
+## Лицензия
 
-    *   **Fix tablet signal** - allow use tablet on underground (dangerzone)
-
-    *   **Hit Sound** - sound emitted when hurting enemy
-
-    *   **Chocked packets** - length of sequence of chocked ticks
-
-    *   **Max angle delta** - maximum viewangles change per tick
-
-    *   **Aspect Ratio** - allows you to change the aspect ratio
-
-    *   **Purchase List** - show the purchased equipment by enemies.
-
-    *   **Reportbot** - automatically report players on server for cheating or other abusive actions
-        *   **Enabled** - on / off master switch
-        *   **Target** - report target *Enemies/Allies/All*
-        *   **Delay** - delay between reports, in seconds
-        *   **Aimbot** - report for aim assistance
-        *   **Wallhack** - report for visual assistance
-        *   **Other** - report for other assistance
-        *   **Griefing** - report for griefing
-        *   **Abusive Communications** - report for abusive communications
-
-    *   **Unhook** - unload cheat
-
-*   **Config** - JSON-based configuration system
-    *   **Create config** - create new configuration file
-    *   **Reset config** - restore default configuration settings (does not touch saved configuration)
-    *   **Load selected** - load selected configuration file
-    *   **Save selected** - save selected configuration file
-    *   **Delete selected** - delete selected configuration file
-    *   **Reload configs** - reload configs list
-</details>
-
-## Getting started
-
-### Prerequisites
-Microsoft Visual Studio 2019 16.10 (or newer), platform toolset v142 and Windows SDK 10.0.x.x are required in order to compile Osiris. If you don't have ones, you can download VS [here](https://visualstudio.microsoft.com/) (Windows SDK is installed during Visual Studio Setup).
-
-### Downloading
-
-There are two options of downloading the source code:
-
-#### Without [git](https://git-scm.com)
-
-Choose this option if you want pure source and you're not going to contribute to the repo. Download size ~600 kB.
-
-To download source code this way [click here](https://github.com/danielkrupinski/Osiris/archive/master.zip).
-
-#### With [git](https://git-scm.com)
-
-Choose this option if you're going to contribute to the repo or you want to use version control system. Download size ~4 MB. Git is required to step further, if not installed download it [here](https://git-scm.com).
-
-Open git command prompt and enter following command:
-
-    git clone --depth=1 https://github.com/danielkrupinski/Osiris.git
-
-`Osiris` folder should have been successfully created, containing all the source files.
-
-### Compiling from source
-
-<details>
-
-<summary>Windows</summary>
-
-When you have equipped a copy of the source code, next step is opening **Osiris.sln** in Microsoft Visual Studio 2019.
-
-Then change build configuration to `Release | x86` and simply press **Build solution**.
-
-If everything went right you should receive `Osiris.dll`  binary file.
-
-</details>
-
-<details>
-
-<summary>Linux</summary>
-
-Install dependencies:
-
-    sudo apt-get update && sudo apt-get install -y libsdl2-dev libfreetype-dev
-
-Configure with CMake:
-
-    cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=g++-11 -S . -B build
-
-Instead of g++-11 you can use g++-12, clang++-13, clang++-14, clang++-15.
-
-Build:
-
-    cmake --build build -j $(nproc --all)
-
-After following these steps you should receive `libOsiris.so` file in `build` directory.
-
-</details>
-
-### Loading / Injecting into game process
-
-<details>
-
-<summary>Windows</summary>
-
-Open your favorite [DLL injector](https://en.wikipedia.org/wiki/DLL_injection) and just inject `Osiris.dll` into `csgo.exe` process.
-
-When injected, menu is openable under `INSERT` key.
-
-</details>
-
-<details>
-
-<summary>Linux</summary>
-
-You can run the following script in the directory containing `libOsiris.so`:
-
-    sudo gdb -batch-silent -p $(pidof csgo_linux64) -ex "call (void*)__libc_dlopen_mode(\"$PWD/libOsiris.so\", 2)"
-
-</details>
-
-### Further optimizations
-If your CPU supports AVX / AVX2 / AVX-512 instruction set, you can enable it in project settings. This should result in more performant code, optimized for your CPU. Currently SSE2 instructions are selected in project settings.
-
-## FAQ
-
-### How do I open menu?
-Press <kbd>INSERT</kbd> while focused on CS:GO window.
-
-### Where is my config file saved?
-Configuration files are saved inside `Osiris` folder in your `Documents` folder (`%USERPROFILE%\Documents\Osiris`). The config is in human readable format and can be edited (e.g, using notepad). Sometimes after updates configuration file needs to be deleted and recreated.
-
-### What hooking methods Osiris uses?
-Currently implemented hooking methods are:
-*   MinHook - trampoline hook
-*   VmtHook - hook a function directly in a vtable
-*   VmtSwap - create a copy of a vtable and swap the pointer on the class instance
-
-Hooking implementation files are located in [Hooks](Source/Hooks) directory.
-
-## Acknowledgments
-
-*   [ocornut](https://github.com/ocornut) and [contributors](https://github.com/ocornut/imgui/graphs/contributors) for creating and maintaining an amazing GUI library - [Dear imgui](https://github.com/ocornut/imgui).
-*   [Zer0Mem0ry](https://github.com/Zer0Mem0ry) - for great tutorials on reverse engineering and game hacking
-
-## License
-
-> Copyright (c) 2018-2023 Daniel Krupiński
-
-This project is licensed under the [MIT License](https://opensource.org/licenses/mit-license.php) - see the [LICENSE](https://github.com/danielkrupinski/Osiris/blob/master/LICENSE) file for details.
-
-## See also
-*   [Anubis](https://github.com/danielkrupinski/Anubis) - free and open source cheat for CS:GO
-*   [GOESP](https://github.com/danielkrupinski/GOESP) - free and open source cross-platform streamproof ESP hack for Counter-Strike: Global Offensive, written in modern C++
+[MIT](LICENSE). Код распространяется как есть, без гарантий. Используй только там, где это разрешено правилами сервера.

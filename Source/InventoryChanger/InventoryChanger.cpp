@@ -422,6 +422,13 @@ static void applyFallbackWeapons(const EngineInterfaces& engineInterfaces, const
                 }
             }
             weapon.entityQuality() = 3;
+            // Мировая модель ножа — отдельный entity. Пока нож убран, она остаётся с дефолтной моделью,
+            // а материал уже от нового ножа — отсюда спам «Failed to set custom material ... w_knife_default».
+            if (definitionIndex == knifeID) {
+                const auto knifeWorld = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(weapon.weaponWorldModel()));
+                if (knifeWorld.getPOD() != nullptr)
+                    setModelIfChanged(knifeWorld, engineInterfaces, memory, knifeID, true);
+            }
         }
 
         const auto it = skins.weapons.find(static_cast<int>(definitionIndex));

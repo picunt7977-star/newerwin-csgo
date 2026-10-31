@@ -1,7 +1,7 @@
-# ECLIPSE — хвх для CS:GO legacy (Linux)
+# newerwin — как это устроено
 
 Основа — [Osiris](https://github.com/danielkrupinski/Osiris), ветка `csgo` (MIT). Поверх добавлено:
-рейджбот, автоволл, DT, антиаимы с десинком, меню в стиле Neverlose.
+рейджбот, автоволл, DT, антиаимы с десинком, меню в стиле gamesense.
 
 ## Граница
 
@@ -19,7 +19,7 @@
 Параметры запуска в Steam (CS:GO legacy):
 
 ```
-SDL_VIDEODRIVER=x11 LD_PRELOAD="$LD_PRELOAD:/home/alex/csgo-hvh/build/Source/libOsiris.so" %command% -insecure
+SDL_VIDEODRIVER=x11 LD_PRELOAD="$LD_PRELOAD:/путь/к/newerwin-csgo/build/Source/libOsiris.so" %command% -insecure
 ```
 
 `SDL_VIDEODRIVER=x11` обязателен: в Hyprland задано `wayland,x11,windows` (синтаксис SDL3),
@@ -92,7 +92,7 @@ SDL_VIDEODRIVER=x11 LD_PRELOAD="$LD_PRELOAD:/home/alex/csgo-hvh/build/Source/lib
 Проверки на всякий случай: офсет animstate берётся только из разобранного кода (не нашёлся — всё,
 что читает animstate, выключается), поля проверяются на правдоподобие, `animstate->player` должен
 совпасть с игроком, а сетевые слои — пройти проверку на вменяемость. При любом несовпадении в консоль
-летит `[ECLIPSE]`-сообщение и резольвер откатывается на геометрию.
+летит `[newerwin]`-сообщение и резольвер откатывается на геометрию.
 
 В консоли при первом обновлении печатается строка с найденными офсетами и тем, приходят ли сетевые
 слои; на каждый промах по вине резольвера — его дельта, уверенность, ошибка и число сигналов.
