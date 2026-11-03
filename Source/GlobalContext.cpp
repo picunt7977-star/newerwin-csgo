@@ -3,6 +3,10 @@
 #include "Hacks/HvH/Ragebot.h"
 #include "Hacks/HvH/HvhGui.h"
 #include "Hacks/HvH/HvhVisuals.h"
+#include "Hacks/HvH/Extras.h"
+#include "Hacks/HvH/Scoreboard.h"
+#include "Hacks/HvH/Extras.h"
+#include "Hacks/HvH/Scoreboard.h"
 #include "Hacks/HvH/Tickbase.h"
 #include "GlobalContext.h"
 
@@ -128,9 +132,10 @@ void GlobalContext::renderFrame()
         features->misc.spectatorList();
         features->visuals.hitMarker(nullptr, ImGui::GetBackgroundDrawList());
         features->visuals.drawMolotovHull(ImGui::GetBackgroundDrawList());
-        features->misc.watermark();
         hvh::gui::drawIndicators(ImGui::GetBackgroundDrawList());
         hvh::gui::drawWatermark(ImGui::GetBackgroundDrawList());
+        hvh::extras::draw(ImGui::GetBackgroundDrawList());
+        hvh::scoreboard::draw(ImGui::GetBackgroundDrawList());
         hvh::movement::draw(ImGui::GetBackgroundDrawList());
         hvh::ragebot::drawLogs(ImGui::GetBackgroundDrawList());
         hvh::grenade::draw(ImGui::GetBackgroundDrawList());

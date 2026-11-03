@@ -221,6 +221,10 @@ struct AntiAimConfig {
 struct ExploitConfig {
     bool doubleTap = false;
     KeyBindToggle doubleTapKey;
+    // 0 — быстрая стрельба (сдвиг на выстреле, вторая пуля); 1 — дефенсив DT: выстрел обычный, заряд уходит
+    // на рывок при выглядывании (враг только что увидел) и LC-триггеры. У скаута/AWP всегда дефенсив:
+    // второй пули у них нет, а на серверах с DT-фиксом сдвиг на выстреле ломает следующий выстрел.
+    int doubleTapMode = 0;
     int shiftTicks = 13;
     KeyBind teleportKey;            // нажать: мгновенно прогнать заряженные тики (рывок)
     bool defensive = false;         // враг только что увидел нас — авто-рывок, его лагкомп по нам ломается
@@ -252,6 +256,25 @@ struct ViewConfig {
     bool killFlash = true;          // вспышка краёв экрана при убийстве
     bool grenadeTimers = true;      // над дымом и огнём — сколько им осталось
     bool shotCapsules = true;       // хитбоксы цели в момент выстрела (зелёные — попал, красные — мимо)
+    // из hysteria (Extras.cpp)
+    bool aspectRatio = false;
+    float aspectRatioValue = 1.5f;  // 1.25 — 5:4, 1.33 — 4:3, 1.5 — 3:2, 1.6 — 16:10, 1.78 — 16:9
+    bool viewmodel = false;
+    int viewmodelFov = 68;
+    float viewmodelX = 0.0f, viewmodelY = 0.0f, viewmodelZ = 0.0f;
+    bool customScope = false;       // свой прицел снайпера: градиентные линии вместо чёрных
+    int scopeSize = 40;
+    int scopeGap = 10;
+    bool scopeT = false;            // без верхней линии
+    bool damageIndicator = false;   // мин. урон у прицела
+    bool shotMarkers = false;       // метки в мире: куда попал / где пуля прошла мимо
+    bool missMarkers = false;
+    float shotMarkerTime = 2.0f;
+    bool slowdownWarning = false;   // после попадания по нам скорость режется — показать насколько
+    bool keybindList = false;       // активные бинды
+    bool lcIndicator = false;       // окно дефенсива (лагкомп по нам не пишется)
+    bool trashTalk = false;         // сообщение в чат при килле/смерти
+    int trashTalkWhen = 3;          // 1 — при килле, 2 — при смерти
 };
 
 // Автострейф: «По камере» — летим туда, куда смотрим (S — назад), «WASD» — направление клавишами
@@ -261,6 +284,7 @@ enum class AutoPeekMode { Shot, ShotOrRelease };
 struct MovementConfig {
     KeyBind autoPeekKey;            // держать: запомнить точку, после выстрела вернуться
     int autoPeekMode = 0;           // AutoPeekMode: только после выстрела / ещё и когда отпустил WASD
+    int peekTeleportTicks = 14;     // заряд под телепорт назад (больше «Тиков сдвига» DT — телепорт дальше)
     KeyBind fakeDuckKey;
     bool fastLadder = false;
     bool bunnyHop = false;

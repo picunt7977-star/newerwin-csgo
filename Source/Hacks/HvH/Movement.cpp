@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <numbers>
 #include <string>
 
@@ -9,6 +10,7 @@
 #include "HvhConfig.h"
 #include "HvhGui.h"
 #include "Movement.h"
+#include "Ragebot.h"
 #include "Tickbase.h"
 
 #include <GameData.h>
@@ -17,6 +19,7 @@
 #include <CSGO/Cvar.h>
 #include <CSGO/Engine.h>
 #include <CSGO/Entity.h>
+#include <CSGO/GlobalVars.h>
 #include <CSGO/EntityList.h>
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/EngineInterfaces.h>
@@ -33,6 +36,8 @@ namespace
 {
 
 bool fakeDucking = false;
+float fdSentDuck = -1.0f;   // присед на последнем отправленном тике (то, что видят враги)
+float fdLowDuck = -1.0f;    // минимум приседа за цикл (с этой высоты стреляем)
 
 bool peekActive = false;
 bool peekReturning = false;
@@ -125,37 +130,54 @@ void autoStrafe(csgo::UserCmd* cmd, float viewYaw, const csgo::Cvar& cvar, float
     cmd->sidemove = -std::sin(relative) * 450.0f;
 }
 
-void fakeDuck(csgo::UserCmd* cmd, float interval) noexcept
+// Фейкдак. Пачка из N команд (чок), отправляется последняя — только её присед видят враги и лагкомп.
+// Первую половину пачки стоим (с этой высоты стреляем), вторую садимся: к отправке модель в полном
+// приседе (IN_BULLRUSH снимает задержку приседа, 7 тиков хватает). Чок N — 14, но часть серверов
+// обрабатывает за раз меньше команд и выкидывает хвост пачки, то есть как раз присед: враг видит нас
+// стоящими через раз («то 100, то 0»). Тогда N уменьшаем, пока отправка не придётся на присед.
+void fakeDuck(csgo::UserCmd* cmd, float) noexcept
 {
+    static int badSends = 0;
+    static float cycleLow = 1.0f;
+
     const auto& key = config.movement.fakeDuckKey;
     fakeDucking = key.isSet() && key.isDown() && tickbase::isInstalled()
         && localPlayer && localPlayer.get().isAlive() && localPlayer.get().isOnGround();
     tickbase::setFakeDuck(fakeDucking);
-    if (!fakeDucking)
+    if (!fakeDucking) {
+        badSends = 0;
+        cycleLow = 1.0f;
+        fdSentDuck = fdLowDuck = -1.0f;
         return;
-
-    // без задержки приседания, иначе за 7 тиков не успеть
-    cmd->buttons |= csgo::UserCmd::IN_BULLRUSH;
-    // Отправленный тик (его видят остальные) должен прийтись на полный присед, а до этого стоим как можно
-    // дольше — с этой высоты и стреляем. Раньше делили чок пополам (7 стоим / 8 сидим), но присед идёт со
-    // скоростью m_flDuckSpeed, и на 128 тиках или со штрафом за спам приседа к отправке он не досаживал.
-    // Теперь садимся, когда до отправки осталось ровно столько команд, сколько нужно на полный присед (+1 запас).
-    constexpr int fakeDuckChoke = 14;   // как chokeLimit() в Tickbase.cpp при фейкдаке
-    const int commandsLeft = fakeDuckChoke - tickbase::chokedCommands() + 1;   // включая эту
-    bool duck = tickbase::chokedCommands() > 6;
-    static const auto duckAmountOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckAmount"));
-    static const auto duckSpeedOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckSpeed"));
-    if (duckAmountOffset && duckSpeedOffset && interval > 0.0f) {
-        const auto base = std::uintptr_t(localPlayer.get().getPOD());
-        const float amount = std::clamp(*reinterpret_cast<const float*>(base + duckAmountOffset), 0.0f, 1.0f);
-        const float speed = std::max(*reinterpret_cast<const float*>(base + duckSpeedOffset), 1.0f);
-        const int ticksToFull = static_cast<int>(std::ceil((1.0f - amount) / (speed * interval) - 0.001f));
-        duck = ticksToFull + 1 >= commandsLeft;
     }
-    if (duck)
+
+    cmd->buttons |= csgo::UserCmd::IN_BULLRUSH;
+    const int limit = tickbase::fakeDuckChoke();
+    const int choked = tickbase::chokedCommands();
+    if (choked >= limit / 2)
         cmd->buttons |= csgo::UserCmd::IN_DUCK;
     else
         cmd->buttons &= ~csgo::UserCmd::IN_DUCK;
+
+    // проверка: прошлая команда ушла — какой присед получил сервер (предсказание поправлено по нему)
+    static const auto duckAmountOffset = Netvars::get(fnv::hash("CBasePlayer->m_flDuckAmount"));
+    if (!duckAmountOffset)
+        return;
+    const float amount = std::clamp(*reinterpret_cast<const float*>(std::uintptr_t(localPlayer.get().getPOD()) + duckAmountOffset), 0.0f, 1.0f);
+    if (choked == 0) {
+        fdSentDuck = amount;
+        fdLowDuck = cycleLow;
+        cycleLow = 1.0f;
+        if (amount < 0.5f) {
+            if (++badSends >= 2) {
+                tickbase::setFakeDuckChoke(limit - 1);
+                badSends = 0;
+            }
+        } else if (amount >= 0.85f) {
+            badSends = 0;
+        }
+    }
+    cycleLow = std::min(cycleLow, amount);
 }
 
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept
@@ -170,6 +192,7 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
 
     if (!localPlayer || !localPlayer.get().isAlive() || !tickbase::isInstalled()) {
         enemyWasVisible.fill(false);
+        tickbase::setThreat(false);
         return;
     }
 
@@ -178,15 +201,8 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
         return;
     }
 
-    if (!ex.defensive)
-        return;
-    // пока зажат автопик, заряд бережём под телепорт назад
-    if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
-        return;
-
-    // дефенсив: враг только что увидел нас — рывок на заряженные тики. Между двумя пакетами мы
-    // смещаемся сразу на десятки юнитов, и его лагкомпенсация/бектрек по нашей прошлой позиции не работает
-    bool newlySpotted = false;
+    // Кто нас сейчас видит: для рывка «враг только что увидел» и чтобы не дозаряжаться посреди перестрелки
+    bool newlySpotted = false, anyVisible = false;
     const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
@@ -197,12 +213,30 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
         const bool visible = localPlayer.get().visibleTo(engineInterfaces, memory, entity);
         if (visible && !enemyWasVisible[i])
             newlySpotted = true;
+        anyVisible = anyVisible || visible;
         enemyWasVisible[i] = visible;
     }
+    tickbase::setThreat(anyVisible);
 
+    // дефенсив DT рвётся при выглядывании и без отдельной галки «Дефенсив»
+    if (!ex.defensive && !tickbase::defensiveDoubleTap())
+        return;
+    // пока зажат автопик, заряд бережём под телепорт назад
+    if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
+        return;
+
+    // Дефенсив: враг только что увидел нас — рывок на заряженные тики, его лагкомп по нашей прошлой позиции
+    // не работает. Не чаще раза в секунду: враг то пропадал, то появлялся, и рывков было по три подряд
+    // (лог 01.11 12:53:12), а после каждого 6 тиков зарядки — стоишь и не стреляешь.
+    static float lastSpotShift = -10.0f;
+    const float now = memory.globalVars->realtime;
+    if (now < lastSpotShift)
+        lastSpotShift = -10.0f;
     // стоя рывок ничего не даёт — нужна скорость
-    if (newlySpotted && tickbase::isCharged() && localPlayer.get().velocity().length2D() > 60.0f)
+    if (newlySpotted && now - lastSpotShift > 1.0f && tickbase::isCharged() && tickbase::defensiveAllowed() && localPlayer.get().velocity().length2D() > 60.0f) {
         tickbase::requestShift();
+        lastSpotShift = now;
+    }
 }
 
 namespace
@@ -250,6 +284,12 @@ void autoBuy(const csgo::Engine& engine) noexcept
         engine.clientCmdUnrestricted(command.c_str());
 }
 
+void fakeDuckStats(float& sent, float& low) noexcept
+{
+    sent = fdSentDuck;
+    low = fdLowDuck;
+}
+
 bool isFakeDucking() noexcept
 {
     return fakeDucking;
@@ -281,8 +321,14 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
         peekTeleported = false;
         peekReturnTicks = 0;
     }
-    if (shot)
+    if (shot && !peekReturning) {
         peekReturning = true;
+        char text[160];
+        std::snprintf(text, sizeof(text), "[автопик] выстрел — возврат: DT %s, режим %s, заряд %d, до точки %.0f ед.",
+            tickbase::doubleTapEnabled() ? "вкл" : "выкл", tickbase::fastFireEnabled() ? "быстрый" : "дефенсив",
+            tickbase::chargedTicks(), std::hypot(peekOrigin.x - origin.x, peekOrigin.y - origin.y));
+        ragebot::logToFile(text);
+    }
     constexpr auto moveButtons = csgo::UserCmd::IN_FORWARD | csgo::UserCmd::IN_BACK | csgo::UserCmd::IN_MOVELEFT | csgo::UserCmd::IN_MOVERIGHT;
     if (config.movement.autoPeekMode == static_cast<int>(AutoPeekMode::ShotOrRelease) && !(cmd->buttons & moveButtons))
         peekReturning = true;
@@ -314,10 +360,22 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
         maxSpeed = std::clamp(maxSpeed, 50.0f, 260.0f);
         const float speed = velocity.length2D();
         const bool arrives = shiftCoverage(speed, maxSpeed, tickbase::chargedTicks() + 1, interval) >= distance - 4.0f;
-        if (arrives || speed >= maxSpeed * 0.9f || peekReturnTicks >= 6) {
+        // Сразу со следующего тика после выстрела (на самом тике выстрела движение назад добавило бы
+        // разброса). Заряд под автопик — до 14 тиков: даже с места после автостопа это ~35–40 ед.
+        // Раньше ждали разгона до 14 тиков — телепорт шёл через ~0.2 с после выстрела.
+        if (arrives || speed >= maxSpeed * 0.9f || peekReturnTicks >= 1) {
             tickbase::requestShift();
             peekTeleported = true;
+            char text[128];
+            std::snprintf(text, sizeof(text), "[автопик] телепорт: заряд %d, скорость %.0f, до точки %.0f ед., тик возврата %d",
+                tickbase::chargedTicks(), speed, distance, peekReturnTicks);
+            ragebot::logToFile(text);
         }
+    } else if (!peekTeleported && peekReturnTicks == 0) {
+        char text[128];
+        std::snprintf(text, sizeof(text), "[автопик] без телепорта: DT %s, сдвиг идёт %s, заряд %d",
+            tickbase::doubleTapEnabled() ? "вкл" : "выкл", tickbase::isShifting() ? "да" : "нет", tickbase::chargedTicks());
+        ragebot::logToFile(text);
     }
     if (!tickbase::isShifting())
         ++peekReturnTicks;

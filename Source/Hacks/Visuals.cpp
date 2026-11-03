@@ -620,7 +620,8 @@ void Visuals::drawGUI(bool contentOnly) noexcept
             | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     }
     ImGui::Columns(2, nullptr, false);
-    ImGui::SetColumnOffset(1, 280.0f);
+    // внутри группы меню ширина меньше окна Osiris — делим пополам, иначе правая колонка обрезается
+    ImGui::SetColumnOffset(1, contentOnly ? ImGui::GetWindowContentRegionMax().x * 0.5f : 280.0f);
     ImGui::Checkbox("Disable post-processing", &postProcessingDisabler.enabled);
     ImGui::Checkbox("Inverse ragdoll gravity", &inverseRagdollGravity_);
     ImGui::Checkbox("No fog", &noFog);
@@ -637,6 +638,8 @@ void Visuals::drawGUI(bool contentOnly) noexcept
     ImGui::Checkbox("No shadows", &noShadows);
     ImGui::Checkbox("Wireframe smoke", &wireframeSmoke);
     ImGui::NextColumn();
+    const float columnWidth = std::max(ImGui::GetColumnWidth() - 12.0f, 80.0f);
+    ImGui::PushItemWidth(columnWidth * 0.5f);   // комбо и ползунки с подписью справа — подпись должна влезть
     ImGui::Checkbox("Zoom", &zoom);
     ImGui::SameLine();
     ImGui::PushID("Zoom Key");
@@ -647,7 +650,7 @@ void Visuals::drawGUI(bool contentOnly) noexcept
     ImGui::PushID("Thirdperson Key");
     ImGui::hotkey("", visualsConfig.thirdpersonKey);
     ImGui::PopID();
-    ImGui::PushItemWidth(290.0f);
+    ImGui::PushItemWidth(contentOnly ? columnWidth : 290.0f);
     ImGui::PushID(0);
     ImGui::SliderInt("", &visualsConfig.thirdpersonDistance, 0, 1000, "Thirdperson distance: %d");
     ImGui::PopID();
@@ -699,6 +702,7 @@ void Visuals::drawGUI(bool contentOnly) noexcept
         ImGui::VSliderFloat("##7", { 40.0f, 160.0f }, &colorCorrection.yellow, 0.0f, 1.0f, "Yellow\n%.3f"); ImGui::SameLine();
         ImGui::EndPopup();
     }
+    ImGui::PopItemWidth();
     ImGui::Columns(1);
 
     if (!contentOnly)

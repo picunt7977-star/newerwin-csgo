@@ -1413,7 +1413,7 @@ void Misc::drawGUI(Visuals& visuals, inventory_changer::InventoryChanger& invent
     }
     ImGui::PopID();
 
-    ImGui::Checkbox("Watermark", &miscConfig.watermark.enabled);
+    // ватермарка — своя, в стиле gamesense (Мир → Ватермарка); старая Osiris убрана, чтобы не было двух
     ImGuiCustom::colorPicker("Offscreen Enemies", miscConfig.offscreenEnemies.asColor4(), &miscConfig.offscreenEnemies.enabled);
     ImGui::SameLine();
     ImGui::PushID("Offscreen Enemies");

@@ -59,6 +59,7 @@
 #include "Hacks/HvH/Tickbase.h"
 #include "Hacks/HvH/HvhVisuals.h"
 #include "Hacks/HvH/Scoreboard.h"
+#include "Hacks/HvH/Extras.h"
 #include "Hooks.h"
 #include "Netvars.h"
 
@@ -83,6 +84,11 @@ void fireGameEvent(csgo::GameEventPOD* eventPointer)
         if (localPlayer && globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("attacker")) == localPlayer.get().getNetworkable().index()
             && globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
             hvh::visuals::onKill();
+        {
+            const auto& engine = globalContext->getEngineInterfaces().getEngine();
+            hvh::extras::onDeath(engine, engine.getPlayerForUserID(event.getInt("attacker")), engine.getPlayerForUserID(event.getInt("userid")),
+                localPlayer ? localPlayer.get().getNetworkable().index() : 0, event.getInt("headshot") != 0);
+        }
         globalContext->features->inventoryChanger.updateStatTrak(event);
         globalContext->features->inventoryChanger.overrideHudIcon(*globalContext->memory, event);
         globalContext->features->misc.killMessage(event);
@@ -260,8 +266,17 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
 
     const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
     hvh::tickbase::setActive(localPlayer && localPlayer.get().isAlive());
-    if (localPlayer && localPlayer.get().isAlive())
+    if (localPlayer && localPlayer.get().isAlive()) {
         hvh::tickbase::updateLagComp(localPlayer.get().tickBase());
+        hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z);   // 1 — FL_ONGROUND
+        // второй пули DT нет у ножа, гранат и оружия с перезарядкой > 0.4 с (скаут, AWP) — там DT дефенсивный.
+        // Раньше это ставил рейдж, а с ножом он до этого места не доходил: режим оставался от прошлого оружия
+        if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
+            const auto data = weapon.getWeaponData();
+            const auto type = weapon.getWeaponType();
+            hvh::tickbase::setSlowWeapon(!data || type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4 || data->cycletime > 0.4f);
+        }
+    }
     hvh::movement::autoBuy(globalContext->getEngineInterfaces().getEngine());
     hvh::movement::exploits(globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory);
 
@@ -288,6 +303,7 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     hvh::visuals::collectGrenades(clientInterfaces, *globalContext->memory);
     hvh::scoreboard::update(*globalContext->memory, globalContext->getOtherInterfaces(), clientInterfaces, globalContext->getEngineInterfaces(),
         cmd->buttons & csgo::UserCmd::IN_SCORE, globalContext->memory->globalVars->realtime);
+    hvh::extras::update(globalContext->getOtherInterfaces(), globalContext->memory->globalVars->intervalPerTick);
     features->misc.edgejump(cmd);
     features->misc.moonwalk(cmd);
     features->misc.fastPlant(cmd);
@@ -577,8 +593,10 @@ void FASTCALL_CONV ClientModeHooks::overrideView(FASTCALL_THIS(csgo::ClientMode*
     if (thirdPerson)
         placeThirdPersonCamera(eye, setup);
     // фейкдак: камера на высоте стоя, хотя модель приседает
-    if (hvh::movement::isFakeDucking() && localPlayer && Netvars::get(fnv::hash("CBasePlayer->m_vecViewOffset[0]")))
-        setup->origin.z += 64.06f - localPlayer.get().viewOffset().z;
+    // Высота считается от интерполированных ног, а не от viewOffset последней команды: тот каждые 14 тиков
+    // скачет 46↔64, а глаз камеры интерполирован — разница дёргала камеру вверх-вниз.
+    if (hvh::movement::isFakeDucking() && localPlayer)
+        setup->origin.z += localPlayer.get().getAbsOrigin().z + 64.06f - eye.z;
 }
 
 int FASTCALL_CONV BspQueryHooks::listLeavesInBox(FASTCALL_THIS(void* thisptr), const csgo::Vector& mins, const csgo::Vector& maxs, unsigned short* list, int listMax) noexcept

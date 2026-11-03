@@ -11,6 +11,7 @@ target_sources(OsirisOBJ PRIVATE
   Visuals.cpp
   HvH/AntiAim.cpp
   HvH/Autowall.cpp
+  HvH/Extras.cpp
   HvH/GrenadePrediction.cpp
   HvH/HvhConfig.cpp
   HvH/HvhGui.cpp

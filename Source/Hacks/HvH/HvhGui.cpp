@@ -534,7 +534,7 @@ void drawIndicators(ImDrawList* drawList) noexcept
     const ImVec2 center{ display.x * 0.5f, display.y * 0.5f };
 
     // ровные тонкие линии вместо игрового скоупа (он спрятан и не плывёт при движении)
-    if (config.view.removeScopeZoom && localPlayer.get().isScoped()) {
+    if (config.view.removeScopeZoom && !config.view.customScope && localPlayer.get().isScoped()) {
         drawList->AddLine({ 0.0f, center.y }, { display.x, center.y }, IM_COL32(0, 0, 0, 220), 1.0f);
         drawList->AddLine({ center.x, 0.0f }, { center.x, display.y }, IM_COL32(0, 0, 0, 220), 1.0f);
     }
@@ -564,14 +564,23 @@ void drawIndicators(ImDrawList* drawList) noexcept
         y += size.y + 1.0f;
     };
 
-    if (movement::isFakeDucking())
-        line("FD", color::accent2);
+    if (movement::isFakeDucking()) {
+        // FD присед на отправке / высота выстрела: хорошо — ~100% / ниже 40%
+        float sent = -1.0f, low = -1.0f;
+        movement::fakeDuckStats(sent, low);
+        char text[48];
+        if (sent >= 0.0f)
+            std::snprintf(text, sizeof(text), "FD  %.0f%% / %.0f%%  %dт", sent * 100.0f, low * 100.0f, tickbase::fakeDuckChoke());
+        else
+            std::snprintf(text, sizeof(text), "FD");
+        line(text, sent >= 0.85f ? color::good : color::bad);
+    }
     else if (config.exploits.doubleTap && (!config.exploits.doubleTapKey.isSet() || config.exploits.doubleTapKey.isToggled()))
-        line("DT", tickbase::isCharged() ? color::good : color::bad);
+        line(tickbase::defensiveDoubleTap() ? "DT · DEF" : "DT", tickbase::isCharged() || tickbase::isDefensiveRecharging() ? color::good : color::bad);
     if (antiaim::isFreestanding())
         line("FS", color::accent);
     if (config.exploits.defensive && !movement::isFakeDucking())
-        line("DEF", tickbase::isCharged() ? color::good : color::bad);
+        line("DEF", tickbase::isCharged() || tickbase::doubleTapEnabled() ? color::good : color::bad);
     if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
         line("PEEK", color::accent);
     if (config.antiAim.enabled) {
@@ -760,6 +769,10 @@ void drawRageTab() noexcept
         auto& ex = config.exploits;
         toggle("Double tap", &ex.doubleTap);
         keybind("Клавиша DT", ex.doubleTapKey);
+        static constexpr const char* dtModes[]{ "Быстрая стрельба", "Дефенсив" };
+        combo("Режим DT", &ex.doubleTapMode, dtModes, IM_ARRAYSIZE(dtModes));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Быстрая стрельба — сдвиг на выстреле, вторая пуля сразу.\nДефенсив — выстрел обычный, заряд уходит на рывок, когда враг\nтебя увидел, и на LC-триггеры: его лагкомп по тебе ломается.\nСкаут и AWP всегда в дефенсиве (второй пули нет, DT-фикс на серверах).");
         sliderInt("Тиков сдвига", &ex.shiftTicks, 6, 14);
         keybind("Телепорт", ex.teleportKey);
         toggle("Дефенсив", &ex.defensive);
@@ -1264,7 +1277,7 @@ void drawEspRageGroup(const ImVec2& size) noexcept
             ImGui::SetTooltip("Скелет цели в момент выстрела (2.5 с):\nзелёный — попал, красный — мимо, белый — ждём ответа сервера.");
         toggle("Снаряжение по Tab", &view.tabLoadout);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Иконки оружия, гранат, брони и бомбы/кусачек в строках врагов в таблице (Tab).");
+            ImGui::SetTooltip("Иконки оружия, гранат, брони и кита/бомбы прямо в строке врага\nв таблице (Tab), посередине между ником и деньгами.");
     }
     endGroup();
 }
@@ -1285,6 +1298,56 @@ void drawVisualsTab() noexcept
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
         ImGui::TextWrapped("Флаги ESP, точка прицела, скелет при выстреле и Tab — во вкладке «Визуалы».");
         ImGui::PopStyleColor();
+    }
+    endGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    if (beginGroup("Экран и чат", { width, height })) {
+        toggle("Aspect ratio", &view.aspectRatio);
+        if (view.aspectRatio) {
+            sliderFloat("Соотношение", &view.aspectRatioValue, 0.8f, 2.4f, "%.2f");
+            static constexpr const char* presets[]{ "5:4", "4:3", "3:2", "16:10", "16:9" };
+            static constexpr float values[]{ 1.25f, 1.3333f, 1.5f, 1.6f, 1.7778f };
+            for (int i = 0; i < IM_ARRAYSIZE(presets); ++i) {
+                if (i)
+                    ImGui::SameLine(0.0f, 4.0f);
+                if (ImGui::SmallButton(presets[i]))
+                    view.aspectRatioValue = values[i];
+            }
+        }
+        toggle("Вьюмодель", &view.viewmodel);
+        if (view.viewmodel) {
+            sliderInt("FOV рук", &view.viewmodelFov, 40, 120);
+            sliderFloat("Смещение X", &view.viewmodelX, -10.0f, 10.0f, "%.1f");
+            sliderFloat("Смещение Y", &view.viewmodelY, -10.0f, 10.0f, "%.1f");
+            sliderFloat("Смещение Z", &view.viewmodelZ, -10.0f, 10.0f, "%.1f");
+        }
+        toggle("Свой прицел снайпера", &view.customScope);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Градиентные линии вместо чёрного прицела (работает с «Без зума в прицеле»).");
+        if (view.customScope) {
+            sliderInt("Длина линий", &view.scopeSize, 10, 300);
+            sliderInt("Отступ от центра", &view.scopeGap, 0, 100);
+            toggle("T-прицел (без верхней)", &view.scopeT);
+        }
+        toggle("Мин. урон у прицела", &view.damageIndicator);
+        toggle("Метки попаданий", &view.shotMarkers);
+        if (view.shotMarkers) {
+            toggle("Метки промахов", &view.missMarkers);
+            sliderFloat("Время меток", &view.shotMarkerTime, 0.5f, 6.0f, "%.1f сек");
+        }
+        toggle("Предупреждение о замедлении", &view.slowdownWarning);
+        toggle("Список биндов", &view.keybindList);
+        toggle("Индикатор LC", &view.lcIndicator);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Зелёный — сейчас идёт дефенсив (лагкомп сломан), полоска — сколько тиков осталось.");
+        ImGui::Dummy({ 0.0f, 6.0f });
+        toggle("Трештолк", &view.trashTalk);
+        if (view.trashTalk) {
+            static constexpr const char* when[]{ "При килле", "При смерти" };
+            multiCombo("Когда писать", &view.trashTalkWhen, when, IM_ARRAYSIZE(when));
+        }
     }
     endGroup();
 }
@@ -1319,6 +1382,9 @@ void drawMovementTab() noexcept
         keybind("Автопик", m.autoPeekKey);
         static constexpr const char* peekModes[]{ "После выстрела", "Выстрел или отпустил WASD" };
         combo("Возврат", &m.autoPeekMode, peekModes, IM_ARRAYSIZE(peekModes));
+        sliderInt("Тиков телепорта", &m.peekTeleportTicks, 6, 14);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Заряд под телепорт назад: 14 тиков — ~55 ед. на полной скорости,\n6 — ~27. Набирается за укрытием; выстрел DT тратит только «Тиков сдвига».\nЕсли сервер режет пачки команд (телепорт дёргает назад) — уменьши.");
         ImGui::Dummy({ 0.0f, 6.0f });
         keybind("Фейкдак", m.fakeDuckKey);
         if (!tickbase::isInstalled()) {

@@ -1048,14 +1048,26 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     }
 
     // ---- дефенсив AA (скрытые углы) ----
-    const int lcLeft = tickbase::defensiveTicksLeft();
+    int lcLeft = tickbase::defensiveTicksLeft();
     const DefensiveSnap* chosenSnap = nullptr;
+    const bool triggerWants = !legit && aa.lcTriggers && (aa.lcTriggerStates & (1 << static_cast<int>(activeState)));
     if (aa.defensiveAa && !legit) {
         chosenSnap = activeSnap(selectSnapState(cmd, freestandRaw.has_value()));
+        // LC включён (триггер этого состояния или Force LC) — скрытые углы держим всегда, а не только
+        // 2–3 тика окна после рывка: между рывками окно идёт по кругу «длительность → 1», как настоящее.
+        const bool always = chosenSnap && (triggerWants || chosenSnap->forceLc);
+        static int synthetic = 0;
+        if (always && lcLeft == 0) {
+            const int length = std::clamp(chosenSnap->duration, 1, 13);
+            synthetic = synthetic > 1 ? synthetic - 1 : length;
+            lcLeft = synthetic;
+        } else {
+            synthetic = 0;
+        }
         bool inWindow = chosenSnap && lcLeft > 0;
         if (inWindow) {
             ++snap.ticks;
-            inWindow = snap.ticks <= std::clamp(chosenSnap->duration, 1, 13);
+            inWindow = always || snap.ticks <= std::clamp(chosenSnap->duration, 1, 13);
         } else {
             snap.ticks = 0;
         }
@@ -1087,7 +1099,6 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     // ---- ломать лагкомп: Force LC у дефенсива и LC-триггеры по состояниям ----
     if (!legit) {
         const bool snapWants = chosenSnap && chosenSnap->forceLc;
-        const bool triggerWants = aa.lcTriggers && (aa.lcTriggerStates & (1 << static_cast<int>(activeState)));
         if (snapWants || triggerWants)
             tickbase::requestBreakLc();
     }

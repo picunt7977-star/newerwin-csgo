@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "HvhConfig.h"
+#include "Ragebot.h"
 #include "Tickbase.h"
 
 // CL_Move(float accumulated_extra_samples, bool bFinalTick) в engine_client.so (Linux, legacy-билд).
@@ -51,6 +52,17 @@ int maxTickBase = 0;
 int lagCompLeft = 0;
 int shiftWindow = 0;            // тиков после нашего сдвига, пока сервер ещё не прислал откат тикбейса
 int breakLcFrames = 0;          // AA просил ломать лагкомп недавно — заряд нужен
+int groundTicks = 0;            // сколько тиков подряд стоим на земле без прыжка
+bool rising = false;            // летим вверх — до приземления далеко, пропуск тика не съест прыжок
+bool airborne = false;
+// Чок фейкдака. Сервер обрабатывает за раз не больше sv_maxusrcmdprocessticks команд (по умолчанию 16,
+// на части HvH-серверов 8): лишние команды пачки он выкидывает — а это как раз тики приседа в её конце,
+// и враг видит нас стоящими через раз. Movement снижает чок, если на отправке оказались не в приседе.
+int fakeDuckChokeLimit = 14;
+bool threat = false;             // нас сейчас видит враг
+bool slowWeapon = false;         // в руках скаут/AWP и прочее с перезарядкой > 0.4 с — второй пули DT нет
+bool lcShift = false;            // сдвиг просили LC-триггеры (дефенсив без выстрела)
+bool defensiveRecharge = false; // заряд потрачен дефенсивом и сейчас набирается заново — DT при этом «включён»
 
 std::uint8_t* find(std::span<const std::byte> code, const std::uint8_t* pattern, std::size_t size) noexcept
 {
@@ -97,6 +109,12 @@ void setSendPacket(bool value) noexcept
 
 // заряд нужен и для DT, и для телепорта/дефенсива. Автопик своего заряда не копит: телепорт на
 // возврате берёт заряд DT, только если DT включён (иначе назначенная клавиша автопика держала DT всегда)
+// DT стреляет второй пулей (сдвиг на выстреле). Иначе DT — дефенсивный: заряд для рывков, выстрел обычный
+[[nodiscard]] bool fastFire() noexcept
+{
+    return wantDoubleTap() && config.exploits.doubleTapMode == 0 && !slowWeapon;
+}
+
 [[nodiscard]] bool wantCharge() noexcept
 {
     const auto& ex = config.exploits;
@@ -106,7 +124,7 @@ void setSendPacket(bool value) noexcept
 [[nodiscard]] int chokeLimit() noexcept
 {
     if (fakeDuck)
-        return 14;
+        return fakeDuckChokeLimit;
     int limit = 0;
     if (config.antiAim.enabled)
         limit = std::clamp(config.antiAim.fakeLag, config.antiAim.desync ? 1 : 0, 14);
@@ -138,13 +156,23 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
     }
 
     const int maxShift = std::clamp(config.exploits.shiftTicks, 1, 14);
+    // С автопиком (клавиша назначена, DT включён) копим больше — под телепорт назад: «Тиков сдвига» 6
+    // дают ~27 ед., телепорта почти не видно. Выстрел DT тратит из этого только maxShift.
+    const auto& peekKey = config.movement.autoPeekKey;
+    const int chargeTarget = wantDoubleTap() && peekKey.isSet()
+        ? std::max(maxShift, std::clamp(config.movement.peekTeleportTicks, 1, 14)) : maxShift;
 
     if (!wantCharge()) {
         charged = 0;
     } else if (rechargeDelay > 0) {
         --rechargeDelay;
-    } else if (charged < maxShift && !shotPending && !shiftRequested && !(holdShot && charged >= 4)) {
-        // (на выглядывании с автопиком, если на телепорт уже хватает, не замираем ради полного заряда)
+    } else if (charged < chargeTarget && !shotPending && !shiftRequested && (groundTicks >= 3 || rising)
+        && !(threat && (!fastFire() || charged >= maxShift)) && !(holdShot && threat)) {
+        // Дефенсив DT не дозаряжается, пока нас видит враг: зарядка — это пропуск тиков, и посреди
+        // перестрелки после рывка стояли 6 тиков без выстрела («фоткает»). Зарядимся за укрытием.
+        // Заряжаемся на земле (не сразу после приземления) и на взлёте. На спуске и на тике приземления —
+        // нет: пропущенный тик там съедает прыжок распрыжки. На взлёте теряется лишь чуть стрейфа, зато
+        // дефенсив в воздухе работает и при распрыжке (иначе заряд не набирался бы вовсе).
         // зарядка: пропускаем тик, команда не создаётся — сервер потом примет пачку
         ++charged;
         return;
@@ -152,21 +180,36 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
 
     // выстрел (или тик сразу после него) в чоке не держим; фейкдаку чок нужен целиком
     setSendPacket((sendNext && !fakeDuck) || choked >= chokeLimit() || choked >= 14);
+    if (charged >= maxShift)
+        defensiveRecharge = false;
     sendNext = false;
     callOriginal(extraSamples, finalTick);
 
     // DT сдвигает сразу на выстреле — второй выстрел не ждёт (с автопиком возврат идёт в этих же командах)
-    if (((shotPending && wantDoubleTap()) || shiftRequested) && charged > 0) {
-        // сдвиг: прогоняем заряженные тики подряд, уходят одним пакетом с последним
+    if (((shotPending && fastFire()) || shiftRequested) && charged > 0) {
+        // сдвиг: прогоняем заряженные тики подряд, уходят одним пакетом с последним. Всегда весь заряд:
+        // на 2 тиках сервер не откатывал тикбейс — окна дефенсива не было (проверено в игре 01.11).
+        const bool small = false;
+        // выстрел DT — только его тики (остаток копили под телепорт автопика); рывок по запросу — весь заряд
+        int left = shiftRequested ? charged : std::min(charged, maxShift);
+        const int shiftedCount = left;
         shifting = true;
-        while (charged > 0) {
+        while (left > 0) {
+            --left;
             --charged;
-            setSendPacket(charged == 0);
-            callOriginal(extraSamples, charged == 0 && finalTick);
+            setSendPacket(left == 0);
+            callOriginal(extraSamples, left == 0 && finalTick);
         }
         shifting = false;
-        rechargeDelay = 16;
-        shiftWindow = 3;
+        if (shiftRequested && !lcShift) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "[тикбейс] сдвиг по запросу: %d тиков%s", shiftedCount, shotPending ? " (с выстрелом)" : "");
+            ragebot::logToFile(text);
+        }
+        // После выстрела DT ждём полный цикл. После дефенсива заряжаемся сразу (на земле): докачать 2 тика.
+        rechargeDelay = shotPending && fastFire() ? 16 : (groundTicks >= 3 || small ? 0 : 6);
+        defensiveRecharge = !(shotPending && fastFire()) && wantDoubleTap();
+        shiftWindow = small ? 2 : 3;
     } else if (shotPending && rechargeDelay > 2) {
         // Второй выстрел DT уже ушёл (сдвиг был недавно, заряд пуст) — ждать остаток 16 тиков незачем:
         // следующий выстрел всё равно через перезарядку оружия. Заряд снова готов через ~16 тиков, а не ~30.
@@ -174,6 +217,7 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
     }
     shotPending = false;
     shiftRequested = false;
+    lcShift = false;
 }
 
 }
@@ -298,6 +342,21 @@ bool isCharged() noexcept
     return charged >= std::clamp(config.exploits.shiftTicks, 1, 14);
 }
 
+bool isDefensiveRecharging() noexcept
+{
+    return defensiveRecharge && wantDoubleTap();
+}
+
+int fakeDuckChoke() noexcept
+{
+    return fakeDuckChokeLimit;
+}
+
+void setFakeDuckChoke(int value) noexcept
+{
+    fakeDuckChokeLimit = std::clamp(value, 4, 14);
+}
+
 void holdShotShift(bool hold) noexcept
 {
     holdShot = hold;
@@ -332,12 +391,57 @@ int defensiveTicksLeft() noexcept
     return std::max(lagCompLeft, shiftWindow);
 }
 
+void setMovement(bool onGround, bool jumpHeld, float verticalSpeed) noexcept
+{
+    groundTicks = onGround && !jumpHeld ? std::min(groundTicks + 1, 64) : 0;
+    // «далеко от земли»: взлёт и первая половина спуска (у прыжка вверх ~300 ед/с, к приземлению −300).
+    // Тут пропуск тика на зарядку прыжок не съест — LC в воздухе дозаряжается и работает весь прыжок.
+    rising = !onGround && verticalSpeed > -150.0f;
+    airborne = !onGround;
+}
+
+bool defensiveAllowed() noexcept
+{
+    // с DT рывков дефенсива нет вообще: они телепортируют и гасят DT (дефенсив — скрытые углы AA)
+    return !fastFire();
+}
+
+bool fastFireEnabled() noexcept
+{
+    return fastFire();
+}
+
+bool defensiveDoubleTap() noexcept
+{
+    return wantDoubleTap() && !fastFire();
+}
+
+void setSlowWeapon(bool value) noexcept
+{
+    slowWeapon = value;
+}
+
+void setThreat(bool value) noexcept
+{
+    threat = value;
+}
+
 void requestBreakLc() noexcept
 {
     breakLcFrames = 8;
+    // С включённым DT LC-триггер не сдвигает: каждый сдвиг — замереть на заряд и рывком догнать, то есть
+    // телепорт, и DT гас-включался. Дефенсив при этом — скрытые углы AA (держатся постоянно), заряд — DT.
+    if (fastFire())
+        return;
+    // зажат автопик — заряд держим под телепорт назад (иначе триггер тратил его на выглядывании,
+    // и после выстрела возвращаться рывком было нечем)
+    if (holdShot)
+        return;
     // уже в окне — второй сдвиг ничего не добавит, только потратит заряд
-    if (defensiveTicksLeft() == 0 && isCharged() && !shifting)
+    if (defensiveTicksLeft() == 0 && isCharged() && !shifting) {
         shiftRequested = true;
+        lcShift = true;
+    }
 }
 
 }

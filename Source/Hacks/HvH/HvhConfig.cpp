@@ -226,6 +226,26 @@ json toJson() noexcept
     j["View"]["Sync render"] = config.view.syncRender;
     j["View"]["Screen logs"] = config.view.screenLogs;
     j["View"]["Watermark"] = config.view.watermark;
+    j["View"]["Aspect ratio"] = config.view.aspectRatio;
+    j["View"]["Aspect ratio value"] = config.view.aspectRatioValue;
+    j["View"]["Viewmodel"] = config.view.viewmodel;
+    j["View"]["Viewmodel fov"] = config.view.viewmodelFov;
+    j["View"]["Viewmodel x"] = config.view.viewmodelX;
+    j["View"]["Viewmodel y"] = config.view.viewmodelY;
+    j["View"]["Viewmodel z"] = config.view.viewmodelZ;
+    j["View"]["Custom scope"] = config.view.customScope;
+    j["View"]["Scope size"] = config.view.scopeSize;
+    j["View"]["Scope gap"] = config.view.scopeGap;
+    j["View"]["Scope T"] = config.view.scopeT;
+    j["View"]["Damage indicator"] = config.view.damageIndicator;
+    j["View"]["Shot markers"] = config.view.shotMarkers;
+    j["View"]["Miss markers"] = config.view.missMarkers;
+    j["View"]["Shot marker time"] = config.view.shotMarkerTime;
+    j["View"]["Slowdown warning"] = config.view.slowdownWarning;
+    j["View"]["Keybind list"] = config.view.keybindList;
+    j["View"]["LC indicator"] = config.view.lcIndicator;
+    j["View"]["Trash talk"] = config.view.trashTalk;
+    j["View"]["Trash talk when"] = config.view.trashTalkWhen;
     j["View"]["ESP flags"] = config.view.espFlags;
     j["View"]["Aim dot"] = config.view.aimDot;
     j["View"]["Tab loadout"] = config.view.tabLoadout;
@@ -239,6 +259,7 @@ json toJson() noexcept
     auto& m = j["Movement"];
     writeKey(m, "Auto peek key", config.movement.autoPeekKey);
     m["Auto peek mode"] = config.movement.autoPeekMode;
+    m["Auto peek teleport ticks"] = config.movement.peekTeleportTicks;
     writeKey(m, "Fake duck key", config.movement.fakeDuckKey);
     m["Fast ladder"] = config.movement.fastLadder;
     m["Bunny hop"] = config.movement.bunnyHop;
@@ -255,6 +276,7 @@ json toJson() noexcept
     e["Double tap"] = ex.doubleTap;
     writeKey(e, "Double tap key", ex.doubleTapKey);
     e["Shift ticks"] = ex.shiftTicks;
+    e["Double tap mode"] = ex.doubleTapMode;
     writeKey(e, "Teleport key", ex.teleportKey);
     e["Defensive"] = ex.defensive;
 
@@ -426,6 +448,26 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Sync render", config.view.syncRender);
         read(j["View"], "Screen logs", config.view.screenLogs);
         read(j["View"], "Watermark", config.view.watermark);
+        read(j["View"], "Aspect ratio", config.view.aspectRatio);
+        read(j["View"], "Aspect ratio value", config.view.aspectRatioValue);
+        read(j["View"], "Viewmodel", config.view.viewmodel);
+        read(j["View"], "Viewmodel fov", config.view.viewmodelFov);
+        read(j["View"], "Viewmodel x", config.view.viewmodelX);
+        read(j["View"], "Viewmodel y", config.view.viewmodelY);
+        read(j["View"], "Viewmodel z", config.view.viewmodelZ);
+        read(j["View"], "Custom scope", config.view.customScope);
+        read(j["View"], "Scope size", config.view.scopeSize);
+        read(j["View"], "Scope gap", config.view.scopeGap);
+        read(j["View"], "Scope T", config.view.scopeT);
+        read(j["View"], "Damage indicator", config.view.damageIndicator);
+        read(j["View"], "Shot markers", config.view.shotMarkers);
+        read(j["View"], "Miss markers", config.view.missMarkers);
+        read(j["View"], "Shot marker time", config.view.shotMarkerTime);
+        read(j["View"], "Slowdown warning", config.view.slowdownWarning);
+        read(j["View"], "Keybind list", config.view.keybindList);
+        read(j["View"], "LC indicator", config.view.lcIndicator);
+        read(j["View"], "Trash talk", config.view.trashTalk);
+        read(j["View"], "Trash talk when", config.view.trashTalkWhen);
         read(j["View"], "ESP flags", config.view.espFlags);
         read(j["View"], "Aim dot", config.view.aimDot);
         read(j["View"], "Tab loadout", config.view.tabLoadout);
@@ -446,6 +488,7 @@ void fromJson(const json& j) noexcept
         config.movement.autoPeekMode = onRelease ? static_cast<int>(AutoPeekMode::ShotOrRelease) : static_cast<int>(AutoPeekMode::Shot);
         read(m, "Auto peek mode", config.movement.autoPeekMode);
         config.movement.autoPeekMode = std::clamp(config.movement.autoPeekMode, 0, 1);
+        read(m, "Auto peek teleport ticks", config.movement.peekTeleportTicks);
         read(m, "Fake duck key", config.movement.fakeDuckKey);
         read(m, "Fast ladder", config.movement.fastLadder);
         read(m, "Bunny hop", config.movement.bunnyHop);
@@ -466,6 +509,7 @@ void fromJson(const json& j) noexcept
         read(e, "Double tap", ex.doubleTap);
         read(e, "Double tap key", ex.doubleTapKey);
         read(e, "Shift ticks", ex.shiftTicks);
+        read(e, "Double tap mode", ex.doubleTapMode);
         read(e, "Teleport key", ex.teleportKey);
         read(e, "Defensive", ex.defensive);
     }

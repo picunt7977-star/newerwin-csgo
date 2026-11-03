@@ -122,7 +122,7 @@ static constexpr auto keyMap = std::to_array<Key>({
     { "W", WIN32_LINUX('W', SDL_SCANCODE_W) },
     { "X", WIN32_LINUX('X', SDL_SCANCODE_X) },
     { "Y", WIN32_LINUX('Y', SDL_SCANCODE_Y) },
-    { "Z", WIN32_LINUX('Z', SDL_SCANCODE_X) },
+    { "Z", WIN32_LINUX('Z', SDL_SCANCODE_Z) },
     { "[", WIN32_LINUX(VK_OEM_4, SDL_SCANCODE_LEFTBRACKET) },
     { "\\", WIN32_LINUX(VK_OEM_5, SDL_SCANCODE_BACKSLASH) },
     { "]", WIN32_LINUX(VK_OEM_6, SDL_SCANCODE_RIGHTBRACKET) },

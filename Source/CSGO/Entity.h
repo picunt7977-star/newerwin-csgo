@@ -276,6 +276,7 @@ struct Entity : GameClass<Entity, EntityPOD> {
     NETVAR2(inBombZone, "CCSPlayer", "m_bInBombZone", bool)
     NETVAR2(hasDefuser, "CCSPlayer", "m_bHasDefuser", bool)
     NETVAR2(hasHelmet, "CCSPlayer", "m_bHasHelmet", bool)
+    NETVAR2(velocityModifier, "CCSPlayer", "m_flVelocityModifier", float)
     NETVAR2(lby, "CCSPlayer", "m_flLowerBodyYawTarget", float)
     NETVAR2(ragdoll, "CCSPlayer", "m_hRagdoll", int)
     NETVAR2(shotsFired, "CCSPlayer", "m_iShotsFired", int)

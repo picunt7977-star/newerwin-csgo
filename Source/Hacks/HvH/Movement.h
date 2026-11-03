@@ -24,6 +24,8 @@ void fakeDuck(csgo::UserCmd* cmd, float interval) noexcept;
 // телепорт по клавише и дефенсив (рывок, когда враг только что нас увидел)
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept;
 [[nodiscard]] bool isFakeDucking() noexcept;
+// присед (0..1) на отправленном тике и минимальный за цикл — для индикатора FD
+void fakeDuckStats(float& sent, float& low) noexcept;
 
 // Автобай: round_start ставит покупку в очередь, CreateMove отправляет её, когда мы живы
 void onRoundStart() noexcept;
