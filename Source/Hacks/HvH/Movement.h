@@ -39,6 +39,9 @@ void fixMovement(csgo::UserCmd* cmd, float viewYaw) noexcept;
 
 // После fixMovement: быстрая лестница (своими углами и кнопками)
 void fastLadder(csgo::UserCmd* cmd, float viewPitch, float viewYaw) noexcept;
+// до движкового предсказания — запомнить скорость падения; после — jumpbug, если этот тик приземлит
+void noFallDamagePre() noexcept;
+void noFallDamage(csgo::UserCmd* cmd, int flagsBeforePrediction) noexcept;
 
 // «Без зума»: каждый кадр возвращаем мышиный поворот к обычной сенсе, игра в скоупе её режет
 void keepZoomSensitivity(const csgo::Engine& engine, const csgo::Cvar& cvar) noexcept;

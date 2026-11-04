@@ -20,6 +20,7 @@
 #include "HvhConfig.h"
 #include "Extras.h"
 #include "Ragebot.h"
+#include "AntiAim.h"
 #include "Resolver.h"
 #include "Tickbase.h"
 
@@ -796,6 +797,14 @@ float segmentDistance(const csgo::Vector& p1, const csgo::Vector& q1, const csgo
     return ((p1 + d1 * s) - (p2 + d2 * t)).length();
 }
 
+void shiftCapsules(Capsules& caps, const csgo::Vector& delta) noexcept
+{
+    for (int k = 0; k < caps.count; ++k) {
+        caps.items[k].a += delta;
+        caps.items[k].b += delta;
+    }
+}
+
 void buildCapsules(const csgo::StudioHitboxSet& set, const csgo::matrix3x4* bones, Capsules& out) noexcept
 {
     out.count = 0;
@@ -1121,6 +1130,8 @@ struct ShotRecord {
     int backtrackTicks = 0;
     int updatesAhead = 0;
     float predictedSimulationTime = 0.0f;
+    csgo::Vector predictedOrigin{}; // где стояла модель, по которой стреляли
+    bool jitter = false;            // враг джиттерил: сервер мог взять другую фазу позы
     float updateTime = 0.0f;
     const csgo::StudioHitboxSet* set = nullptr;
     Capsules aimed;                 // скелет, по которому стреляли
@@ -1270,6 +1281,21 @@ void evaluateMiss(int index) noexcept
                     std::snprintf(detail, sizeof(detail), " (позиция верна, сервер был между обновлениями)");
                 else
                     std::snprintf(detail, sizeof(detail), " (сервер взял %+d обн.)", offset);
+            } else if (shot.jitter && [&] {
+                           // позиция была верной, а поза — от другой фазы джиттера: поза пришедших записей,
+                           // перенесённая на нашу прогнозную позицию, ложится под луч
+                           for (int age = 0; age < list.count; ++age) {
+                               const auto& record = list.at(age);
+                               if (std::abs(record.simulationTime - shot.predictedSimulationTime) > shot.updateTime * 3.5f)
+                                   continue;
+                               buildCapsules(*shot.set, record.bones, test);
+                               shiftCapsules(test, shot.predictedOrigin - record.origin);
+                               if (rayHits(shot.eye, end, test))
+                                   return true;
+                           }
+                           return false;
+                       }()) {
+                reason = "джиттер (сервер был в другой фазе)";
             } else {
                 // ни одна пришедшая потом запись не легла под луч — враг сменил движение. Сторону тут не доказать:
                 // крайние скелеты стояли там же, где неверная позиция, — резольвер на этом не учим
@@ -1359,6 +1385,7 @@ struct Target {
     int minDamage = 0;
     RecordKind kind = RecordKind::Live;
     float simulationTime = 0.0f;
+    csgo::Vector origin{};
     int backtrackTicks = 0;
     int updatesAhead = 0;
     int choke = 1;
@@ -1435,6 +1462,26 @@ ShotView shotView() noexcept
 
 void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgroup, int damage, int healthLeft) noexcept
 {
+    // попали по нам — тихо, только в файл: куда и что в этот момент делал наш AA (для подстройки конфига)
+    if (victimIndex == localIndex && attackerIndex != localIndex && attackerIndex > 0 && attackerIndex < 65) {
+        static constexpr const char* groups[]{ "тело", "голова", "грудь", "живот", "левая рука", "правая рука", "левая нога", "правая нога", "шея" };
+        float pitch = 0.0f, yaw = 0.0f;
+        const bool sent = hvh::antiaim::sentAngles(pitch, yaw);
+        float speed = 0.0f;
+        bool onGround = true;
+        if (localPlayer && localPlayer.get().isAlive()) {
+            speed = localPlayer.get().velocity().length2D();
+            onGround = (localPlayer.get().flags() & 1) != 0;
+        }
+        char text[384];
+        std::snprintf(text, sizeof(text), "[по нам] %s: %s −%d (осталось %d) | AA: %s, сторона %+d%s%s, pitch %.0f, %s, скорость %.0f, окно LC %d, заряд %d, нас видят: %s",
+            playerName(attackerIndex).c_str(), hitgroup >= 0 && hitgroup < 9 ? groups[hitgroup] : "?", damage, healthLeft,
+            hvh::antiaim::stateName(), hvh::antiaim::desyncSide(), hvh::antiaim::defensiveActive() ? ", скрытые углы" : "",
+            hvh::antiaim::isFreestanding() ? ", фристенд" : "", sent ? pitch : 0.0f, onGround ? "земля" : "воздух", speed,
+            tickbase::defensiveTicksLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет");
+        fileLog(text);
+        return;
+    }
     if (attackerIndex != localIndex || victimIndex <= 0 || victimIndex >= 65 || !memoryPtr)
         return;
     auto& shot = shots[victimIndex];
@@ -1806,6 +1853,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         }
     }
     const bool needScope = settings.autoScope && weapon.isSniperRifle() && !localPlayer.get().isScoped();
+    // после выстрела игра сама возвращает зум в тик готовности — наш ПКМ в тот же тик перещёлкивал зум
+    // (второй уровень/выход из скопа). Жмём, только если тик спустя игра зум не вернула.
+    const bool scopeAllowed = weapon.nextPrimaryAttack() + interval * 1.5f <= serverTime && weapon.nextSecondaryAttack() <= serverTime;
     const auto stopMode = static_cast<AutoStop>(settings.autoStop);
     const auto moveVars = movementVars(interfaces.getCvar());
     const float stopMaxSpeed = localPlayer.get().isScoped() || needScope ? weaponData->maxSpeedAlt : weaponData->maxSpeed;
@@ -1853,7 +1903,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const float cone = std::max(weapon.getInaccuracy(), 0.0f)
         + std::clamp(weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread, 0.0f, 0.2f);
     // мультипоинт по всему телу — до ~70 точек на цель, каждая автоволл: бюджет на тик против фризов
-    int pointBudget = 160;
+    int pointBudget = 240;
 
     static std::array<Target, 3> top;
     int topCount = 0;
@@ -1970,13 +2020,13 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         const int minDamageSetting = minDamageOverride ? settings.minDamageOverride : settings.minDamage;
         // больше 100 — «HP+N»: убить с запасом; иначе хп меньше мин. урона — достаточно добить
         const int minDamage = minDamageSetting > 100 ? health + (minDamageSetting - 100) : std::min(minDamageSetting, health);
-        // конечности — только наповал: рука x1, нога x0.75 от урона оружия
-        const bool limbsLethal = static_cast<float>(weaponData->damage) >= hp;
         const bool safeRequired = rage.safePoint == 2 || (rage.safePoint == 1 && brain.misses > 0);
         // своя статистика: по голове мажем, а по телу попадаем — голове меньше доверия
         const float headRate = (brain.headHits + 0.5f) / (brain.headShots + 1.0f);
         const float bodyRate = (brain.bodyHits + 0.5f) / (brain.bodyShots + 1.0f);
-        const bool headUnlucky = (brain.bodyShots >= 4 && bodyRate > headRate + 0.1f) || brain.headResolverMisses == 1;
+        // статистика головы — только если в голову правда стреляли (раньше 4 попадания в тело без единого выстрела
+        // в голову уже давали ей штраф)
+        const bool headUnlucky = (brain.bodyShots >= 4 && brain.headShots >= 3 && bodyRate > headRate + 0.1f) || brain.headResolverMisses == 1;
         // два промаха резольвера в голову подряд — до попадания в голову бьём тело, голову только если
         // тело недоступно (наповал по голове 1.5×0.35 ≈ 0.5 — меньше любого убийства телом)
         const bool headBanned = brain.headResolverMisses >= 2;
@@ -2121,13 +2171,29 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 const auto end = eye + normalized(point - eye) * weaponData->range;
                 return rayHits(eye, end, earlierCaps) && rayHits(eye, end, laterCaps);
             };
+            // Джиттер на прогнозе: позицию мы угадываем, а в какой фазе рывка враг будет на сервере — нет.
+            // Поза двух свежих записей (обе фазы), перенесённая на прогнозную позицию: точка должна попадать в обе.
+            const bool checkPhases = predictedRecord && !cheap && list.count >= 2 && (jittering(brain) || desyncFlipping(brain));
+            static Capsules phaseCaps[2];
+            csgo::Vector phaseShift[2]{};
+            if (checkPhases) {
+                for (int k = 0; k < 2; ++k) {
+                    phaseShift[k] = record.origin - list.at(k).origin;
+                    buildCapsules(*set, list.at(k).bones, phaseCaps[k]);
+                    shiftCapsules(phaseCaps[k], phaseShift[k]);
+                }
+            }
+            const auto phaseSafe = [&](const csgo::Vector& point, bool head) {
+                const auto end = eye + normalized(point - eye) * weaponData->range;
+                return hitsAs(phaseCaps[0], end, head) && hitsAs(phaseCaps[1], end, head);
+            };
 
             // край капсулы прощает только при известной стороне: иначе «край» — промах по чужой стороне
             float sideScale = 1.0f;
             if (source == SideSource::Layers)
                 sideScale = std::clamp(record.resolvedConfidence * 1.4f, 0.35f, 1.0f);
             else if (resolve && !sideCertain)
-                sideScale = side == 0.0f ? 0.0f : 0.45f;
+                sideScale = side == 0.0f ? 0.35f : 0.45f;
 
             struct Scored {
                 AimPoint point;
@@ -2151,7 +2217,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 if (isHead && forceBody)
                     continue;
                 const bool isLimb = flag == HB_Arms || flag == HB_Legs || flag == HB_Feet;
-                if (isLimb && (!limbsLethal || cheap))
+                if (isLimb && cheap)
                     continue;
                 const bool multipoint = (settings.multipoint & flag) && (!cheap || viewOnly);
                 // каждый промах прижимает точки к центру; прогноз — тоже
@@ -2159,7 +2225,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 const float maxScale = (isHead ? settings.headScale : settings.bodyScale) * sideScale;
                 float trust = 1.0f;
                 if (predictedRecord)
-                    trust *= isHead ? 0.4f : 0.7f;
+                    trust *= isHead ? 0.6f : 0.7f;
                 // прогноз в воздухе: стрейф меняет курс между обновлениями (сессия 01:09 — 3 промаха подряд по прыгающему)
                 if (predictedRecord && airborne)
                     trust *= 0.75f;
@@ -2169,7 +2235,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     trust *= 0.6f;
                 if (!isHead && settings.preferBody)
                     trust *= 1.3f;
-                const float sideFactor = isHead ? sideTrust * sideTrust : sideTrust;
+                // голове раньше шёл квадрат доверия — при DT тело всегда выигрывало у головы
+                const float sideFactor = sideTrust;
 
                 for (const auto hitboxId : hitboxes) {
                     if (hitboxId == Hitbox::Max)
@@ -2183,7 +2250,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
                     // мультипоинт: центр, края поперёк взгляда, верх головы, точки по оси вытянутых хитбоксов;
                     // размер — ползунок или авто: пятно разброса + погрешность анимации бегущего внутри капсулы
-                    std::array<csgo::Vector, 6> points{ center };
+                    std::array<csgo::Vector, 14> points{ center };
                     std::size_t count = 1;
                     const float radius = hitbox->capsuleRadius;
                     if (multipoint && radius > 0.0f) {
@@ -2201,14 +2268,37 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             const float offset = radius * scale;
                             points[count++] = center + across * offset;
                             points[count++] = center - across * offset;
-                            if (isHead)
+                            if (isHead) {
+                                // макушка и две диагонали сверху: голова из-за угла часто видна только верхом
                                 points[count++] = center + worldUp * offset;
+                                points[count++] = center + (worldUp + across) * (offset * 0.7f);
+                                points[count++] = center + (worldUp - across) * (offset * 0.7f);
+                            } else {
+                                // низ капсулы поперёк взгляда (видно из-под укрытия)
+                                points[count++] = center - worldUp * (offset * 0.8f);
+                            }
                         }
                         const auto axis = max - min;
                         if (!isHead && flag != HB_Chest && axis.length() > radius && scale > 0.0f) {
-                            points[count++] = center + axis * (0.5f * std::min(scale + 0.3f, 0.9f));
-                            points[count++] = center - axis * (0.5f * std::min(scale + 0.3f, 0.9f));
+                            const float along = 0.5f * std::min(scale + 0.3f, 0.9f);
+                            points[count++] = center + axis * along;
+                            points[count++] = center - axis * along;
+                            // углы капсулы: край по оси + край поперёк
+                            if (scale >= 0.2f) {
+                                const auto view = normalized(center - eye);
+                                csgo::Vector across{ view.y, -view.x, 0.0f };
+                                across = across.squareLength() > 0.0001f ? normalized(across) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
+                                const float side = radius * scale * 0.7f;
+                                points[count++] = center + axis * along + across * side;
+                                points[count++] = center - axis * along - across * side;
+                            }
                         }
+                    }
+                    // конечности без мультипоинта: хотя бы концы кости — из-за укрытия чаще торчит кисть/локоть
+                    if (isLimb && !multipoint) {
+                        const auto axis = max - min;
+                        points[count++] = center + axis * 0.4f;
+                        points[count++] = center - axis * 0.4f;
                     }
                     // сторона не доказана: середина между тем же хитбоксом в крайних скелетах — если капсулы
                     // перекрываются, точка попадает при любой стороне (проверка безопасности её подтвердит)
@@ -2227,6 +2317,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                         if ((middle - center).squareLength() > 1.0f)
                             points[count++] = middle;
                     }
+                    // джиттер: середина головы между двумя фазами — туда, где она будет в любой из них
+                    if (checkPhases && isHead && count < points.size()) {
+                        const auto middle = (centerOf(list.at(0).bones) + phaseShift[0] + centerOf(list.at(1).bones) + phaseShift[1]) * 0.5f;
+                        if ((middle - center).squareLength() > 1.0f)
+                            points[count++] = middle;
+                    }
 
                     for (std::size_t p = 0; p < count; ++p) {
                         if (p > 0 && pointBudget-- <= 0)
@@ -2239,15 +2335,16 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                         // 53% попаданий и 32% промахов резольвера против 62% и 16% у центра; сессия 01.11 01:00 —
                         // край 1 из 8, центр 8 из 12. Край попадает лишь в одну модель, и любая ошибка угла ног
                         // уводит голову из-под него; центр прощает её гораздо лучше.
-                        if (isHead && p > 0 && checkSafe && !safe)
-                            continue;
+                        // Раньше небезопасный край головы выкидывался: голова торчит краем из-за укрытия, центр за стеной —
+                        // и стрелять «некуда». Теперь край берётся со скидкой (центр при равных всё равно лучше).
+                        const bool headEdgeUnsafe = isHead && p > 0 && checkSafe && !safe;
                         // Голова при сомнительной стороне — только в точки, общие для всех трёх скелетов.
                         // Сессия 01.11 01:09–01:21: 4 промаха в «общую точку» головы по слоям с уверенностью 28–58%,
                         // и импакт доказал другую сторону; ещё 2 доказанных — голова в воздухе. Тело по тем же
                         // слоям попадает ~85%, поэтому лучше тело, чем голова наугад. Якорь LBY (100%) и
                         // уверенные слои (≥60%) по-прежнему бьют голову по найденному углу.
-                        if (isHead && headNeedsSafe && checkSafe && !safe)
-                            continue;
+                        // Раньше центр головы тут выкидывался — рейдж «фоткал» по зелёной голове. Теперь только штраф ниже.
+                        const bool headUnsafe = isHead && headNeedsSafe && checkSafe && !safe;
                         // дальность оружия автоволл не проверяет (у зевса ~183 ед.)
                         if ((points[p] - eye).squareLength() > weaponData->range * weaponData->range)
                             continue;
@@ -2265,11 +2362,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             damage *= static_cast<float>(weaponData->bullets) * std::clamp(8.0f * 8.0f / (blur * blur), 0.1f, 1.0f);
                         }
                         const bool lethal = damage >= hp;
-                        if (isLimb && !lethal)
-                            continue;
                         const bool qualified = damage >= static_cast<float>(minDamage);
-                        if ((lethal || qualified) && viewPointCount < static_cast<int>(viewPoints.size()))
-                            viewPoints[viewPointCount++] = { points[p], static_cast<std::uint8_t>(lethal ? 2 : 1) };
+                        // конечность — если набирает мин. урон (раньше только наповал: торчащую руку игнорили)
+                        if (isLimb && !lethal && !qualified)
+                            continue;
 
                         // край тела, не общий для всех скелетов: по логам 58% против 74% у центра
                         float reliability = trust * (p > 0 ? (safe ? 0.9f : 0.75f) : 1.0f);
@@ -2277,14 +2373,20 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             reliability *= sideTrust;
                         else if (!safe)
                             reliability *= sideFactor * (isHead && layerSide && !hvh::resolver::extremeActive(i) ? 0.85f : 1.0f);
-                        // Прогноз: точка, не попадающая в обе соседние модели (N−1 и N), по логам 31.10 — больше
-                        // половины промахов «прогноз». Голову и врага в воздухе (стрейф меняет курс между
-                        // обновлениями) по таким точкам не бьём вовсе, тело — с сильной скидкой.
-                        if (checkSteps && !stepSafe(points[p])) {
-                            if (isHead || airborne)
-                                continue;
-                            reliability *= 0.45f;
-                        }
+                        if (headUnsafe)
+                            reliability *= 0.8f;
+                        if (headEdgeUnsafe)
+                            reliability *= 0.8f;
+                        // Прогноз: точка, не попадающая в обе соседние модели (N−1 и N) — скидка. Раньше голову
+                        // и врага в воздухе по таким точкам не били вовсе: голова горела зелёным, выстрела не было.
+                        if (checkSteps && !stepSafe(points[p]))
+                            reliability *= isHead || airborne ? 0.6f : 0.45f;
+                        // не попадает в одну из фаз джиттера — промах в половине случаев
+                        if (checkPhases && !phaseSafe(points[p], isHead))
+                            reliability *= isHead ? 0.4f : 0.6f;
+                        // зелёным рисуем только то, что реально пошло в выбор цели
+                        if ((lethal || qualified) && viewPointCount < static_cast<int>(viewPoints.size()))
+                            viewPoints[viewPointCount++] = { points[p], static_cast<std::uint8_t>(lethal ? 2 : 1) };
                         // сквозь стену: автоволл иногда переоценивает пробитие (логи: 51 «пуля застряла»)
                         const float openDamage = static_cast<float>(weaponData->damage) * std::pow(weaponData->rangeModifier, (points[p] - eye).length() / 500.0f);
                         if (baseDamage < openDamage * 0.97f)
@@ -2343,6 +2445,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.minDamage = effectiveMinDamage;
                 t.kind = candidates[c].kind;
                 t.simulationTime = record.simulationTime;
+                t.origin = record.origin;
                 t.backtrackTicks = list.count && candidates[c].age > 0 ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
                 t.updatesAhead = candidates[c].updatesAhead;
                 t.choke = record.choked;
@@ -2433,10 +2536,16 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     // с нажатым прыжком тик уже воздушный: стоп и скоп только ломают бхоп
     const bool onGround = (localPlayer.get().flags() & FL_ONGROUND) && !(cmd->buttons & csgo::UserCmd::IN_JUMP);
     const bool scoping = needScope && onGround;
-    if (scoping)
+    if (scoping && scopeAllowed)
         cmd->buttons |= csgo::UserCmd::IN_ATTACK2;
     if (stopMode != AutoStop::Off && onGround && (canShoot || readySoon || settings.autoStopEarly))
         autoStop(cmd, stopMode, stopMaxSpeed, interval, moveVars);
+    // идёт передёргивание/перезарядка — это не «держит без выстрела»
+    if (!canShoot && !readySoon) {
+        hesitateSince = realtime;
+        statusText = "перезарядка";
+        return false;
+    }
     if (scoping) {
         statusText = "скоуп";
         hesitate(statusText);
@@ -2523,6 +2632,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.backtrackTicks = best.backtrackTicks;
     shot.updatesAhead = best.updatesAhead;
     shot.predictedSimulationTime = best.simulationTime;
+    shot.predictedOrigin = best.origin;
+    shot.jitter = jittering(brains[best.index]) || desyncFlipping(brains[best.index]);
     shot.updateTime = static_cast<float>(std::max(best.choke, 1)) * interval;
     shot.set = best.set;
     shot.aimed = capsules;

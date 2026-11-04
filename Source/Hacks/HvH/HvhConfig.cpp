@@ -176,6 +176,8 @@ json toJson() noexcept
     }
     a["Defensive AA"] = aa.defensiveAa;
     a["LC triggers"] = aa.lcTriggers;
+    a["Defensive on peek"] = aa.peekDefensive;
+    a["Defensive on peek ticks"] = aa.peekTicks;
     a["LC trigger states"] = aa.lcTriggerStates;
     a["Anti bruteforce triggers"] = aa.antiBruteTriggers;
     a["Anti bruteforce mode"] = aa.antiBruteMode;
@@ -262,6 +264,7 @@ json toJson() noexcept
     m["Auto peek teleport ticks"] = config.movement.peekTeleportTicks;
     writeKey(m, "Fake duck key", config.movement.fakeDuckKey);
     m["Fast ladder"] = config.movement.fastLadder;
+    m["No fall damage"] = config.movement.noFallDamage;
     m["Bunny hop"] = config.movement.bunnyHop;
     m["Auto strafe mode"] = config.movement.autoStrafe;
 
@@ -385,6 +388,9 @@ void fromJson(const json& j) noexcept
         }
         read(a, "Defensive AA", aa.defensiveAa);
         read(a, "LC triggers", aa.lcTriggers);
+        read(a, "Defensive on peek", aa.peekDefensive);
+        read(a, "Defensive on peek ticks", aa.peekTicks);
+        aa.peekTicks = std::clamp(aa.peekTicks, 2, 16);
         read(a, "LC trigger states", aa.lcTriggerStates);
         read(a, "Anti bruteforce triggers", aa.antiBruteTriggers);
         read(a, "Anti bruteforce mode", aa.antiBruteMode);
@@ -491,6 +497,7 @@ void fromJson(const json& j) noexcept
         read(m, "Auto peek teleport ticks", config.movement.peekTeleportTicks);
         read(m, "Fake duck key", config.movement.fakeDuckKey);
         read(m, "Fast ladder", config.movement.fastLadder);
+        read(m, "No fall damage", config.movement.noFallDamage);
         read(m, "Bunny hop", config.movement.bunnyHop);
         read(m, "Auto strafe mode", config.movement.autoStrafe);
     }

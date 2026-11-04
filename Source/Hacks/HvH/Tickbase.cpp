@@ -45,6 +45,7 @@ int charged = 0;
 int rechargeDelay = 0;
 bool shotPending = false;
 bool shiftRequested = false;
+int requestedTicks = 0;          // сколько тиков сдвига просили (0 — весь заряд)
 bool shifting = false;
 bool holdShot = false;
 bool sendNext = false;
@@ -55,6 +56,8 @@ int breakLcFrames = 0;          // AA просил ломать лагкомп �
 int groundTicks = 0;            // сколько тиков подряд стоим на земле без прыжка
 bool rising = false;            // летим вверх — до приземления далеко, пропуск тика не съест прыжок
 bool airborne = false;
+bool movingFast = false;        // бежим/идём — перезарядку дефенсива растягиваем
+bool chargeParity = false;      // плавная зарядка: пропускаем через тик
 // Чок фейкдака. Сервер обрабатывает за раз не больше sv_maxusrcmdprocessticks команд (по умолчанию 16,
 // на части HvH-серверов 8): лишние команды пачки он выкидывает — а это как раз тики приседа в её конце,
 // и враг видит нас стоящими через раз. Movement снижает чок, если на отправке оказались не в приседе.
@@ -113,6 +116,14 @@ void setSendPacket(bool value) noexcept
 [[nodiscard]] bool fastFire() noexcept
 {
     return wantDoubleTap() && config.exploits.doubleTapMode == 0 && !slowWeapon;
+}
+
+// Плавная зарядка: заряд под дефенсив (не под вторую пулю DT) в движении и в воздухе копится через тик.
+// Иначе 13 пропущенных тиков подряд = замер на ~200 мс (в воздухе — зависание), а потом сдвиг рывком
+// догоняет — со стороны и у себя на экране это «кидает туда-сюда». Через тик видно лишь лёгкое замедление.
+[[nodiscard]] bool smoothCharge() noexcept
+{
+    return !fastFire() && (airborne || movingFast);
 }
 
 [[nodiscard]] bool wantCharge() noexcept
@@ -174,8 +185,12 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         // нет: пропущенный тик там съедает прыжок распрыжки. На взлёте теряется лишь чуть стрейфа, зато
         // дефенсив в воздухе работает и при распрыжке (иначе заряд не набирался бы вовсе).
         // зарядка: пропускаем тик, команда не создаётся — сервер потом примет пачку
-        ++charged;
-        return;
+        chargeParity = !chargeParity;
+        if (!smoothCharge() || chargeParity) {
+            ++charged;
+            return;
+        }
+        // плавная зарядка: этот тик — обычная команда, следующий снова в заряд
     }
 
     // выстрел (или тик сразу после него) в чоке не держим; фейкдаку чок нужен целиком
@@ -191,7 +206,7 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         // на 2 тиках сервер не откатывал тикбейс — окна дефенсива не было (проверено в игре 01.11).
         const bool small = false;
         // выстрел DT — только его тики (остаток копили под телепорт автопика); рывок по запросу — весь заряд
-        int left = shiftRequested ? charged : std::min(charged, maxShift);
+        int left = shiftRequested ? (requestedTicks > 0 ? std::min(requestedTicks, charged) : charged) : std::min(charged, maxShift);
         const int shiftedCount = left;
         shifting = true;
         while (left > 0) {
@@ -217,6 +232,7 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
     }
     shotPending = false;
     shiftRequested = false;
+    requestedTicks = 0;
     lcShift = false;
 }
 
@@ -316,10 +332,16 @@ void sendNextPacket() noexcept
     sendNext = true;
 }
 
-void requestShift() noexcept
+void requestShift(int ticks) noexcept
 {
-    if (!shifting)
-        shiftRequested = true;
+    if (shifting)
+        return;
+    // два запроса за тик — берём больший («весь заряд» главнее)
+    if (!shiftRequested)
+        requestedTicks = ticks;
+    else if (requestedTicks > 0)
+        requestedTicks = ticks > 0 ? std::max(requestedTicks, ticks) : 0;
+    shiftRequested = true;
 }
 
 bool isShifting() noexcept
@@ -340,6 +362,11 @@ bool doubleTapEnabled() noexcept
 bool isCharged() noexcept
 {
     return charged >= std::clamp(config.exploits.shiftTicks, 1, 14);
+}
+
+bool threatened() noexcept
+{
+    return threat;
 }
 
 bool isDefensiveRecharging() noexcept
@@ -391,8 +418,9 @@ int defensiveTicksLeft() noexcept
     return std::max(lagCompLeft, shiftWindow);
 }
 
-void setMovement(bool onGround, bool jumpHeld, float verticalSpeed) noexcept
+void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizontalSpeed) noexcept
 {
+    movingFast = horizontalSpeed > 20.0f;
     groundTicks = onGround && !jumpHeld ? std::min(groundTicks + 1, 64) : 0;
     // «далеко от земли»: взлёт и первая половина спуска (у прыжка вверх ~300 ед/с, к приземлению −300).
     // Тут пропуск тика на зарядку прыжок не съест — LC в воздухе дозаряжается и работает весь прыжок.
@@ -437,9 +465,16 @@ void requestBreakLc() noexcept
     // и после выстрела возвращаться рывком было нечем)
     if (holdShot)
         return;
+    // Нас никто не видит — ломать лагкомп не для кого. Раньше триггер «Воздух»/Force LC гонял по кругу
+    // «сдвиг → 13 тиков зарядки → сдвиг» прямо на пустой карте, и в полёте/на бегу кидало туда-сюда.
+    // Скрытые углы AA при этом держатся (синтетическое окно в AntiAim.cpp), заряд копится и ждёт врага:
+    // как только кто-то увидел — сдвиг сразу (а пока он видит, перезарядки и так нет).
+    if (!threat)
+        return;
     // уже в окне — второй сдвиг ничего не добавит, только потратит заряд
     if (defensiveTicksLeft() == 0 && isCharged() && !shifting) {
         shiftRequested = true;
+        requestedTicks = 0;
         lcShift = true;
     }
 }

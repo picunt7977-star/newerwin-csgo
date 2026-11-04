@@ -1051,7 +1051,15 @@ static void drawAntiAimDefensive(float width, float height) noexcept
         tooltip("Пока тикбейс откатился после рывка (дефенсив/DT), сервер не пишет лагкомп по нам:\n"
                 "враг видит эти углы, но ни бектрекнуть, ни разрезольвить их не может.\n"
                 "Здесь задаётся, какие pitch и yaw показывать в это окно.\n"
-                "Нужен заряд: «Дефенсив» или DT в эксплойтах, либо «Ломать лагкомп» ниже.");
+                "Работает только с включённым DT (галка и клавиша DT): без DT — обычный AA.");
+        toggle("Дефенсив на пике", &aa.peekDefensive);
+        tooltip("Как «On Peek» у DT в Neverlose: за несколько тиков до того, как враг тебя увидит\n"
+                "(или в тот же тик, если он вышел сам), — рывок тикбейса. Записи лагкомпа на выглядывании\n"
+                "нет, а в окне показываются углы снизу (у стены — состояние «У стены (фристенд)»).\n"
+                "Только с дефенсивным DT (скаут/AWP или режим DT «Дефенсив»); с автопиком 6 тиков\n"
+                "заряда остаются на телепорт назад.");
+        if (aa.peekDefensive)
+            sliderInt("Предсказание пика", &aa.peekTicks, 2, 16, "%d тик.");
 
         static int selected = 0;
         static DefensiveSnap clipboard;
@@ -1121,7 +1129,9 @@ static void drawAntiAimDefensive(float width, float height) noexcept
         }
 
         ImGui::Dummy({ 0.0f, 4.0f });
-        if (aa.defensiveAa) {
+        if (aa.defensiveAa && !tickbase::doubleTapEnabled()) {
+            hint("DT выключен — дефенсив AA не работает.");
+        } else if (aa.defensiveAa) {
             char text[64];
             std::snprintf(text, sizeof(text), "Сейчас окно: %d тик.", tickbase::defensiveTicksLeft());
             hint(text);
@@ -1407,6 +1417,7 @@ void drawMovementTab() noexcept
         static constexpr const char* strafeModes[]{ "Выкл", "По камере", "WASD" };
         combo("Автострейф", &m.autoStrafe, strafeModes, IM_ARRAYSIZE(strafeModes));
         toggle("Быстрая лестница", &m.fastLadder);
+        toggle("Без урона от падения", &m.noFallDamage);
         ImGui::Dummy({ 0.0f, 6.0f });
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
         ImGui::TextWrapped("Автострейф в воздухе сам набирает скорость. «По камере» — летишь куда смотришь (S — назад), «WASD» — направление клавишами. Старые bunny hop / auto strafe из «Основное» выключи.");

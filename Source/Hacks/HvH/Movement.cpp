@@ -19,6 +19,7 @@
 #include <CSGO/Cvar.h>
 #include <CSGO/Engine.h>
 #include <CSGO/Entity.h>
+#include <CSGO/EngineTrace.h>
 #include <CSGO/GlobalVars.h>
 #include <CSGO/EntityList.h>
 #include <Interfaces/ClientInterfaces.h>
@@ -180,6 +181,28 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
     cycleLow = std::min(cycleLow, amount);
 }
 
+namespace
+{
+// Увидит ли враг нашу голову через `ahead` секунд, если и он, и мы продолжим двигаться как сейчас.
+// Его глаз двигаем только по горизонтали (прыжок врага не угадать), свой — по полной скорости.
+bool willSee(const EngineInterfaces& engineInterfaces, const Memory& memory, const csgo::Entity& enemy,
+             const csgo::Vector& ourEye, const csgo::Vector& ourVelocity, float ahead) noexcept
+{
+    const auto enemyVelocity = enemy.velocity();
+    const csgo::Vector from = enemy.getEyePosition() + csgo::Vector{ enemyVelocity.x * ahead, enemyVelocity.y * ahead, 0.0f };
+    const csgo::Vector to = ourEye + ourVelocity * ahead;
+    for (const csgo::Vector& point : { to + csgo::Vector{ 0.0f, 0.0f, 5.0f }, to - csgo::Vector{ 0.0f, 0.0f, 20.0f } }) {
+        if (memory.lineGoesThroughSmoke(from, point, 1))
+            continue;
+        csgo::Trace trace;
+        engineInterfaces.engineTrace().traceRay({ from, point }, 0x46004009, enemy.getPOD(), trace);
+        if (trace.entity == localPlayer.get().getPOD() || trace.fraction > 0.97f)
+            return true;
+    }
+    return false;
+}
+}
+
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept
 {
     static bool teleportWasDown = false;
@@ -203,6 +226,14 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
 
     // Кто нас сейчас видит: для рывка «враг только что увидел» и чтобы не дозаряжаться посреди перестрелки
     bool newlySpotted = false, anyVisible = false;
+
+    const auto& aa = config.antiAim;
+    const bool peekCheck = aa.peekDefensive && tickbase::doubleTapEnabled() && tickbase::defensiveAllowed()
+        && tickbase::isCharged() && !tickbase::isShifting() && tickbase::defensiveTicksLeft() == 0;
+    const float ahead = static_cast<float>(std::clamp(aa.peekTicks, 2, 16)) * memory.globalVars->intervalPerTick;
+    const csgo::Vector ourEye = localPlayer.get().getEyePosition();
+    const csgo::Vector ourVelocity = localPlayer.get().velocity();
+    bool peekSoon = false;
     const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
@@ -215,8 +246,36 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
             newlySpotted = true;
         anyVisible = anyVisible || visible;
         enemyWasVisible[i] = visible;
+        // пик: сейчас не видит, а через peekTicks тиков (оба продолжают двигаться как сейчас) — увидит
+        if (peekCheck && !visible && !peekSoon)
+            peekSoon = willSee(engineInterfaces, memory, entity, ourEye, ourVelocity, ahead);
     }
     tickbase::setThreat(anyVisible);
+
+    // Дефенсив на пике: рывок до того, как враг нас увидел (или в тик, когда увидел — тут и стоя:
+    // окно скрытых углов, а его лагкомп берёт старую запись). Записи лагкомпа на выглядывании нет —
+    // его чит стреляет по нам за стеной. В окне работают снапы дефенсив AA («У стены» — у стены).
+    if (peekCheck && (peekSoon || newlySpotted)) {
+        static float lastPeekShift = -10.0f;
+        const float now = memory.globalVars->realtime;
+        if (now < lastPeekShift)
+            lastPeekShift = -10.0f;
+        if (now - lastPeekShift > 0.5f) {
+            // зажат автопик — оставляем 6 тиков на телепорт назад
+            const bool peekHeld = config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown();
+            const int charged = tickbase::chargedTicks();
+            if (!peekHeld) {
+                tickbase::requestShift();
+                lastPeekShift = now;
+                return;
+            }
+            if (charged >= 12) {
+                tickbase::requestShift(charged - 6);
+                lastPeekShift = now;
+                return;
+            }
+        }
+    }
 
     // дефенсив DT рвётся при выглядывании и без отдельной галки «Дефенсив»
     if (!ex.defensive && !tickbase::defensiveDoubleTap())
@@ -364,11 +423,25 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
         // разброса). Заряд под автопик — до 14 тиков: даже с места после автостопа это ~35–40 ед.
         // Раньше ждали разгона до 14 тиков — телепорт шёл через ~0.2 с после выстрела.
         if (arrives || speed >= maxSpeed * 0.9f || peekReturnTicks >= 1) {
-            tickbase::requestShift();
+            // Тратим только сколько нужно до точки (+2 тика запаса на торможение у точки, не меньше 6 —
+            // на меньшем сдвиге сервер тикбейс не откатывает). Раньше уходил весь заряд (14) на каждый
+            // выстрел, и вторую половину перестрелки стояли без DT и дефенсива. Скорость берём к точке:
+            // сразу после выстрела мы ещё едем от неё.
+            const float towards = (velocity.x * dx + velocity.y * dy) / std::max(distance, 0.001f);
+            const int charge = tickbase::chargedTicks();
+            int need = charge;
+            for (int n = 1; n <= charge; ++n) {
+                if (shiftCoverage(towards, maxSpeed, n + 1, interval) >= distance - 4.0f) {
+                    need = n;
+                    break;
+                }
+            }
+            need = std::clamp(need + 2, std::min(6, charge), charge);
+            tickbase::requestShift(need);
             peekTeleported = true;
             char text[128];
-            std::snprintf(text, sizeof(text), "[автопик] телепорт: заряд %d, скорость %.0f, до точки %.0f ед., тик возврата %d",
-                tickbase::chargedTicks(), speed, distance, peekReturnTicks);
+            std::snprintf(text, sizeof(text), "[автопик] телепорт: %d из %d тиков, скорость %.0f, до точки %.0f ед., тик возврата %d",
+                need, charge, speed, distance, peekReturnTicks);
             ragebot::logToFile(text);
         }
     } else if (!peekTeleported && peekReturnTicks == 0) {
@@ -423,6 +496,50 @@ void fixMovement(csgo::UserCmd* cmd, float viewYaw) noexcept
         };
         swap(UserCmd::IN_FORWARD, UserCmd::IN_BACK);
         swap(UserCmd::IN_MOVELEFT, UserCmd::IN_MOVERIGHT);
+    }
+}
+
+namespace
+{
+float fallSpeed = 0.0f;     // скорость падения до предсказания этого тика
+bool fallUnduck = false;    // прошлый тик присели перед землёй — сейчас встать и прыгнуть
+}
+
+void noFallDamagePre() noexcept
+{
+    fallSpeed = localPlayer && localPlayer.get().isAlive() ? -localPlayer.get().velocity().z : 0.0f;
+}
+
+void noFallDamage(csgo::UserCmd* cmd, int flagsBeforePrediction) noexcept
+{
+    if (!config.movement.noFallDamage || !localPlayer || !localPlayer.get().isAlive()) {
+        fallUnduck = false;
+        return;
+    }
+    const auto moveType = localPlayer.get().moveType();
+    if (moveType == MoveType::LADDER || moveType == MoveType::NOCLIP) {
+        fallUnduck = false;
+        return;
+    }
+    using csgo::UserCmd;
+    // тик после приседа: в воздухе вставание опускает ноги на землю, и прыжок срабатывает раньше,
+    // чем игра посчитает приземление с урона
+    if (fallUnduck) {
+        cmd->buttons &= ~UserCmd::IN_DUCK;
+        cmd->buttons |= UserCmd::IN_JUMP;
+        fallUnduck = false;
+        return;
+    }
+    // урон начинается с ~580 ед/с, берём с запасом
+    if (fallSpeed < 500.0f)
+        return;
+    const bool wasInAir = !(flagsBeforePrediction & 1);             // 1 — FL_ONGROUND
+    const bool landsNow = (localPlayer.get().flags() & 1) != 0;     // после предсказания этой команды
+    if (wasInAir && landsNow) {
+        // присед в воздухе мгновенно поджимает ноги — в этот тик не приземляемся
+        cmd->buttons |= UserCmd::IN_DUCK;
+        cmd->buttons &= ~UserCmd::IN_JUMP;
+        fallUnduck = true;
     }
 }
 

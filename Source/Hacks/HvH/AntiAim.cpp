@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -9,6 +11,7 @@
 #include "AntiAim.h"
 #include "HvhConfig.h"
 #include "Movement.h"
+#include "Ragebot.h"
 #include "Tickbase.h"
 
 #include <Interfaces/ClientInterfaces.h>
@@ -236,8 +239,22 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
             center.z += 36.0f;
             closerTeammate = distanceToSegment(center, shooterEye, impact.position) < ours;
         }
-        if (!closerTeammate)
+        if (!closerTeammate) {
             triggerAntiBrute(memory.globalVars->realtime);
+            // в файл: выстрелы в нас (одна пуля — несколько импактов, не чаще раза в 0.3 с на стрелка).
+            // Вместе с «[по нам]» это даёт процент, с которым по нам попадают
+            static std::array<float, 65> lastLogged{};
+            const float now = memory.globalVars->realtime;
+            if (shooterIndex < 65 && (now - lastLogged[shooterIndex] > 0.3f || now < lastLogged[shooterIndex])) {
+                lastLogged[shooterIndex] = now;
+                csgo::PlayerInfo info;
+                const bool named = engineInterfaces.getEngine().getPlayerInfo(shooterIndex, info);
+                char text[256];
+                std::snprintf(text, sizeof(text), "[в нас стреляли] %s, пуля в %.0f ед. | AA: %s, сторона %+d%s", named ? info.name : "?", ours,
+                    stateName(), side, snap.active ? ", скрытые углы" : "");
+                ragebot::logToFile(text);
+            }
+        }
     }
     pendingImpacts.clear();
 }
@@ -935,11 +952,15 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
 
     const int inverterSide = aa.inverter.isToggled() ? 1 : -1;
 
+    // Дефенсив AA (скрытые углы, LC-триггеры, Force LC) — только с включённым DT (галка + клавиша).
+    // DT выключен — обычный AA, тикбейс ради дефенсива не трогаем.
+    const bool defensiveAaOn = !legit && aa.defensiveAa && tickbase::doubleTapEnabled();
+
     // ---- фристенд (сырое направление нужно ещё и дефенсиву «у стены») ----
     std::optional<float> freestandRaw;
     const bool freestandHeld = aa.freestandKey.isSet() && aa.freestandKey.isDown();
     const bool wantFreestand = !legit && aa.freestanding && (freestandHeld || (!aa.freestandKey.isSet() && manual == Manual::None));
-    const bool wantEdgeBait = !legit && aa.defensiveAa && aa.snaps[static_cast<int>(SnapState::EdgeBait)].mode != static_cast<int>(SnapMode::Default);
+    const bool wantEdgeBait = defensiveAaOn && aa.snaps[static_cast<int>(SnapState::EdgeBait)].mode != static_cast<int>(SnapMode::Default);
     bool freestandOverridesManual = false;
     if (wantFreestand || wantEdgeBait) {
         csgo::Vector enemyEye;
@@ -1050,12 +1071,16 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     // ---- дефенсив AA (скрытые углы) ----
     int lcLeft = tickbase::defensiveTicksLeft();
     const DefensiveSnap* chosenSnap = nullptr;
-    const bool triggerWants = !legit && aa.lcTriggers && (aa.lcTriggerStates & (1 << static_cast<int>(activeState)));
-    if (aa.defensiveAa && !legit) {
+    const bool triggerWants = defensiveAaOn && aa.lcTriggers && (aa.lcTriggerStates & (1 << static_cast<int>(activeState)));
+    if (defensiveAaOn) {
         chosenSnap = activeSnap(selectSnapState(cmd, freestandRaw.has_value()));
         // LC включён (триггер этого состояния или Force LC) — скрытые углы держим всегда, а не только
         // 2–3 тика окна после рывка: между рывками окно идёт по кругу «длительность → 1», как настоящее.
-        const bool always = chosenSnap && (triggerWants || chosenSnap->forceLc);
+        // Но только пока нас никто не видит. Под прицелом лагкомп по нам сломан лишь в настоящем окне
+        // после сдвига, а синтетическое окно показывало врагу голову вверх/спин без защиты — он её
+        // спокойно бектрекал и забирал (в воздухе с Force LC так было постоянно). Под прицелом — только
+        // настоящие окна, между ними обычный AA с десинком.
+        const bool always = chosenSnap && (triggerWants || chosenSnap->forceLc) && !tickbase::threatened();
         static int synthetic = 0;
         if (always && lcLeft == 0) {
             const int length = std::clamp(chosenSnap->duration, 1, 13);
@@ -1094,6 +1119,12 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
             snap.delayed = 0;
             snap.haveRandomPitch = snap.haveRandomYaw = false;
         }
+    } else {
+        // DT выключили посреди окна — следующее включение начнётся с чистого листа
+        snap.ticks = 0;
+        snap.apex = 0;
+        snap.delayed = 0;
+        snap.haveRandomPitch = snap.haveRandomYaw = false;
     }
 
     // ---- ломать лагкомп: Force LC у дефенсива и LC-триггеры по состояниям ----

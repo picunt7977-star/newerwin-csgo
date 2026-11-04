@@ -196,6 +196,11 @@ struct AntiAimConfig {
     std::array<DefensiveSnap, static_cast<int>(SnapState::Count)> snaps{};
     bool lcTriggers = false;        // ломать лагкомп в выбранных состояниях
     int lcTriggerStates = 0;        // биты AaState
+    // Дефенсив на пике (как «Lag Options: On Peek» у DT в Neverlose, на нём держится hysteria):
+    // за peekTicks тиков до того, как враг нас увидит (наш и его глаз продлены по скорости), или
+    // в тик, когда он увидел, — рывок тикбейса. В окне — снапы дефенсив AA (у стены — «У стены»)
+    bool peekDefensive = false;
+    int peekTicks = 8;
 
     // Дефенсив AA: пока враг целится в нас — голова вниз, тело уведено вбок от его прицела,
     // сторона дёргается на каждом отправленном пакете, чтобы его резольвер не успевал привыкнуть
@@ -287,6 +292,7 @@ struct MovementConfig {
     int peekTeleportTicks = 14;     // заряд под телепорт назад (больше «Тиков сдвига» DT — телепорт дальше)
     KeyBind fakeDuckKey;
     bool fastLadder = false;
+    bool noFallDamage = false;      // jumpbug в тик приземления: урон от падения не засчитывается
     bool bunnyHop = false;
     int autoStrafe = 1;             // AutoStrafe
 };

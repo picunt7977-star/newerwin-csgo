@@ -21,10 +21,13 @@ void onShot() noexcept;
 // Следующая команда уйдёт без чока (рейдж будет стрелять)
 void sendNextPacket() noexcept;
 // Телепорт/дефенсив: сдвинуть заряженные тики без выстрела
-void requestShift() noexcept;
+// ticks > 0 — сдвинуть только столько (остаток заряда остаётся), 0 — весь заряд
+void requestShift(int ticks = 0) noexcept;
 [[nodiscard]] bool isShifting() noexcept;
 [[nodiscard]] int chargedTicks() noexcept;
 [[nodiscard]] bool isCharged() noexcept;
+// нас сейчас видит хотя бы один враг
+[[nodiscard]] bool threatened() noexcept;
 // Заряд ушёл на дефенсив (LC-триггер) и сейчас набирается заново — для индикатора DT это «включён»
 [[nodiscard]] bool isDefensiveRecharging() noexcept;
 // Чок фейкдака (≤14): снижается, если сервер выкидывает хвост пачки
@@ -51,7 +54,8 @@ void updateLagComp(int tickBase) noexcept;   // из CreateMove, каждый т
 void requestBreakLc() noexcept;
 // Из CreateMove: заряд копим на земле и на взлёте; на спуске и при приземлении — нет: зарядка пропускает
 // тики, и пропущенный тик приземления съедает прыжок распрыжки
-void setMovement(bool onGround, bool jumpHeld, float verticalSpeed) noexcept;
+// horizontalSpeed — для плавной перезарядки дефенсива в движении (заряд через тик, а не замирание на 13)
+void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizontalSpeed) noexcept;
 // При включённом DT дефенсив рывков не делает (телепорт и мигающий DT) — только скрытые углы AA
 [[nodiscard]] bool defensiveAllowed() noexcept;
 // DT в режиме быстрой стрельбы (сдвиг на выстреле) / в дефенсивном режиме (заряд — на рывки при пике)

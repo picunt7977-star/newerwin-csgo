@@ -262,13 +262,15 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     features->misc.slowwalk(cmd);
     hvh::movement::fakeDuck(cmd, globalContext->memory->globalVars->intervalPerTick);
 
+    hvh::movement::noFallDamagePre();
     EnginePrediction::run(ClientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces }, *globalContext->memory, cmd);
+    hvh::movement::noFallDamage(cmd, EnginePrediction::getFlags());
 
     const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
     hvh::tickbase::setActive(localPlayer && localPlayer.get().isAlive());
     if (localPlayer && localPlayer.get().isAlive()) {
         hvh::tickbase::updateLagComp(localPlayer.get().tickBase());
-        hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z);   // 1 — FL_ONGROUND
+        hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z, localPlayer.get().velocity().length2D());   // 1 — FL_ONGROUND
         // второй пули DT нет у ножа, гранат и оружия с перезарядкой > 0.4 с (скаут, AWP) — там DT дефенсивный.
         // Раньше это ставил рейдж, а с ножом он до этого места не доходил: режим оставался от прошлого оружия
         if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
