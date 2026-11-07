@@ -41,6 +41,32 @@ struct matrix3x4 {
             mat[1][column] = ny;
         }
     }
+
+    // поворот кости вокруг оси axis (единичный вектор), проходящей через pivot (cos/sin угла)
+    constexpr void rotateAxis(const Vector& pivot, const Vector& axis, float c, float s) noexcept
+    {
+        const float t = 1.0f - c;
+        const float x = axis.x, y = axis.y, z = axis.z;
+        const float r[3][3]{
+            { t * x * x + c,     t * x * y - s * z, t * x * z + s * y },
+            { t * x * y + s * z, t * y * y + c,     t * y * z - s * x },
+            { t * x * z - s * y, t * y * z + s * x, t * z * z + c },
+        };
+        for (int column = 0; column < 4; ++column) {
+            float v[3]{ mat[0][column], mat[1][column], mat[2][column] };
+            if (column == 3) {
+                v[0] -= pivot.x;
+                v[1] -= pivot.y;
+                v[2] -= pivot.z;
+            }
+            for (int row = 0; row < 3; ++row) {
+                float value = r[row][0] * v[0] + r[row][1] * v[1] + r[row][2] * v[2];
+                if (column == 3)
+                    value += row == 0 ? pivot.x : row == 1 ? pivot.y : pivot.z;
+                mat[row][column] = value;
+            }
+        }
+    }
 private:
     float mat[3][4];
 };

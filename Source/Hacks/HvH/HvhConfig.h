@@ -80,6 +80,11 @@ struct RageConfig {
     // Зевс: стреляет, только если убивает (тело, в пределах дальности), со своим хитшансом
     bool zeusBot = false;
     int zeusHitchance = 80;
+    // Дормант-аимбот: враг вне PVS, но слышен (шаги/выстрел) или виден союзникам на радаре — стрелять
+    // в живот по последней позиции, если пробиваем на мин. урон. dormantAccuracy — насколько свежей
+    // должна быть позиция: 100% — только что услышали, 25% — до ~1.1 с назад
+    bool dormantAim = false;
+    int dormantAccuracy = 65;
     float fov = 180.0f;
     KeyBind minDamageOverrideKey;
     KeyBind forceBodyKey;
@@ -126,7 +131,6 @@ struct DefensiveSnap {
     int yawAngle = 180;
     int yawDelay = 0;               // пакетов между переключениями джиттера
     int yawSpeed = 20;
-    bool forceLc = false;           // в этом состоянии ломать лагкомп самим
     int duration = 13;              // сколько тиков окна дефенсива занимать (13 — всё окно)
 };
 
@@ -181,6 +185,7 @@ struct AntiAimConfig {
     KeyBind edgeKey;
     bool edgeStatic = true;
     int roll = 0;                   // наклон головы (roll), знак — сторона; в движении до ±40
+    int extendedYaw = 0;            // extended yaw: стоя ломаем LBY флик-тиком на столько градусов в сторону десинка (0 — выкл)
     int safeHead = static_cast<int>(SafeHead::Off);
     bool legitAa = false;           // на E — смотреть куда смотришь, десинк остаётся
     bool naturality = false;        // плавный переход между состояниями билдера
@@ -191,24 +196,9 @@ struct AntiAimConfig {
     KeyBind manualBack{ KeyBind::DOWN };
     KeyBind manualForward;
 
-    // Дефенсив AA (скрытые углы, как в hysteria)
+    // Скрытые углы: что показывать на тиках окна дефенсива. Само окно — в DefensiveConfig ниже
     bool defensiveAa = false;
     std::array<DefensiveSnap, static_cast<int>(SnapState::Count)> snaps{};
-    bool lcTriggers = false;        // ломать лагкомп в выбранных состояниях
-    int lcTriggerStates = 0;        // биты AaState
-    // Дефенсив на пике (как «Lag Options: On Peek» у DT в Neverlose, на нём держится hysteria):
-    // за peekTicks тиков до того, как враг нас увидит (наш и его глаз продлены по скорости), или
-    // в тик, когда он увидел, — рывок тикбейса. В окне — снапы дефенсив AA (у стены — «У стены»)
-    bool peekDefensive = false;
-    int peekTicks = 8;
-
-    // Дефенсив AA: пока враг целится в нас — голова вниз, тело уведено вбок от его прицела,
-    // сторона дёргается на каждом отправленном пакете, чтобы его резольвер не успевал привыкнуть
-    bool defensive = false;
-    int defensiveFov = 25;          // насколько точно враг должен смотреть на нас, градусы
-    int defensiveYaw = 50;          // на сколько уводить yaw от направления на врага
-    int defensivePitch = 89;        // pitch в дефенсиве, 89 — вниз, -89 — вверх
-    bool defensiveJitter = true;    // дёргать сторону на каждом отправленном пакете
 
     bool flicks = false;
     int flickTrigger = static_cast<int>(FlickTrigger::Defensive);
@@ -219,8 +209,66 @@ struct AntiAimConfig {
     int flickPitch = -89;            // градусы, -89 — вверх, 89 — вниз
     int flickEvery = 12;            // «Всегда»: раз в столько отправленных пакетов
 
+    // Фейклаг: сколько тиков держать команды в чоке. Чем длиннее чок, тем дальше модель на
+    // сервере от настоящей позиции. Режимы — как в NL: ровно столько тиков, случайно, адаптивно
+    // по скорости (держать смещение у порога телепорта сервера) и «ломать лагкомп» (перешагнуть
+    // этот порог: сервер считает такой шаг телепортом и запись лагкомпа по нам не интерполирует).
     int fakeLag = 1;                // сколько тиков чокать (1..14)
+    int fakeLagMode = 0;            // FakeLagMode
+    int fakeLagAir = 0;             // свой лимит в воздухе (0 — как основной)
+    int fakeLagStanding = 0;        // свой лимит, пока стоим (0 — как основной)
     bool slideWalk = false;         // ноги не крутятся при ходьбе
+
+    // Аним брейкер (своя модель): ноги на земле / в воздухе — 0 выкл, 1 статика, 2 мунвок;
+    // «Статика» на земле включает и слайд-волк (его видят враги), остальное — только у себя
+    bool animBreaker = false;
+    int breakerGround = 0;
+    int breakerAir = 0;
+    bool breakerLandPitch = false;  // при приземлении голова не кивает (pitch 0)
+};
+
+enum class AnimBreak { Off, Static, Moonwalk };
+
+// Фейклаг. «Адаптивный» и «Ломать лагкомп» считают лимит от своей скорости: сервер считает
+// телепортом шаг больше 64 юнитов по горизонтали (m_flTeleportDistanceSqr) — адаптивный держится
+// под этим порогом, «ломать» старается его перешагнуть (на земле скорости обычно не хватает).
+enum class FakeLagMode { Static, Random, Adaptive, Break, Count };
+inline constexpr std::array fakeLagModeNames{ "Статика", "Случайно", "Адаптивный", "Ломать лагкомп" };
+
+// Дефенсив: когда открывать окна. Биты триггеров
+enum DefensiveTrigger {
+    DefPeek    = 1 << 0,    // вот-вот выйдем врагу на глаза (или он только что нас увидел)
+    DefVisible = 1 << 1,    // пока нас кто-то видит — держать окна подряд
+    DefNear    = 1 << 2,    // живой враг рядом, даже если не видит
+    DefKey     = 1 << 3,    // по клавише
+    DefShot    = 1 << 4,    // сразу после своего выстрела (бектрек по тику выстрела не сработает)
+};
+
+// Как копить под окно. Разница в том, создаётся ли команда на «заряжаемом» тике.
+enum class ChargeStyle {
+    Choke,  // чоком: команда создаётся, но уходит позже — серверная модель отстаёт, мы едем ровно
+    Skip,   // пропуском вызова CL_Move: окно приходит быстрее, но персонаж на этих тиках не идёт
+    Count
+};
+inline constexpr std::array chargeStyleNames{ "Чоком (плавно)", "Пропуском тиков" };
+
+struct DefensiveConfig {
+    bool enabled = false;
+    // «Чоком» — по умолчанию: на пропусках персонаж терял треть скорости (1 из 3 тиков без команды),
+    // а рывок прогонял всю пачку за один тик, предсказание улетало вперёд и коррекция тянула назад
+    int chargeStyle = static_cast<int>(ChargeStyle::Choke);
+    int triggers = DefPeek | DefVisible;
+    KeyBind key;
+    int peekTicks = 8;      // за сколько тиков до «увидит» считать это пиком
+    // Заряд под рывок. Сервер откатывает тикбейс, когда промах больше sv_clockcorrection_msecs
+    // (~60 мс ≈ 4 тика) — полные 13 не нужны. Меньше заряд → чаще окна, но каждое короче
+    int chargeTicks = 10;
+    // Зарядка пропускает вызовы CL_Move: на пропущенном тике не создаётся команда и стоит персонаж.
+    // Пропускаем 1 тик из N: один пропуск — 15 мс и не чувствуется, подряд (1) — рывками
+    int chargeSpread = 3;
+    // Минимум тиков между рывками (у NL это `command_number % mode_duration`, по умолчанию 8).
+    // Не даёт жечь заряд очередью рывков, когда триггер висит всё время
+    int interval = 8;
 };
 
 struct ExploitConfig {
@@ -232,7 +280,15 @@ struct ExploitConfig {
     int doubleTapMode = 0;
     int shiftTicks = 13;
     KeyBind teleportKey;            // нажать: мгновенно прогнать заряженные тики (рывок)
-    bool defensive = false;         // враг только что увидел нас — авто-рывок, его лагкомп по нам ломается
+    // Хайдшоты: команда выстрела всегда уходит в чоке, следующим пакетом — углы AA. Сервер обновляет
+    // анимацию и лагкомп по последней команде пачки: угол выстрела (голова вверх, взгляд на врага) никто не видит
+    bool hideShots = false;
+    KeyBindToggle hideShotsKey;
+    // Авто хайдшоты: DT включён, а мы стоим / идём на shift / сидим — вместо быстрой стрельбы хайдшоты
+    // (стоячий DT резольвят легче всего). В воздухе и на автопике — снова DT
+    bool autoHideShots = false;
+    bool autoHsRifles = true;       // разрешать для автоматов, ПП и пистолетов (иначе там остаётся DT)
+    bool autoHsDeagle = true;       // для дигла
 };
 
 enum EspFlag {
@@ -246,6 +302,8 @@ struct ViewConfig {
     bool secondZoom = true;         // при «без зума»: второй уровень скопа всё же приближает
     float secondZoomFactor = 2.0f;  // во сколько раз
     bool showFakeAngles = true;     // в 3-м лице модель показывает то, что видит сервер
+    bool serverModel = true;        // в 3-м лице поверх — модель, как её видит сервер (десинк, roll)
+    float serverModelColor[4]{ 0.55f, 0.7f, 1.0f, 0.4f };
     bool grenadePrediction = true;  // траектория гранаты в руке
     float dormantTime = 6.0f;       // сколько секунд держать ESP игрока, пропавшего из PVS
     bool syncRender = true;         // mat_queue_mode 0: кадр и ESP из одного тика, без дёрганья
@@ -293,6 +351,11 @@ struct MovementConfig {
     KeyBind fakeDuckKey;
     bool fastLadder = false;
     bool noFallDamage = false;      // jumpbug в тик приземления: урон от падения не засчитывается
+    // AI peek (при зажатом автопике и без WASD): ищет вокруг точку в паре шагов, откуда пробиваем
+    // ближайшего к прицелу врага на мин. урон, выходит туда сам, после выстрела автопик возвращает
+    bool aiPeek = false;
+    int aiPeekQuality = 50;         // 30..100: сколько направлений проверять (8..16)
+    int aiPeekSafety = 4;           // столько проверок подряд точка должна держаться, прежде чем пойти
     bool bunnyHop = false;
     int autoStrafe = 1;             // AutoStrafe
 };
@@ -328,6 +391,7 @@ struct Config {
     ViewConfig view;
     RageConfig rage;
     AntiAimConfig antiAim;
+    DefensiveConfig defensive;
     ExploitConfig exploits;
     MovementConfig movement;
     AutoBuyConfig autoBuy;

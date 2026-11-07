@@ -15,6 +15,7 @@
 #include "HvhGui.h"
 #include "Movement.h"
 #include "Ragebot.h"
+#include "Defensive.h"
 #include "Tickbase.h"
 
 #include <GameData.h>
@@ -252,6 +253,11 @@ void setMinDamage(int value, bool overridden) noexcept
     minDamageOverridden = overridden;
 }
 
+int currentMinDamage() noexcept
+{
+    return minDamage;
+}
+
 void onDeath(const csgo::Engine& engine, int attacker, int victim, int local, bool headshot) noexcept
 {
     const auto& v = config.view;
@@ -389,7 +395,7 @@ void draw(ImDrawList* d) noexcept
     }
 
     if (v.lcIndicator) {
-        const int left = tickbase::defensiveTicksLeft();
+        const int left = defensive::windowLeft();
         const char* text = "LC";
         const auto size = ImGui::CalcTextSize(text);
         const ImVec2 at{ center.x - size.x * 0.5f, center.y + display.y * 0.18f };

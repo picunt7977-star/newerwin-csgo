@@ -38,6 +38,8 @@ public:
     }
 
     bool render(Backtrack& backtrack, void*, void*, const csgo::ModelRenderInfo&, csgo::matrix3x4*) noexcept;
+    // «Модель сервера»: ещё один проход модели плоским полупрозрачным цветом по своим костям
+    void drawGhost(void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones, const float rgba[4]) noexcept;
     void updateInput() noexcept;
 
     void setModelRenderHooks(const ModelRenderHooks* modelRenderHooks) noexcept

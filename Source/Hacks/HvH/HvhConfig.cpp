@@ -89,7 +89,6 @@ static void writeSnaps(json& j, const std::array<DefensiveSnap, static_cast<int>
         js["Yaw angle"] = sn.yawAngle;
         js["Yaw delay"] = sn.yawDelay;
         js["Yaw speed"] = sn.yawSpeed;
-        js["Force LC"] = sn.forceLc;
         js["Duration"] = sn.duration;
     }
 }
@@ -110,7 +109,6 @@ static void readSnaps(const json& j, std::array<DefensiveSnap, static_cast<int>(
         read(js, "Yaw angle", sn.yawAngle);
         read(js, "Yaw delay", sn.yawDelay);
         read(js, "Yaw speed", sn.yawSpeed);
-        read(js, "Force LC", sn.forceLc);
         read(js, "Duration", sn.duration);
         sn.mode = std::clamp(sn.mode, 0, 2);
         sn.pitch = std::clamp(sn.pitch, 0, static_cast<int>(SnapPitch::Count) - 1);
@@ -141,6 +139,8 @@ json toJson() noexcept
     r["Zeus bot"] = rage.zeusBot;
     r["Zeus hitchance"] = rage.zeusHitchance;
     r["FOV"] = rage.fov;
+    r["Dormant aimbot"] = rage.dormantAim;
+    r["Dormant accuracy"] = rage.dormantAccuracy;
     writeKey(r, "Min damage override key", rage.minDamageOverrideKey);
     writeKey(r, "Force body key", rage.forceBodyKey);
     writeKey(r, "Force shot key", rage.forceShotKey);
@@ -175,10 +175,6 @@ json toJson() noexcept
         writeSnaps(a["Preset rack"][i]["Snaps"], aa.presetRack[i].snaps);
     }
     a["Defensive AA"] = aa.defensiveAa;
-    a["LC triggers"] = aa.lcTriggers;
-    a["Defensive on peek"] = aa.peekDefensive;
-    a["Defensive on peek ticks"] = aa.peekTicks;
-    a["LC trigger states"] = aa.lcTriggerStates;
     a["Anti bruteforce triggers"] = aa.antiBruteTriggers;
     a["Anti bruteforce mode"] = aa.antiBruteMode;
     a["Anti bruteforce power"] = aa.antiBrutePower;
@@ -188,6 +184,7 @@ json toJson() noexcept
     writeKey(a, "Edge key", aa.edgeKey);
     a["Edge static"] = aa.edgeStatic;
     a["Roll"] = aa.roll;
+    a["Extended yaw"] = aa.extendedYaw;
     a["Safe head"] = aa.safeHead;
     a["Legit AA"] = aa.legitAa;
     a["Naturality"] = aa.naturality;
@@ -196,11 +193,6 @@ json toJson() noexcept
     a["Desync"] = aa.desync;
     a["Anti bruteforce reset"] = aa.antiBruteReset;
     a["Static on manual"] = aa.staticOnManual;
-    a["Defensive"] = aa.defensive;
-    a["Defensive fov"] = aa.defensiveFov;
-    a["Defensive yaw"] = aa.defensiveYaw;
-    a["Defensive pitch"] = aa.defensivePitch;
-    a["Defensive jitter"] = aa.defensiveJitter;
     a["Flicks"] = aa.flicks;
     a["Flick trigger"] = aa.flickTrigger;
     a["Flick side"] = aa.flickSide;
@@ -217,12 +209,21 @@ json toJson() noexcept
     writeKey(a, "Manual right", aa.manualRight);
     writeKey(a, "Manual back", aa.manualBack);
     a["Fake lag"] = aa.fakeLag;
+    a["Fake lag mode"] = aa.fakeLagMode;
+    a["Fake lag air"] = aa.fakeLagAir;
+    a["Fake lag standing"] = aa.fakeLagStanding;
     a["Slide walk"] = aa.slideWalk;
+    a["Animation breaker"] = aa.animBreaker;
+    a["Breaker ground"] = aa.breakerGround;
+    a["Breaker air"] = aa.breakerAir;
+    a["Breaker land pitch"] = aa.breakerLandPitch;
 
     j["View"]["Remove scope zoom"] = config.view.removeScopeZoom;
     j["View"]["Second zoom"] = config.view.secondZoom;
     j["View"]["Second zoom factor"] = config.view.secondZoomFactor;
     j["View"]["Show fake angles"] = config.view.showFakeAngles;
+    j["View"]["Server model"] = config.view.serverModel;
+    j["View"]["Server model color"] = { config.view.serverModelColor[0], config.view.serverModelColor[1], config.view.serverModelColor[2], config.view.serverModelColor[3] };
     j["View"]["Grenade prediction"] = config.view.grenadePrediction;
     j["View"]["Dormant time"] = config.view.dormantTime;
     j["View"]["Sync render"] = config.view.syncRender;
@@ -265,6 +266,9 @@ json toJson() noexcept
     writeKey(m, "Fake duck key", config.movement.fakeDuckKey);
     m["Fast ladder"] = config.movement.fastLadder;
     m["No fall damage"] = config.movement.noFallDamage;
+    m["AI peek"] = config.movement.aiPeek;
+    m["AI peek quality"] = config.movement.aiPeekQuality;
+    m["AI peek safety"] = config.movement.aiPeekSafety;
     m["Bunny hop"] = config.movement.bunnyHop;
     m["Auto strafe mode"] = config.movement.autoStrafe;
 
@@ -279,9 +283,24 @@ json toJson() noexcept
     e["Double tap"] = ex.doubleTap;
     writeKey(e, "Double tap key", ex.doubleTapKey);
     e["Shift ticks"] = ex.shiftTicks;
+
+    auto& d = j["Defensive"];
+    const auto& df = config.defensive;
+    d["Enabled"] = df.enabled;
+    d["Triggers"] = df.triggers;
+    writeKey(d, "Key", df.key);
+    d["Peek ticks"] = df.peekTicks;
+    d["Charge style"] = df.chargeStyle;
+    d["Charge ticks"] = df.chargeTicks;
+    d["Charge spread"] = df.chargeSpread;
+    d["Interval"] = df.interval;
     e["Double tap mode"] = ex.doubleTapMode;
     writeKey(e, "Teleport key", ex.teleportKey);
-    e["Defensive"] = ex.defensive;
+    e["Hide shots"] = ex.hideShots;
+    writeKey(e, "Hide shots key", ex.hideShotsKey);
+    e["Auto hide shots"] = ex.autoHideShots;
+    e["Auto hide shots rifles"] = ex.autoHsRifles;
+    e["Auto hide shots deagle"] = ex.autoHsDeagle;
 
     auto& s = j["Skins"];
     const auto& skins = config.skins;
@@ -323,6 +342,9 @@ void fromJson(const json& j) noexcept
         read(r, "Zeus bot", rage.zeusBot);
         read(r, "Zeus hitchance", rage.zeusHitchance);
         read(r, "FOV", rage.fov);
+        read(r, "Dormant aimbot", rage.dormantAim);
+        read(r, "Dormant accuracy", rage.dormantAccuracy);
+        rage.dormantAccuracy = std::clamp(rage.dormantAccuracy, 25, 95);
         read(r, "Min damage override key", rage.minDamageOverrideKey);
         read(r, "Force body key", rage.forceBodyKey);
         read(r, "Force shot key", rage.forceShotKey);
@@ -387,11 +409,6 @@ void fromJson(const json& j) noexcept
             }
         }
         read(a, "Defensive AA", aa.defensiveAa);
-        read(a, "LC triggers", aa.lcTriggers);
-        read(a, "Defensive on peek", aa.peekDefensive);
-        read(a, "Defensive on peek ticks", aa.peekTicks);
-        aa.peekTicks = std::clamp(aa.peekTicks, 2, 16);
-        read(a, "LC trigger states", aa.lcTriggerStates);
         read(a, "Anti bruteforce triggers", aa.antiBruteTriggers);
         read(a, "Anti bruteforce mode", aa.antiBruteMode);
         aa.antiBruteMode = std::clamp(aa.antiBruteMode, 0, 2);
@@ -403,6 +420,8 @@ void fromJson(const json& j) noexcept
         read(a, "Edge static", aa.edgeStatic);
         read(a, "Roll", aa.roll);
         aa.roll = std::clamp(aa.roll, -50, 50);
+        read(a, "Extended yaw", aa.extendedYaw);
+        aa.extendedYaw = std::clamp(aa.extendedYaw, 0, 180);
         read(a, "Safe head", aa.safeHead);
         aa.safeHead = std::clamp(aa.safeHead, 0, 2);
         read(a, "Legit AA", aa.legitAa);
@@ -412,11 +431,6 @@ void fromJson(const json& j) noexcept
         read(a, "Desync", aa.desync);
         read(a, "Anti bruteforce reset", aa.antiBruteReset);
         read(a, "Static on manual", aa.staticOnManual);
-        read(a, "Defensive", aa.defensive);
-        read(a, "Defensive fov", aa.defensiveFov);
-        read(a, "Defensive yaw", aa.defensiveYaw);
-        read(a, "Defensive pitch", aa.defensivePitch);
-        read(a, "Defensive jitter", aa.defensiveJitter);
         read(a, "Flicks", aa.flicks);
         read(a, "Flick trigger", aa.flickTrigger);
         read(a, "Flick side", aa.flickSide);
@@ -441,7 +455,19 @@ void fromJson(const json& j) noexcept
         read(a, "Manual right", aa.manualRight);
         read(a, "Manual back", aa.manualBack);
         read(a, "Fake lag", aa.fakeLag);
+        read(a, "Fake lag mode", aa.fakeLagMode);
+        read(a, "Fake lag air", aa.fakeLagAir);
+        read(a, "Fake lag standing", aa.fakeLagStanding);
+        aa.fakeLagMode = std::clamp(aa.fakeLagMode, 0, static_cast<int>(FakeLagMode::Count) - 1);
+        aa.fakeLagAir = std::clamp(aa.fakeLagAir, 0, 14);
+        aa.fakeLagStanding = std::clamp(aa.fakeLagStanding, 0, 14);
         read(a, "Slide walk", aa.slideWalk);
+        read(a, "Animation breaker", aa.animBreaker);
+        read(a, "Breaker ground", aa.breakerGround);
+        read(a, "Breaker air", aa.breakerAir);
+        read(a, "Breaker land pitch", aa.breakerLandPitch);
+        aa.breakerGround = std::clamp(aa.breakerGround, 0, 2);
+        aa.breakerAir = std::clamp(aa.breakerAir, 0, 2);
     }
 
     if (j.contains("View") && j["View"].is_object()) {
@@ -449,6 +475,13 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Second zoom", config.view.secondZoom);
         read(j["View"], "Second zoom factor", config.view.secondZoomFactor);
         read(j["View"], "Show fake angles", config.view.showFakeAngles);
+        read(j["View"], "Server model", config.view.serverModel);
+        if (const auto& color = j["View"]["Server model color"]; color.is_array() && color.size() == 4) {
+            for (std::size_t i = 0; i < 4; ++i) {
+                if (color[i].is_number())
+                    config.view.serverModelColor[i] = std::clamp(color[i].get<float>(), 0.0f, 1.0f);
+            }
+        }
         read(j["View"], "Grenade prediction", config.view.grenadePrediction);
         read(j["View"], "Dormant time", config.view.dormantTime);
         read(j["View"], "Sync render", config.view.syncRender);
@@ -498,6 +531,11 @@ void fromJson(const json& j) noexcept
         read(m, "Fake duck key", config.movement.fakeDuckKey);
         read(m, "Fast ladder", config.movement.fastLadder);
         read(m, "No fall damage", config.movement.noFallDamage);
+        read(m, "AI peek", config.movement.aiPeek);
+        read(m, "AI peek quality", config.movement.aiPeekQuality);
+        read(m, "AI peek safety", config.movement.aiPeekSafety);
+        config.movement.aiPeekQuality = std::clamp(config.movement.aiPeekQuality, 30, 100);
+        config.movement.aiPeekSafety = std::clamp(config.movement.aiPeekSafety, 1, 16);
         read(m, "Bunny hop", config.movement.bunnyHop);
         read(m, "Auto strafe mode", config.movement.autoStrafe);
     }
@@ -518,7 +556,29 @@ void fromJson(const json& j) noexcept
         read(e, "Shift ticks", ex.shiftTicks);
         read(e, "Double tap mode", ex.doubleTapMode);
         read(e, "Teleport key", ex.teleportKey);
-        read(e, "Defensive", ex.defensive);
+        read(e, "Hide shots", ex.hideShots);
+        read(e, "Hide shots key", ex.hideShotsKey);
+        read(e, "Auto hide shots", ex.autoHideShots);
+        read(e, "Auto hide shots rifles", ex.autoHsRifles);
+        read(e, "Auto hide shots deagle", ex.autoHsDeagle);
+    }
+
+    if (j.contains("Defensive") && j["Defensive"].is_object()) {
+        const auto& d = j["Defensive"];
+        auto& df = config.defensive;
+        read(d, "Enabled", df.enabled);
+        read(d, "Triggers", df.triggers);
+        read(d, "Key", df.key);
+        read(d, "Peek ticks", df.peekTicks);
+        df.peekTicks = std::clamp(df.peekTicks, 2, 16);
+        read(d, "Charge style", df.chargeStyle);
+        df.chargeStyle = std::clamp(df.chargeStyle, 0, static_cast<int>(ChargeStyle::Count) - 1);
+        read(d, "Charge ticks", df.chargeTicks);
+        df.chargeTicks = std::clamp(df.chargeTicks, 4, 14);
+        read(d, "Charge spread", df.chargeSpread);
+        df.chargeSpread = std::clamp(df.chargeSpread, 1, 6);
+        read(d, "Interval", df.interval);
+        df.interval = std::clamp(df.interval, 1, 64);
     }
 
     if (j.contains("Skins") && j["Skins"].is_object()) {

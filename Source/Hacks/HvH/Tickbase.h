@@ -22,8 +22,23 @@ void onShot() noexcept;
 void sendNextPacket() noexcept;
 // Телепорт/дефенсив: сдвинуть заряженные тики без выстрела
 // ticks > 0 — сдвинуть только столько (остаток заряда остаётся), 0 — весь заряд
-void requestShift(int ticks = 0) noexcept;
+// byDefensive — сдвиг просит дефенсив: длину пачки он потом забирает через takeDefensiveShift()
+void requestShift(int ticks = 0, bool byDefensive = false) noexcept;
 [[nodiscard]] bool isShifting() noexcept;
+// Сколько команд пачки ещё впереди (0 — сдвига нет). Пока пачка идёт, сервер запишет лагкомп
+// только по её ПОСЛЕДНЕЙ команде — остальные скрыты на любом сервере, без всякого отката
+[[nodiscard]] int shiftLeft() noexcept;
+// Длина последней ушедшей пачки сдвига — чья бы она ни была (рывок дефенсива, вторая пуля DT,
+// телепорт автопика) и его же чоковая пачка. Забирается один раз (дальше 0)
+[[nodiscard]] int takeShiftPack() noexcept;
+// Хайдшоты (ручные или авто) сейчас действуют: выстрел только в чокнутой команде
+[[nodiscard]] bool hideShotsActive() noexcept;
+// авто хайдшоты подменили быстрый DT (для индикатора «HS»)
+[[nodiscard]] bool autoHideShotsEngaged() noexcept;
+// из CreateMove каждый тик: стоим/шаг/присед и оружие подходит — DT уступает хайдшотам
+void setAutoHideShots(bool value) noexcept;
+// следующая команда уйдёт в чок (хайдшоты: в ней будет выстрел)
+void chokeNextPacket() noexcept;
 [[nodiscard]] int chargedTicks() noexcept;
 [[nodiscard]] bool isCharged() noexcept;
 // нас сейчас видит хотя бы один враг
@@ -44,19 +59,32 @@ void setFakeDuck(bool active) noexcept;
 // В игре/жив ли локальный игрок — ставится из CreateMove каждый тик
 void setActive(bool active) noexcept;
 
-// Окно дефенсива: наш m_nTickBase ниже максимума, который уже видел сервер, — новые записи лагкомпа
-// по нам не пишутся (сервер не кладёт запись с тем же или меньшим simtime), и враг видит углы этих
-// тиков, но не может по ним ни бектрекнуть, ни разрезольвить. Считается как lc_left в hysteria:
-// максимум тикбейса − текущий − 1. Плюс пара тиков сразу после нашего сдвига.
-void updateLagComp(int tickBase) noexcept;   // из CreateMove, каждый тик
-[[nodiscard]] int defensiveTicksLeft() noexcept;
-// AA просит ломать лагкомп (Force LC / LC-триггеры): держать заряд и сдвигать его, как только готов
-void requestBreakLc() noexcept;
+// Сырой откат тикбейса: на сколько наш m_nTickBase ниже максимума, который мы уже видели.
+// Пока он > 0, сервер не кладёт по нам новых записей лагкомпа (запись с тем же или меньшим simtime
+// он отбрасывает). Значение приходит из снапшота, то есть устарело на пинг, и само по себе
+// как «окно прямо сейчас» не годится — им пользуется только замер в Defensive.cpp
+void updateLagComp(int tickBase) noexcept;      // из CreateMove, каждый тик
+[[nodiscard]] int rawDeficit() noexcept;
+
+// Дефенсив ставит цель заряда (0 — заряд не нужен) и то, как размазывать пропуски тиков:
+// spread = 1 — пропускать подряд, N — 1 тик из N. Пропущенный тик — это несозданная команда,
+// то есть замерший персонаж, поэтому подряд их много быть не должно
+void setDefensiveCharge(int target, int spread) noexcept;
+// Дефенсив «чоком»: держать в чоке столько команд и отправлять пачкой (0 — не нужно). В отличие
+// от заряда пропуском, команды создаются — движение и мышь не теряются, а серверная модель просто
+// отстаёт от нашей на длину чока. Пачка и есть окно: сервер обработает её за один свой тик
+void setDefensiveChoke(int ticks) noexcept;
+[[nodiscard]] int defensiveChokeTicks() noexcept;
+// sv_maxusrcmdprocessticks, если сервер его реплицирует: больше этого в пачке держать нельзя —
+// хвост сервер выкинет (0 — неизвестно, тогда предел 14)
+void setProcessLimit(int ticks) noexcept;
+[[nodiscard]] int processLimitTicks() noexcept;
 // Из CreateMove: заряд копим на земле и на взлёте; на спуске и при приземлении — нет: зарядка пропускает
 // тики, и пропущенный тик приземления съедает прыжок распрыжки
 // horizontalSpeed — для плавной перезарядки дефенсива в движении (заряд через тик, а не замирание на 13)
-void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizontalSpeed) noexcept;
-// При включённом DT дефенсив рывков не делает (телепорт и мигающий DT) — только скрытые углы AA
+void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizontalSpeed, float interval) noexcept;
+// Дефенсив может тратить заряд: детур стоит, мы живы, не фейкдак и заряд не занят второй пулей DT
+// (быстрая стрельба). Сам DT для дефенсива не нужен — у него свой заряд
 [[nodiscard]] bool defensiveAllowed() noexcept;
 // DT в режиме быстрой стрельбы (сдвиг на выстреле) / в дефенсивном режиме (заряд — на рывки при пике)
 [[nodiscard]] bool fastFireEnabled() noexcept;

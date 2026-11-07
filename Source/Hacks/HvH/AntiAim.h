@@ -34,5 +34,20 @@ void storeSentAngles(float pitch, float yaw) noexcept;
 void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory& memory, bool forceRemove = false) noexcept;
 void onRoundStart() noexcept;
 [[nodiscard]] bool sentAngles(float& pitch, float& yaw) noexcept;
+// взгляд камеры этого тика до подмены: меню показывает, насколько AA уводит углы от настоящих
+void cameraAngles(float& pitch, float& yaw) noexcept;
+// Поза, которую видит сервер, по последнему отправленному пакету: взгляд, увод тела десинком
+// (сторона × величина из билдера, 0 — без десинка) и roll
+[[nodiscard]] bool sentServerPose(float& pitch, float& yaw, float& desync, float& roll) noexcept;
+
+// extended yaw: для линий у ног — настоящий LBY с сервера и отправленный взгляд (рисуется в HvhVisuals)
+struct ExtendedView {
+    bool active = false;
+    float origin[3]{};
+    float lby = 0.0f;       // m_flLowerBodyYawTarget, как его прислал сервер
+    float eyeYaw = 0.0f;    // отправленный взгляд
+    float flickYaw = 0.0f;  // куда ломаем LBY
+};
+[[nodiscard]] ExtendedView extendedView() noexcept;
 
 }

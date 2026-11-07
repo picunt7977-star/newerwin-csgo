@@ -25,6 +25,10 @@ float getDamage(const EngineInterfaces& engineInterfaces, const OtherInterfaces&
 float getDamageToPoint(const EngineInterfaces& engineInterfaces, const OtherInterfaces& interfaces, const csgo::Vector& point,
                        const csgo::WeaponInfo* weaponData, bool penetrate) noexcept;
 
+// То же, но луч из произвольной точки from (AI peek: откуда будем стрелять, если выйдем туда)
+float getDamageBetween(const EngineInterfaces& engineInterfaces, const OtherInterfaces& interfaces, const csgo::Vector& from, const csgo::Vector& point,
+                       const csgo::WeaponInfo* weaponData, bool penetrate) noexcept;
+
 // множитель хитгруппы + броня/шлем цели
 float scaleDamage(const csgo::Entity& target, int hitgroup, const csgo::WeaponInfo* weaponData, float damage) noexcept;
 

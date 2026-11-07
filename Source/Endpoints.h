@@ -9,6 +9,8 @@
 #include "Hooks/WindowProcedureHook.h"
 #endif
 
+#include <CSGO/NetworkChannel.h>
+
 #include "EventListener.h"
 #include "GlobalContext.h"
 
@@ -53,6 +55,7 @@
 #include "Hacks/HvH/ModelPreview.h"
 #include "Hacks/HvH/Movement.h"
 #include "Hacks/HvH/Ragebot.h"
+#include "Hacks/HvH/Defensive.h"
 #include "Hacks/HvH/Smoothing.h"
 #include "Hacks/HvH/RadarSpotted.h"
 #include "Hacks/HvH/Resolver.h"
@@ -72,6 +75,7 @@ void fireGameEvent(csgo::GameEventPOD* eventPointer)
         hvh::ragebot::onRoundStart();
         hvh::antiaim::onRoundStart();
         hvh::movement::onRoundStart();
+        hvh::defensive::onRoundStart();
         GameData::clearProjectileList();
         globalContext->features->misc.preserveKillfeed(true);
         [[fallthrough]];
@@ -270,7 +274,7 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     hvh::tickbase::setActive(localPlayer && localPlayer.get().isAlive());
     if (localPlayer && localPlayer.get().isAlive()) {
         hvh::tickbase::updateLagComp(localPlayer.get().tickBase());
-        hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z, localPlayer.get().velocity().length2D());   // 1 — FL_ONGROUND
+        hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z, localPlayer.get().velocity().length2D(), globalContext->memory->globalVars->intervalPerTick);   // 1 — FL_ONGROUND
         // второй пули DT нет у ножа, гранат и оружия с перезарядкой > 0.4 с (скаут, AWP) — там DT дефенсивный.
         // Раньше это ставил рейдж, а с ножом он до этого места не доходил: режим оставался от прошлого оружия
         if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
@@ -279,8 +283,11 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
             hvh::tickbase::setSlowWeapon(!data || type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4 || data->cycletime > 0.4f);
         }
     }
+    hvh::movement::exploitTuning(globalContext->getOtherInterfaces().getCvar());
+    hvh::movement::autoHideShots(cmd);
     hvh::movement::autoBuy(globalContext->getEngineInterfaces().getEngine());
     hvh::movement::exploits(globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory);
+    hvh::defensive::update(cmd, globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory);
 
     bool ragebotShot = false;
     if (hvh::config.rage.enabled) {
@@ -298,6 +305,8 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
         const float serverTime = globalContext->memory->globalVars->serverTime();
         manualShot = weapon.getPOD() && weapon.clip() > 0 && weapon.nextPrimaryAttack() <= serverTime && localPlayer.get().nextAttack() <= serverTime;
     }
+    hvh::movement::aiPeek(cmd, currentViewAngles.x, currentViewAngles.y, hvh::config.rage.enabled && hvh::ragebot::currentTarget() != 0,
+        globalContext->getEngineInterfaces(), clientInterfaces, globalContext->getOtherInterfaces(), *globalContext->memory);
     hvh::movement::autoPeek(cmd, currentViewAngles.y, ragebotShot || manualShot, globalContext->memory->globalVars->intervalPerTick);
     hvh::antiaim::run(cmd, globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory, ragebotShot);
     hvh::grenade::update(globalContext->getEngineInterfaces(), *globalContext->memory);
@@ -371,30 +380,12 @@ float FASTCALL_CONV ClientModeHooks::getViewModelFov(FASTCALL_THIS(csgo::ClientM
 
 // Модель чужого игрока (и то, что к нему прикреплено: оружие в руках) рисуем в сглаженной позиции (Smoothing.h):
 // сдвигаем копию костей, кэш костей игрока не трогаем — рейдж и лагкомп видят настоящую модель.
-csgo::matrix3x4* smoothedBones(const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones) noexcept
+// сдвиг копии костей: кэш движка не трогаем — рейдж, лагкомп и трассы видят настоящую модель
+static csgo::matrix3x4* shiftBones(const csgo::ModelRenderInfo& info, const csgo::matrix3x4* bones, const csgo::Vector& shift) noexcept
 {
-    if (!bones || !localPlayer || info.entityIndex <= 0 || !info.model)
-        return bones;
-    const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
-    auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(info.entityIndex));
-    // оружие в руках прикреплено к игроку (moveparent) — его тоже двигаем, иначе отстанет от рук
-    static const auto moveParentOffset = Netvars::get(fnv::hash("CBaseEntity->moveparent"));
-    for (int depth = 0; depth < 2 && moveParentOffset && entity.getPOD() != nullptr && !entity.isPlayer(); ++depth) {
-        const int handle = *reinterpret_cast<const int*>(std::uintptr_t(entity.getPOD()) + moveParentOffset);
-        entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(handle));
-    }
-    // все игроки, кроме нас: у союзников-хвхшников модель скачет так же
-    if (entity.getPOD() == nullptr || !entity.isPlayer() || entity.getPOD() == localPlayer.get().getPOD()
-        || entity.getNetworkable().isDormant() || !entity.isAlive())
-        return bones;
-
-    const auto raw = entity.getAbsOrigin();
-    const auto shift = hvh::smoothing::origin(entity.getNetworkable().index(), raw, entity.velocity(), globalContext->memory->globalVars->realtime) - raw;
-    if (shift.squareLength() < 0.01f)
-        return bones;
     const auto studio = globalContext->getEngineInterfaces().getModelInfo().getStudioModel(info.model);
     if (!studio)
-        return bones;
+        return const_cast<csgo::matrix3x4*>(bones);
     const int count = std::clamp(studio->numBones, 0, MAXSTUDIOBONES);
     static csgo::matrix3x4 shifted[MAXSTUDIOBONES];
     for (int i = 0; i < count; ++i) {
@@ -404,9 +395,104 @@ csgo::matrix3x4* smoothedBones(const csgo::ModelRenderInfo& info, csgo::matrix3x
     return shifted;
 }
 
+csgo::matrix3x4* smoothedBones(const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones) noexcept
+{
+    if (!bones || !localPlayer || !info.model)
+        return bones;
+
+    if (info.entityIndex <= 0)
+        return bones;
+    const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
+    auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(info.entityIndex));
+    // Оружие в руках — отдельная сущность, и её кости надо двигать вместе с владельцем: иначе тело
+    // уезжает на сглаженную позицию, а ствол остаётся на месте и висит в полуметре сбоку от руки.
+    // m_hOwnerEntity объявлен в Entity.h (NETVAR2) и у оружия в руках указывает на игрока.
+    static const auto ownerOffset = Netvars::get(fnv::hash("CBaseEntity->m_hOwnerEntity"));
+    for (int depth = 0; depth < 2 && ownerOffset && entity.getPOD() != nullptr && !entity.isPlayer(); ++depth)
+        entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntityFromHandle(entity.ownerEntity()));
+    // только чужие игроки: у союзников-хвхшников модель скачет так же, как у врагов (Smoothing.h).
+    // Свою модель и камеру не сглаживаем вовсе — сдвиг у себя давал телепорты и расхождение с руками
+    if (entity.getPOD() == nullptr || !entity.isPlayer() || entity.getNetworkable().isDormant() || !entity.isAlive())
+        return bones;
+    if (entity.getPOD() == localPlayer.get().getPOD())
+        return bones;
+
+    const auto raw = entity.getAbsOrigin();
+    const auto shift = hvh::smoothing::origin(entity.getNetworkable().index(), raw, entity.velocity(), globalContext->memory->globalVars->realtime) - raw;
+    if (shift.squareLength() < 0.01f)
+        return bones;
+    return shiftBones(info, bones, shift);
+}
+
+// «Модель сервера» (3-е лицо): кости своей модели, повёрнутые в позу, которую видит сервер по
+// последнему отправленному пакету. Ноги/таз — на угол ног сервера (взгляд + увод десинком, не больше
+// макс. десинка на этой скорости), выше по телу поворот плавно переходит к отправленному взгляду
+// (так body_yaw закручивает корпус), голова — по взгляду. Затем вся модель наклоняется на roll
+// вокруг направления взгляда. nullptr — рисовать нечего (поза совпадает с нашей или выключено).
+csgo::matrix3x4* serverModelBones(const csgo::ModelRenderInfo& info, const csgo::matrix3x4* bones) noexcept
+{
+    float pitch, sentYaw, desync, roll;
+    if (!bones || !info.model || !hvh::antiaim::sentServerPose(pitch, sentYaw, desync, roll))
+        return nullptr;
+    const auto& local = localPlayer.get();
+    float maxDesync = local.getMaxDesyncAngle();
+    if (maxDesync <= 1.0f)
+        maxDesync = 58.0f;
+    const float serverFeet = sentYaw + std::clamp(desync, -maxDesync, maxDesync);
+    // модель повёрнута по углу ног клиентской анимации, голова клиента смотрит по renderAngles
+    const auto* animstate = local.getAnimstate();
+    const float clientFeet = animstate ? animstate->footYaw : info.angles.y;
+    const float feetDelta = std::remainder(serverFeet - clientFeet, 360.0f);
+    const float eyeDelta = std::remainder(sentYaw - local.renderAngles().y, 360.0f);
+    if (std::abs(feetDelta) < 1.0f && std::abs(eyeDelta) < 1.0f && std::abs(roll) < 1.0f)
+        return nullptr;
+
+    const auto studio = globalContext->getEngineInterfaces().getModelInfo().getStudioModel(info.model);
+    if (!studio)
+        return nullptr;
+    const int count = std::clamp(studio->numBones, 0, MAXSTUDIOBONES);
+    if (count == 0)
+        return nullptr;
+
+    const auto pivot = info.origin;
+    float top = pivot.z + 1.0f;
+    for (int i = 0; i < count; ++i)
+        top = std::max(top, bones[i][2][3]);
+    const float height = top - pivot.z;
+    // таз примерно на 55% роста (стоя ~38 из ~70, в приседе пропорция та же)
+    const float pelvis = pivot.z + height * 0.55f;
+
+    static csgo::matrix3x4 ghost[MAXSTUDIOBONES];
+    const float rollRad = Helpers::deg2rad(roll);
+    const float lookYaw = Helpers::deg2rad(sentYaw);
+    const csgo::Vector forward{ std::cos(lookYaw), std::sin(lookYaw), 0.0f };
+    for (int i = 0; i < count; ++i) {
+        ghost[i] = bones[i];
+        const float w = std::clamp((bones[i][2][3] - pelvis) / std::max(top - pelvis, 1.0f), 0.0f, 1.0f);
+        const float angle = Helpers::deg2rad(feetDelta + (eyeDelta - feetDelta) * w * w * (3.0f - 2.0f * w));
+        ghost[i].rotateYaw(pivot, std::cos(angle), std::sin(angle));
+        if (rollRad != 0.0f)
+            ghost[i].rotateAxis(pivot, forward, std::cos(rollRad), std::sin(rollRad));
+    }
+    return ghost;
+}
+
+// Призрак рисуется до самой модели: он полупрозрачный, а модель сверху перекроет его там, где они совпадают
+inline void drawServerModel(void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones) noexcept
+{
+    if (!hvh::config.view.serverModel || !hvh::config.antiAim.enabled || !localPlayer || !localPlayer.get().isAlive()
+        || info.entityIndex != localPlayer.get().getNetworkable().index()
+        || !globalContext->memory->input || !globalContext->memory->input->isCameraInThirdPerson
+        || globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())
+        return;
+    if (const auto ghost = serverModelBones(info, bones))
+        globalContext->features->chams.drawGhost(ctx, state, info, ghost, hvh::config.view.serverModelColor);
+}
+
 void FASTCALL_CONV ModelRenderHooks::drawModelExecute(FASTCALL_THIS(csgo::ModelRenderPOD* thisptr), void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* customBoneToWorld) noexcept
 {
     customBoneToWorld = smoothedBones(info, customBoneToWorld);
+    drawServerModel(ctx, state, info, customBoneToWorld);
     if (globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())
         return globalContext->hooks->modelRenderHooks.getOriginalDrawModelExecute()(thisptr, ctx, state, &info, customBoneToWorld);
 
@@ -506,6 +592,9 @@ void FASTCALL_CONV ClientHooks::frameStageNotify(FASTCALL_THIS(csgo::ClientPOD* 
     features->inventoryChanger.run(*globalContext->memory, stage);
 
     globalContext->hooks->clientHooks.getOriginalFrameStageNotify()(thisptr, stage);
+    // своя анимация посчитана в оригинале RENDER_START — поверх неё аним брейкер
+    if (stage == csgo::FrameStage::RENDER_START)
+        hvh::movement::animBreaker(globalContext->memory->globalVars->realtime);
 }
 
 int FASTCALL_CONV EngineSoundHooks::emitSound(FASTCALL_THIS(csgo::EngineSoundPOD* thisptr), void* filter, int entityIndex, int channel, const char* soundEntry, unsigned int soundEntryHash, const char* sample, float volume, int seed, int soundLevel, int flags, int pitch, const csgo::Vector& origin, const csgo::Vector& direction, void* utlVecOrigins, bool updatePositions, float soundtime, int speakerentity, void* soundParams) noexcept

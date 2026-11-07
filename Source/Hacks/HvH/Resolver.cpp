@@ -39,12 +39,19 @@ constexpr int LAYERS = csgo::ANIMATION_LAYER_COUNT;
 constexpr int MAX_CANDIDATES = 24;
 constexpr std::size_t STATE_SIZE = sizeof(csgo::AnimState);
 
-// Режимы коррекции поверх угла от слоёв: если слои врут (сильный джиттер, дефенсив),
-// счёт по попаданиям/промахам уводит на зеркальный угол. «Половину» убрали: в рейджботе такой же
-// половинный угол по логам 29.10 попадал 1 из 9, а величину десинка слои и так меряют.
-enum Mode { ModeLayers, ModeMirror, ModeCount };
-constexpr const char* modeNames[]{ "слои", "зеркало" };
-// счёт держим в рамках: иначе серия промахов по чужой вине запирает режим навсегда
+// Варианты коррекции поверх угла от слоёв. Слои врут на дефенсиве и лютом джиттере, а величину
+// десинка систематически занижают — поэтому угол не берётся как есть, а перебирается.
+// «Половину» в перебор не берём: в рейджботе такой же половинный угол по логам 29.10 попадал
+// 1 из 9, а величину десинка слои и так меряют.
+//
+// У каждого варианта свой счёт по игроку — это долгая память (чей антиаим как резольвится).
+// Поверх неё быстрый перебор: на каждом промахе по вине резольвера берём следующий вариант по
+// порядку предпочтения, попадание перебор останавливает и закрепляет вариант. Раньше вариантов
+// было два (слои / зеркало) и переключались они только накопленным счётом — против незнакомого
+// антиаима это значило 3-4 промаха подряд одним и тем же углом.
+enum Variant { VarLayers, VarMirror, VarExtreme, VarExtremeMirror, VarZero, VarCount };
+constexpr const char* variantNames[]{ "слои", "зеркало", "до максимума", "зеркало до максимума", "по взгляду" };
+// счёт держим в рамках: иначе серия промахов по чужой вине запирает вариант навсегда
 constexpr int scoreLimit = 8;
 
 struct Layers {
@@ -77,18 +84,26 @@ struct PlayerState {
     bool carried = false;           // угол не из слоёв, а доведён от прошлого найденного
     bool anchored = false;          // угол по LBY — точный, зеркалить его нельзя
 
-    std::array<int, ModeCount> score{};
-    int mode = ModeLayers;
-    // Величина десинка, выученная промахами: импакт показал, что сторона верна, а модель стояла
-    // дальше найденного угла (логи 31.10: 4 из 5 доказанных промахов в голову по слоям — так).
-    // Пока > 0, найденный угол доводим до полного десинка той же стороны.
-    int extreme = 0;
+    std::array<int, VarCount> score{};
+    int variant = VarLayers;        // чем правим угол прямо сейчас
+    int cycle = 0;                  // шагов быстрого перебора в текущей серии промахов
     bool transition = false;        // на этом обновлении слой ходьбы сменил анимацию — слои ненадёжны
     Layers lastNet;                 // сетевые слои прошлого обновления
 
     bool haveShadow = false;
     alignas(16) std::byte shadow[STATE_SIZE]{};
     Layers shadowLayers;
+
+    // База этого обновления: состояние, с которого считались все кандидаты (тень прошлого
+    // обновления или то, что было у клиента). Пока обновление то же, с неё можно прогнать
+    // анимацию под любой угол ног — этим живёт анимфикс в рейджботе (simulateAt).
+    bool baseValid = false;
+    float baseSimulationTime = -1.0f;
+    float baseEyeYaw = 0.0f;
+    float basePitch = 0.0f;
+    float baseDelta = 0.0f;
+    alignas(16) std::byte baseState[STATE_SIZE]{};
+    Layers baseLayers;
 
     Layers afterClient;
     bool haveAfterClient = false;
@@ -229,6 +244,7 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     state.signals = 0;
     state.carried = false;
     state.anchored = false;
+    state.baseValid = false;
 
     auto* animstate = entity.getAnimstate();
     auto* layers = entity.animOverlays();
@@ -364,8 +380,18 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
     static std::array<csgo::AnimationLayer, MAX_CANDIDATES * LAYERS> simulated{};
     static std::array<float, MAX_CANDIDATES> resultYaw{};
     static std::array<float, MAX_CANDIDATES> error{};
-    const std::byte* base = state.haveShadow ? state.shadow : backupState;
-    const Layers& baseLayers = state.haveShadow ? state.shadowLayers : backupLayers;
+    // База обновления — в своё поле. Тень ниже перезапишется найденным углом, а прогоны под
+    // другие углы (simulateAt: скелеты крайних сторон и зеркала для анимфикса) обязаны идти от
+    // того же состояния, с которого считались кандидаты, иначе фаза анимации уедет.
+    std::memcpy(state.baseState, state.haveShadow ? state.shadow : backupState, STATE_SIZE);
+    state.baseLayers = state.haveShadow ? state.shadowLayers : backupLayers;
+    state.baseSimulationTime = entity.simulationTime();
+    state.baseEyeYaw = eyeYaw;
+    state.basePitch = pitch;
+    state.baseDelta = updateDelta;
+    state.baseValid = true;
+    const std::byte* base = state.baseState;
+    const Layers& baseLayers = state.baseLayers;
 
     ScoreResult scored;
     if (!lbyAnchor) {
@@ -535,21 +561,21 @@ void resolvePlayer(PlayerState& state, const csgo::Entity& entity, const Memory&
 
     if (lbyAnchor) {
         std::snprintf(state.status, sizeof(state.status),
-            "ноги по LBY (сервер сам показал угол у стоящего): дельта %+.1f° (макс %.0f°), режим %s",
-            state.delta, state.maxDesync, modeNames[std::clamp(state.mode, 0, ModeCount - 1)]);
+            "ноги по LBY (сервер сам показал угол у стоящего): дельта %+.1f° (макс %.0f°), вариант %s",
+            state.delta, state.maxDesync, variantNames[std::clamp(state.variant, 0, VarCount - 1)]);
     } else if (state.carried) {
         std::snprintf(state.status, sizeof(state.status),
-            "слои молчат, угол доведён от прошлого: дельта %+.1f° (макс %.0f°), уверенность %.0f%%, режим %s",
-            state.delta, state.maxDesync, state.confidence * 100.0f, modeNames[std::clamp(state.mode, 0, ModeCount - 1)]);
+            "слои молчат, угол доведён от прошлого: дельта %+.1f° (макс %.0f°), уверенность %.0f%%, вариант %s",
+            state.delta, state.maxDesync, state.confidence * 100.0f, variantNames[std::clamp(state.variant, 0, VarCount - 1)]);
     } else if (state.signals == 0) {
         std::snprintf(state.status, sizeof(state.status),
             "слои молчат (ноги не крутятся, кандидатов %d, макс %.0f°) — угол от геометрии",
             candidateCount, state.maxDesync);
     } else {
         std::snprintf(state.status, sizeof(state.status),
-            "дельта %+.1f° (макс %.0f°), уверенность %.0f%%, ошибка %.2f, сигналов %d, кандидатов %d, режим %s%s%s",
+            "дельта %+.1f° (макс %.0f°), уверенность %.0f%%, ошибка %.2f, сигналов %d, кандидатов %d, вариант %s%s%s",
             state.delta, state.maxDesync, state.confidence * 100.0f, state.error, state.signals, state.candidates,
-            modeNames[std::clamp(state.mode, 0, ModeCount - 1)], state.extreme > 0 ? ", до максимума" : "",
+            variantNames[std::clamp(state.variant, 0, VarCount - 1)], state.cycle > 0 ? ", перебор" : "",
             state.transition ? ", переход анимации" : "");
     }
 }
@@ -559,18 +585,46 @@ void forget(PlayerState& state) noexcept
 {
     const int userId = state.userId;
     const auto score = state.score;
-    const int extreme = state.extreme;
+    const int cycle = state.cycle;
     state = {};
     state.userId = userId;
     state.score = score;
-    state.extreme = extreme;
+    state.cycle = cycle;
 }
 
-// Зеркало — только с запасом в два очка: один промах по чужой вине (пинг, стена) не должен
-// переворачивать угол, который слои нашли честно
-[[nodiscard]] int bestMode(const PlayerState& state) noexcept
+// Порядок предпочтения вариантов: по счёту, при равенстве — по очереди объявления (слои первыми).
+// Любой вариант, кроме слоёв, должен обогнать их на два очка: один промах по чужой вине (пинг,
+// стена, чужой дефенсив) не должен переворачивать угол, который слои нашли честно.
+[[nodiscard]] std::array<int, VarCount> variantOrder(const PlayerState& state) noexcept
 {
-    return state.score[ModeMirror] >= state.score[ModeLayers] + 2 ? ModeMirror : ModeLayers;
+    std::array<int, VarCount> order{ VarLayers, VarMirror, VarExtreme, VarExtremeMirror, VarZero };
+    const auto weight = [&state](int variant) {
+        return state.score[variant] - (variant == VarLayers ? 0 : 2);
+    };
+    std::stable_sort(order.begin(), order.end(), [&weight](int a, int b) { return weight(a) > weight(b); });
+    return order;
+}
+
+// Вариант на сейчас: лучший по счёту, сдвинутый на число промахов в текущей серии
+[[nodiscard]] int pickVariant(const PlayerState& state) noexcept
+{
+    return variantOrder(state)[static_cast<std::size_t>(std::clamp(state.cycle, 0, VarCount - 1))];
+}
+
+// Угол ног с учётом варианта. delta — что нашли слои, max — максимальный десинк на этой записи
+[[nodiscard]] float applyVariant(int variant, float delta, float max) noexcept
+{
+    // «Почти по взгляду» не доводим до максимума: там сторона не определена, и полный угол
+    // был бы не коррекцией, а догадкой
+    const bool sided = std::abs(delta) > 3.0f;
+    const float sign = delta >= 0.0f ? 1.0f : -1.0f;
+    switch (variant) {
+    case VarMirror: return -delta;
+    case VarExtreme: return sided ? sign * max : delta;
+    case VarExtremeMirror: return sided ? -sign * max : -delta;
+    case VarZero: return 0.0f;
+    default: return delta;
+    }
 }
 
 }
@@ -622,6 +676,7 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
             // иначе слои молчали бы, пока simtime не перегонит старый максимум (сдвиг 14 тиков = ~220 мс)
             if (simulationTime < state.lastSimulationTime) {
                 state.haveShadow = false;
+                state.baseValid = false;
                 state.valid = false;
                 state.lastSimulationTime = simulationTime;
             }
@@ -633,10 +688,11 @@ void onNetUpdate(const EngineInterfaces& engineInterfaces, const ClientInterface
             if (ticks >= 1 && ticks <= 17)
                 state.chokeHistory = static_cast<std::uint8_t>((state.chokeHistory << 1) | (ticks > 1 ? 1 : 0));
             else
+                state.baseValid = false;
                 state.haveShadow = false;   // пропустили обновления (дормант, выход из PVS) — история анимации уже не та
         }
 
-        state.mode = bestMode(state);
+        state.variant = pickVariant(state);
         resolvePlayer(state, entity, memory, interval, config.rage.resolverSteps);
 
         state.lastSimulationTime = simulationTime;
@@ -686,13 +742,8 @@ float footYaw(int index) noexcept
         return 0.0f;
     const auto& state = states[index];
     if (state.anchored)
-        return state.footYaw;
-    float delta = state.mode == ModeMirror ? -state.delta : state.delta;
-    // выучено промахами: сторону слои находят верно, а величину занижают — доводим до максимума.
-    // «Почти по взгляду» не трогаем: там сторона не определена, и полный угол был бы догадкой.
-    if (state.extreme > 0 && std::abs(delta) > 3.0f)
-        delta = delta > 0.0f ? state.maxDesync : -state.maxDesync;
-    return normalizeYaw(state.eyeYaw + delta);
+        return state.footYaw;   // угол по LBY сервер показал сам — перебирать тут нечего
+    return normalizeYaw(state.eyeYaw + applyVariant(state.variant, state.delta, std::max(state.maxDesync, 1.0f)));
 }
 
 float delta(int index) noexcept
@@ -731,10 +782,9 @@ void onHit(int index) noexcept
     if (index <= 0 || index >= MAX_PLAYERS)
         return;
     auto& state = states[index];
-    auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
+    auto& score = state.score[std::clamp(state.variant, 0, VarCount - 1)];
     score = std::min(score + 2, scoreLimit);
-    if (state.extreme > 0)
-        state.extreme = std::min(state.extreme + 1, 6);
+    state.cycle = 0;    // вариант попал — перебор останавливаем
 }
 
 void onMiss(int index, bool proven) noexcept
@@ -742,12 +792,12 @@ void onMiss(int index, bool proven) noexcept
     if (index <= 0 || index >= MAX_PLAYERS)
         return;
     auto& state = states[index];
-    auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
+    auto& score = state.score[std::clamp(state.variant, 0, VarCount - 1)];
     score = std::max(score - (proven ? 2 : 1), -scoreLimit);
-    // при доведении до максимума промах мог быть и перелётом (ноги были ближе к взгляду) —
-    // доведение отпускаем, иначе одна выученная серия держала бы его вечно
-    if (state.extreme > 0)
-        state.extreme = std::max(state.extreme - (proven ? 1 : 2), 0);
+    // Следующий выстрел по этому игроку — следующим вариантом. Доказанный промах (импакт показал,
+    // что модель была на другой стороне) перепрыгивает сразу через зеркально-симметричный вариант:
+    // перебирать «то же, только зеркально» после такого промаха бессмысленно.
+    state.cycle = (state.cycle + 1) % VarCount;
 }
 
 void onMagnitudeMiss(int index) noexcept
@@ -755,26 +805,100 @@ void onMagnitudeMiss(int index) noexcept
     if (index <= 0 || index >= MAX_PLAYERS)
         return;
     auto& state = states[index];
-    // сторона была верной — режиму это в плюс, а не в минус (раньше такие промахи уводили в зеркало)
-    auto& score = state.score[std::clamp(state.mode, 0, ModeCount - 1)];
-    score = std::min(score + 1, scoreLimit);
-    state.extreme = std::min(state.extreme + 2, 6);
+    // Сторона была верной, не хватило величины: вариант со сторон́ой в плюс, а перебор ставим
+    // ровно на «до максимума» той же стороны — это и есть ответ на такой промах.
+    const int mirrored = state.variant == VarMirror || state.variant == VarExtremeMirror;
+    state.score[std::clamp(state.variant, 0, VarCount - 1)] = std::min(state.score[std::clamp(state.variant, 0, VarCount - 1)] + 1, scoreLimit);
+    const int wanted = mirrored ? VarExtremeMirror : VarExtreme;
+    state.score[wanted] = std::min(state.score[wanted] + 3, scoreLimit);
+    state.cycle = 0;
+    const auto order = variantOrder(state);
+    for (int i = 0; i < VarCount; ++i) {
+        if (order[static_cast<std::size_t>(i)] == wanted) {
+            state.cycle = i;
+            break;
+        }
+    }
 }
 
 bool extremeActive(int index) noexcept
 {
-    return index > 0 && index < MAX_PLAYERS && states[index].extreme > 0;
+    if (index <= 0 || index >= MAX_PLAYERS)
+        return false;
+    const int variant = states[index].variant;
+    return variant == VarExtreme || variant == VarExtremeMirror;
+}
+
+bool bruteforcing(int index) noexcept
+{
+    return index > 0 && index < MAX_PLAYERS && states[index].cycle > 0;
+}
+
+bool canSimulate(int index, float simulationTime) noexcept
+{
+    return index > 0 && index < MAX_PLAYERS && available() && !offsetsBroken
+        && states[index].baseValid && states[index].baseSimulationTime == simulationTime;
+}
+
+bool simulateAt(int index, const csgo::Entity& entity, const Memory& memory, float footYaw, AnimSnapshot& out) noexcept
+{
+    out.ok = false;
+    if (!canSimulate(index, entity.simulationTime()) || !memory.updateAnimationState || !knownBuild())
+        return false;
+
+    auto& state = states[index];
+    auto* animstate = entity.getAnimstate();
+    auto* layers = entity.animOverlays();
+    const int count = std::min(entity.animOverlayCount(), LAYERS);
+    if (!animstate || !layers || count < LAYERS || animstate->player != entity.getPOD())
+        return false;
+
+    // Прогон пишет в animstate, слои, позы и несколько полей игрока — всё это на время
+    alignas(16) std::byte savedState[STATE_SIZE];
+    std::memcpy(savedState, animstate, STATE_SIZE);
+    Layers savedLayers;
+    captureLayers(entity, savedLayers);
+    auto& poses = entity.poseParameters();
+    std::array<float, 24> savedPoses{};
+    std::copy(std::begin(poses), std::end(poses), savedPoses.begin());
+    std::byte savedScratch[40]{};
+    saveEntityScratch(entity, savedScratch);
+    const auto savedAbsAngles = entity.getAbsAngle();
+    const auto savedRotation = entity.angRotation();
+
+    simulate(animstate, layers, memory, state.baseState, state.baseLayers, normalizeYaw(footYaw),
+        state.baseEyeYaw, state.basePitch, state.baseDelta);
+
+    Layers result;
+    captureLayers(entity, result);
+    std::memcpy(out.state, animstate, STATE_SIZE);
+    out.layerCount = result.count;
+    std::copy(result.items.begin(), result.items.begin() + result.count, out.layers.begin());
+    std::copy(std::begin(poses), std::end(poses), out.poses.begin());
+    out.footYaw = animstate->footYaw;
+    out.eyeYaw = state.baseEyeYaw;
+    out.simulationTime = state.baseSimulationTime;
+    out.ok = std::isfinite(out.footYaw) && result.count == LAYERS && sane(result);
+
+    std::memcpy(animstate, savedState, STATE_SIZE);
+    restoreLayers(savedLayers, layers);
+    std::copy(savedPoses.begin(), savedPoses.end(), std::begin(poses));
+    restoreEntityScratch(entity, savedScratch);
+    const_cast<csgo::Vector&>(entity.getAbsAngle()) = savedAbsAngles;
+    entity.angRotation() = savedRotation;
+    return out.ok;
 }
 
 void onRoundStart() noexcept
 {
-    // Счёт режимов гасим наполовину, а не в ноль: антиаим у врага между раундами тот же,
-    // но инвертер он мог переключить. Величину десинка тоже чуть отпускаем.
+    // Счёт вариантов гасим наполовину, а не в ноль: антиаим у врага между раундами тот же,
+    // но инвертер он мог переключить. Перебор начинаем заново — с лучшего варианта.
     for (auto& state : states) {
         for (auto& score : state.score)
             score /= 2;
-        state.extreme = std::max(state.extreme - 1, 0);
+        state.cycle = 0;
         state.haveShadow = false;
+        state.baseValid = false;
         state.valid = false;
     }
 }

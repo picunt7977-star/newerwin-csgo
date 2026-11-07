@@ -22,7 +22,9 @@
 #include "Ragebot.h"
 #include "AntiAim.h"
 #include "Resolver.h"
+#include "Defensive.h"
 #include "Tickbase.h"
+#include "RadarSpotted.h"
 
 #include <Helpers.h>
 #include <Netvars.h>
@@ -43,6 +45,7 @@
 #include <CSGO/matrix3x4.h>
 #include <CSGO/ModelInfo.h>
 #include <CSGO/NetworkChannel.h>
+#include <CSGO/Sound.h>
 #include <CSGO/UserCmd.h>
 #include <CSGO/Vector.h>
 #include <CSGO/WeaponData.h>
@@ -321,6 +324,8 @@ struct LagRecord {
     float maxDesync = 0.0f;
     float jitterPhase = 1.0f;       // фаза джиттера на момент записи
     bool variants = false;          // plus/minus собраны анимацией
+    bool animFixed = false;         // крайние скелеты собраны прогоном анимации, а не подменой поз
+    bool resolvedByAnimation = false;   // и скелет под угол резольвера — тоже
     bool resolved = false;          // bones собраны под угол ног от резольвера по слоям
     float resolvedYaw = 0.0f;
     float resolvedConfidence = 0.0f;
@@ -450,6 +455,81 @@ bool rebuildAtYaw(const csgo::Entity& entity, const Memory& memory, const LagRec
     return ok;
 }
 
+// ---------- анимфикс: скелет по снимку серверной анимации ----------
+// rebuildAtYaw выше подменяет две позы формулой и просит кости у игры. Этого мало: при угле ног
+// animstate крутит не только body_yaw, а ещё lean, move_yaw, доворот позвоночника и наклон корпуса,
+// и считает их от своего состояния (скорость, присед, фаза шага). Поэтому правильный путь —
+// прогнать движковый CCSGOPlayerAnimState::Update с нужным углом (это делает резольвер: Resolver.cpp
+// simulateAt), снять всё, что прогон записал, и собрать кости уже по этому снимку.
+// Так хитбоксы совпадают с серверными — включая присед, прыжок, lean и фазу бега.
+bool rebuildFromSnapshot(const csgo::Entity& entity, const Memory& memory, const LagRecord& record,
+    const hvh::resolver::AnimSnapshot& snapshot, csgo::matrix3x4* out) noexcept
+{
+    const auto& offsets = boneCacheOffsets(memory);
+    if (!offsets.ok || rebuildDisabled || !snapshot.ok)
+        return false;
+
+    auto* animstate = entity.getAnimstate();
+    auto* layers = entity.animOverlays();
+    const int count = std::min(entity.animOverlayCount(), csgo::ANIMATION_LAYER_COUNT);
+    if (!animstate || !layers || count < snapshot.layerCount || snapshot.layerCount <= 0)
+        return false;
+
+    alignas(16) std::byte savedState[sizeof(csgo::AnimState)];
+    std::memcpy(savedState, animstate, sizeof(csgo::AnimState));
+    csgo::AnimationLayer savedLayers[csgo::ANIMATION_LAYER_COUNT];
+    std::copy(layers, layers + count, savedLayers);
+    auto& poses = entity.poseParameters();
+    std::array<float, 24> savedPoses{};
+    std::copy(std::begin(poses), std::end(poses), savedPoses.begin());
+    auto& absAngles = const_cast<csgo::Vector&>(entity.getAbsAngle());
+    auto& rotation = entity.angRotation();
+    const auto savedAbsAngles = absAngles;
+    const auto savedRotation = rotation;
+
+    std::memcpy(animstate, snapshot.state, sizeof(csgo::AnimState));
+    std::copy(snapshot.layers.begin(), snapshot.layers.begin() + snapshot.layerCount, layers);
+    std::copy(snapshot.poses.begin(), snapshot.poses.end(), std::begin(poses));
+    absAngles.y = snapshot.footYaw;
+    rotation.y = snapshot.footYaw;
+    invalidateBoneCache(entity, offsets);
+
+    static csgo::matrix3x4 setup[MAXSTUDIOBONES];
+    const bool ok = entity.setupBones(setup, MAXSTUDIOBONES, BONE_USED_BY_HITBOX, memory.globalVars->currenttime);
+    if (ok) {
+        const auto shift = record.origin - entity.getAbsOrigin();
+        for (int bone = 0; bone < RECORD_BONES; ++bone) {
+            out[bone] = setup[bone];
+            out[bone].translate(shift);
+        }
+    }
+
+    std::memcpy(animstate, savedState, sizeof(csgo::AnimState));
+    std::copy(savedLayers, savedLayers + count, layers);
+    std::copy(savedPoses.begin(), savedPoses.end(), std::begin(poses));
+    absAngles = savedAbsAngles;
+    rotation = savedRotation;
+    invalidateBoneCache(entity, offsets);
+    return ok;
+}
+
+// Скелет под угол ног, честно прогнанный через анимацию. Возвращает угол, на котором движок
+// остановился (он сам обрезает по максимальному десинку) — по нему рейджбот знает, где реально тело.
+bool rebuildByAnimation(const csgo::Entity& entity, const Memory& memory, const LagRecord& record, int index,
+    float feetYaw, csgo::matrix3x4* out, float* landedYaw = nullptr) noexcept
+{
+    if (!hvh::resolver::canSimulate(index, record.simulationTime))
+        return false;
+    static hvh::resolver::AnimSnapshot snapshot;
+    if (!hvh::resolver::simulateAt(index, entity, memory, feetYaw, snapshot))
+        return false;
+    if (!rebuildFromSnapshot(entity, memory, record, snapshot, out))
+        return false;
+    if (landedYaw)
+        *landedYaw = snapshot.footYaw;
+    return true;
+}
+
 // Запасной путь, если пересборка недоступна: поворот готовых костей вокруг оси игрока.
 // На сервере на полный угол повёрнуты ноги и таз, а позвоночник закручен обратно к взгляду:
 // чем выше кость, тем меньше доворот (ступни 100%, голова ~35%).
@@ -469,18 +549,32 @@ void buildVariants(const csgo::Entity& entity, const Memory& memory, LagRecord& 
 {
     const float maxDesync = record.maxDesync > 1.0f ? record.maxDesync : maxDesyncFor(record.velocity);
     const float eyeYaw = record.eyeAngles.y;
-    record.variants = rebuildAtYaw(entity, memory, record, eyeYaw + maxDesync, record.plus)
-        && rebuildAtYaw(entity, memory, record, eyeYaw - maxDesync, record.minus);
-    if (record.variants) {
-        // самопроверка: при десинке ~30°+ голова обязана сдвинуться, но не улететь
+
+    // самопроверка крайних скелетов: при десинке ~30°+ голова обязана сдвинуться, но не улететь
+    const auto variantsSane = [&record, maxDesync] {
         const float plusMove = (record.plus[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length();
         const float minusMove = (record.minus[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length();
-        if (plusMove > 40.0f || minusMove > 40.0f || (std::max(plusMove, minusMove) < 0.5f && maxDesync > 25.0f)) {
-            record.variants = false;
-            if (++rebuildFailures >= 8)
-                rebuildDisabled = true;
-        } else {
-            rebuildFailures = 0;
+        return plusMove <= 40.0f && minusMove <= 40.0f && !(std::max(plusMove, minusMove) < 0.5f && maxDesync > 25.0f);
+    };
+
+    // Крайние скелеты. Сначала анимфикс — прогон анимации под каждый угол (lean, доворот корпуса и
+    // фаза шага выходят настоящими). Нет свежей базы у резольвера — старый путь подменой поз,
+    // не вышел и он — поворот готовых костей.
+    record.animFixed = rebuildByAnimation(entity, memory, record, index, eyeYaw + maxDesync, record.plus)
+        && rebuildByAnimation(entity, memory, record, index, eyeYaw - maxDesync, record.minus)
+        && variantsSane();
+    record.variants = record.animFixed;
+    if (!record.variants) {
+        record.variants = rebuildAtYaw(entity, memory, record, eyeYaw + maxDesync, record.plus)
+            && rebuildAtYaw(entity, memory, record, eyeYaw - maxDesync, record.minus);
+        if (record.variants) {
+            if (!variantsSane()) {
+                record.variants = false;
+                if (++rebuildFailures >= 8)
+                    rebuildDisabled = true;
+            } else {
+                rebuildFailures = 0;
+            }
         }
     }
     if (!record.variants) {
@@ -496,17 +590,25 @@ void buildVariants(const csgo::Entity& entity, const Memory& memory, LagRecord& 
         // успел развернуться (выстрел, дефенсив), абсолютный угол уезжал за предел десинка
         // (лог 31.10: «ноги +159°/57°» — скелет с телом задом наперёд).
         const float yaw = eyeYaw + std::clamp(hvh::resolver::delta(index), -maxDesync, maxDesync);
-        if (rebuildAtYaw(entity, memory, record, yaw, resolved) && (resolved[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length() < 40.0f) {
+        float landed = yaw;
+        const bool byAnimation = rebuildByAnimation(entity, memory, record, index, yaw, resolved, &landed);
+        const bool built = byAnimation || rebuildAtYaw(entity, memory, record, yaw, resolved);
+        if (built && (resolved[HEAD_BONE].origin() - record.bones[HEAD_BONE].origin()).length() < 40.0f) {
             std::copy(resolved, resolved + RECORD_BONES, record.bones);
             record.resolved = true;
-            record.resolvedYaw = std::remainder(yaw, 360.0f);
+            record.resolvedByAnimation = byAnimation;
+            // При прогоне берём угол, на котором остановился движок: он обрезает его по
+            // максимальному десинку сам, и это та сторона, по которой потом учится резольвер
+            record.resolvedYaw = std::remainder(byAnimation ? landed : yaw, 360.0f);
             record.resolvedConfidence = hvh::resolver::confidence(index);
             return;
         }
     }
     // клиент собрал скелет со сглаженным взглядом (джиттер) — пересобираем с теми же ногами и настоящим взглядом
-    if (std::abs(std::remainder(entity.eyeAngles().y - eyeYaw, 360.0f)) > 5.0f)
-        rebuildAtYaw(entity, memory, record, record.absYaw, record.bones);
+    if (std::abs(std::remainder(entity.eyeAngles().y - eyeYaw, 360.0f)) > 5.0f) {
+        if (!rebuildByAnimation(entity, memory, record, index, record.absYaw, record.bones))
+            rebuildAtYaw(entity, memory, record, record.absYaw, record.bones);
+    }
 }
 
 // «потерял след» у лагкомпа сервера: соседние записи дальше 64 ед. по горизонтали
@@ -1123,6 +1225,7 @@ struct ShotRecord {
     float layerDelta = 0.0f;        // слои: угол ног от взгляда, по которому собран скелет
     float layerMax = 0.0f;          // ...и максимум десинка на той записи
     float layerConfidence = 0.0f;
+    bool animFixed = false;         // скелет собран прогоном анимации (анимфикс), а не подменой поз
     bool sideSafe = false;          // точка попадает и в найденный угол, и в максимум той же стороны
     bool safe = false;              // точка общая для всех трёх скелетов (промах по ней — модель вне всех трёх)
     bool flipping = false;          // ноги по слоям перекидываются между обновлениями (джиттер десинка)
@@ -1199,6 +1302,8 @@ void scoreGuess(Brain& brain, float guess, float truth) noexcept
     if (shot.source == SideSource::Layers && length > 0 && length < static_cast<int>(sizeof(text)))
         length += std::snprintf(text + length, sizeof(text) - length, " [ноги %+.0f°/%.0f°, %.0f%%%s]", shot.layerDelta, shot.layerMax,
             shot.layerConfidence * 100.0f, shot.sideSafe ? ", общая точка" : "");
+    if (shot.animFixed && length > 0 && length < static_cast<int>(sizeof(text)))
+        length += std::snprintf(text + length, sizeof(text) - length, " [анимфикс]");
     if (shot.flipping && length > 0 && length < static_cast<int>(sizeof(text)))
         length += std::snprintf(text + length, sizeof(text) - length, " [флипы]");
     if (shot.safe && length > 0 && length < static_cast<int>(sizeof(text)))
@@ -1396,6 +1501,7 @@ struct Target {
     float layerDelta = 0.0f;
     float layerMax = 0.0f;
     float layerConfidence = 0.0f;
+    bool animFixed = false;
     bool flipping = false;
     const csgo::StudioHitboxSet* set = nullptr;
     const csgo::StudioHdr* studio = nullptr;
@@ -1478,7 +1584,7 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
             playerName(attackerIndex).c_str(), hitgroup >= 0 && hitgroup < 9 ? groups[hitgroup] : "?", damage, healthLeft,
             hvh::antiaim::stateName(), hvh::antiaim::desyncSide(), hvh::antiaim::defensiveActive() ? ", скрытые углы" : "",
             hvh::antiaim::isFreestanding() ? ", фристенд" : "", sent ? pitch : 0.0f, onGround ? "земля" : "воздух", speed,
-            tickbase::defensiveTicksLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет");
+            defensive::windowLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет");
         fileLog(text);
         return;
     }
@@ -1736,6 +1842,135 @@ bool knifeBot(csgo::UserCmd* cmd, const csgo::Entity& weapon, const EngineInterf
     return true;
 }
 
+// ---------- дормант-аимбот ----------
+// Враг вне PVS: сервер его не шлёт, но звуки (шаги, выстрел, перезарядка) приходят с координатами, а
+// замеченных союзниками — радар. Держим последнюю позицию и время; стреляем в живот через стену.
+
+struct DormantTrack {
+    csgo::Vector origin{};
+    float at = -1.0f;               // realtime последней достоверной позиции
+};
+std::array<DormantTrack, 65> dormantTracks{};
+
+// каждый тик: живые враги — позиция как есть; дормант — по звуку / радару, опущенная на пол
+void trackDormant(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, int maxClients, float realtime) noexcept
+{
+    for (int i = 1; i <= maxClients; ++i) {
+        auto& track = dormantTracks[i];
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+        if (!entity.getPOD() || entity.getPOD() == localPlayer.get().getPOD() || !entity.isOtherEnemy(memory, localPlayer.get()) || !entity.isAlive()) {
+            track.at = -1.0f;
+            continue;
+        }
+        if (realtime < track.at)
+            track.at = -1.0f;
+        if (!entity.getNetworkable().isDormant()) {
+            track.origin = entity.getAbsOrigin();
+            track.at = realtime;
+            continue;
+        }
+        bool heard = false;
+        csgo::Vector heardAt{};
+        for (int c = 0; c < memory.activeChannels->count; ++c) {
+            const auto& channel = memory.channels[memory.activeChannels->list[c]];
+            if (channel.soundSource != i || (channel.origin.x == 0.0f && channel.origin.y == 0.0f))
+                continue;
+            heardAt = channel.origin;
+            heard = true;
+            break;
+        }
+        if (!heard) {
+            auto radarAt = track.origin;
+            if (track.at > 0.0f && hvh::radar::origin(i, track.at, radarAt)) {
+                heardAt = radarAt;
+                heard = true;
+            }
+        }
+        if (!heard)
+            continue;
+        // звук оружия звучит из рук, шаги — из ног: опускаем точку на пол, дальше от него считаем высоту
+        csgo::Trace trace;
+        engineInterfaces.engineTrace().traceRay({ heardAt + csgo::Vector{ 0.0f, 0.0f, 4.0f }, heardAt - csgo::Vector{ 0.0f, 0.0f, 90.0f } },
+            0x1400B, { entity.getPOD() }, trace);
+        track.origin = trace.fraction < 1.0f ? trace.endpos : heardAt;
+        track.at = realtime;
+    }
+}
+
+bool dormantShot(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces,
+                 const Memory& memory, const csgo::WeaponInfo* weaponData, const RageWeapon& settings, int maxClients,
+                 const csgo::Vector& eye, float cone, bool needScope, bool scopeAllowed, AutoStop stopMode, float stopMaxSpeed,
+                 const MovementVars& moveVars, float interval, float realtime) noexcept
+{
+    const auto& rage = config.rage;
+    // свежесть позиции -> «точность»: 100% — только что, 0% — 1.5 с назад
+    const float maxAge = 1.5f * (1.0f - static_cast<float>(std::clamp(rage.dormantAccuracy, 25, 95)) / 100.0f);
+    const int minDamageSetting = minDamageOverride ? settings.minDamageOverride : settings.minDamage;
+
+    int bestIndex = 0;
+    float bestDamage = 0.0f;
+    csgo::Vector bestPoint{};
+    for (int i = 1; i <= maxClients; ++i) {
+        const auto& track = dormantTracks[i];
+        if (track.at < 0.0f || realtime - track.at > maxAge)
+            continue;
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+        if (!entity.getPOD() || !entity.getNetworkable().isDormant() || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()))
+            continue;
+        // живот: стоя ~40 ед. от пола, сидя ~28 (флаги — с последнего обновления, другого нет)
+        const bool ducking = entity.flags() & (1 << 1);
+        const auto point = track.origin + csgo::Vector{ 0.0f, 0.0f, ducking ? 28.0f : 40.0f };
+        const auto toPoint = (point - eye).toAngle();
+        const float fov = std::hypot(std::remainder(toPoint.x - cmd->viewangles.x, 360.0f), std::remainder(toPoint.y - cmd->viewangles.y, 360.0f));
+        if (fov > rage.fov)
+            continue;
+        const float raw = autowall::getDamageToPoint(engineInterfaces, interfaces, point, weaponData, rage.autowall);
+        if (raw <= 0.0f)
+            continue;
+        const float damage = autowall::scaleDamage(entity, HitGroup::Stomach, weaponData, raw);
+        const int health = std::max(entity.health(), 1);
+        const int need = minDamageSetting > 100 ? health + (minDamageSetting - 100) : std::min(minDamageSetting, health);
+        if (damage < static_cast<float>(need) || damage <= bestDamage)
+            continue;
+        bestIndex = i;
+        bestDamage = damage;
+        bestPoint = point;
+    }
+    if (!bestIndex)
+        return false;
+
+    target = bestIndex;
+    const bool onGround = (localPlayer.get().flags() & FL_ONGROUND) && !(cmd->buttons & csgo::UserCmd::IN_JUMP);
+    if (needScope && onGround) {
+        if (scopeAllowed)
+            cmd->buttons |= csgo::UserCmd::IN_ATTACK2;
+        statusText = "дормант: скоуп";
+        return false;
+    }
+    if (stopMode != AutoStop::Off && onGround)
+        autoStop(cmd, stopMode, stopMaxSpeed, interval, moveVars);
+    // пятно разброса на этой дистанции должно лечь в живот (~7 ед.): иначе ждём, пока автостоп погасит скорость
+    if (cone * (bestPoint - eye).length() > 7.0f) {
+        statusText = "дормант: ждёт точности";
+        return false;
+    }
+    if (tickbase::hideShotsActive() && tickbase::isInstalled() && tickbase::sendPacket() && !tickbase::isShifting()) {
+        tickbase::chokeNextPacket();
+        statusText = "дормант: хайдшот в след. тике";
+        return false;
+    }
+    auto aimAngle = (bestPoint - eye).toAngle() - localPlayer.get().aimPunchAngle() * 2.0f;
+    aimAngle.normalize();
+    cmd->viewangles = aimAngle;
+    cmd->buttons |= csgo::UserCmd::IN_ATTACK;
+    statusText = "дормант: выстрел";
+    if (!rage.silent)
+        engineInterfaces.getEngine().setViewAngles(cmd->viewangles);
+    if (!tickbase::isShifting())
+        tickbase::onShot();
+    return true;
+}
+
 bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory) noexcept
 {
     const auto& rage = config.rage;
@@ -1788,6 +2023,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         view.breakingLagComp = list.count && list.at(0).breakingLagComp;
         view.charged = list.count && memory.globalVars->serverTime() - list.at(0).simulationTime > 0.15f + interval * 2.0f;
     }
+
+    if (rage.dormantAim)
+        trackDormant(engineInterfaces, clientInterfaces, memory, maxClients, realtime);
 
     if (localPlayer.get().isDefusing())
         return false;
@@ -2373,6 +2611,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             reliability *= sideTrust;
                         else if (!safe)
                             reliability *= sideFactor * (isHead && layerSide && !hvh::resolver::extremeActive(i) ? 0.85f : 1.0f);
+                        // по игроку идёт перебор вариантов резольвера — угол под вопросом,
+                        // голова по нему ненадёжна (тело прощает ошибку в стороне, голова нет)
+                        if (isHead && !safe && hvh::resolver::bruteforcing(i))
+                            reliability *= 0.7f;
                         if (headUnsafe)
                             reliability *= 0.8f;
                         if (headEdgeUnsafe)
@@ -2456,6 +2698,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.layerDelta = source == SideSource::Layers ? std::remainder(record.resolvedYaw - record.eyeAngles.y, 360.0f) : 0.0f;
                 t.layerMax = record.maxDesync;
                 t.layerConfidence = record.resolvedConfidence;
+                t.animFixed = record.resolvedByAnimation || record.animFixed;
                 t.flipping = flipping;
                 t.set = set;
                 t.studio = studio;
@@ -2510,6 +2753,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     // Диагностика «держит цель и не стреляет»: цель есть дольше 0.3 с без выстрела — причина в лог (раз за эпизод)
     static float hesitateSince = -1.0f;
     static bool hesitateLogged = false;
+    // видимых целей нет — дормант-аимбот по слышимым врагам (зевс — только по видимым)
+    if (topCount == 0 && !visualOnly && canShoot && rage.dormantAim && !taser
+        && dormantShot(cmd, engineInterfaces, clientInterfaces, interfaces, memory, weaponData, settings, maxClients, eye, cone,
+                       needScope, scopeAllowed, stopMode, stopMaxSpeed, moveVars, interval, realtime)) {
+        firedAt = serverTime;
+        firedCycle = weaponData->cycletime;
+        return true;
+    }
     if (topCount == 0 || visualOnly) {
         hesitateSince = -1.0f;
         hesitateLogged = false;
@@ -2595,6 +2846,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const auto& best = top[0];
     target = best.index;
 
+    // Хайдшоты: выстрел только в команде, которая уйдёт в чоке — следующая (с углами AA) её закроет.
+    // Этот тик отправляется — стреляем следующим, его заранее держим в чоке
+    if (tickbase::hideShotsActive() && tickbase::isInstalled() && tickbase::sendPacket() && !tickbase::isShifting()) {
+        tickbase::chokeNextPacket();
+        statusText = "хайдшот: выстрел в след. тике";
+        return false;
+    }
+
     // ---- выстрел ----
     auto aimAngle = angle - localPlayer.get().aimPunchAngle() * 2.0f;
     aimAngle.normalize();
@@ -2625,6 +2884,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.layerDelta = best.layerDelta;
     shot.layerMax = best.layerMax;
     shot.layerConfidence = best.layerConfidence;
+    shot.animFixed = best.animFixed;
     shot.sideSafe = best.point.sideSafe;
     shot.safe = best.point.safe;
     shot.flipping = best.flipping;

@@ -24,6 +24,9 @@ CONVAR_NAME(cl_csm_enabled);
 CONVAR_NAME(sv_skyname);
 CONVAR_NAME(cl_fullupdate);
 CONVAR_NAME(sv_cheats);
+CONVAR_NAME(cl_smooth);
+CONVAR_NAME(cl_smoothtime);
+CONVAR_NAME(sv_maxusrcmdprocessticks);
 
 #undef CONVAR_NAME
 

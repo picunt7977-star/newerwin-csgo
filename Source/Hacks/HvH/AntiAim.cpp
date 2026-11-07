@@ -3,12 +3,14 @@
 #include <cstdio>
 #include <cmath>
 #include <iterator>
+#include <mutex>
 #include <limits>
 #include <optional>
 #include <random>
 #include <vector>
 
 #include "AntiAim.h"
+#include "Defensive.h"
 #include "HvhConfig.h"
 #include "Movement.h"
 #include "Ragebot.h"
@@ -30,6 +32,7 @@
 #include <CSGO/GameEvent.h>
 #include <CSGO/EntityList.h>
 #include <CSGO/GlobalVars.h>
+#include <CSGO/NetworkChannel.h>
 #include <CSGO/LocalPlayer.h>
 #include <CSGO/UserCmd.h>
 #include <CSGO/Vector.h>
@@ -53,6 +56,9 @@ Manual manual = Manual::None;
 int side = 1;
 AaState activeState = AaState::Default;
 float currentRoll = 0.0f;
+std::mutex extendedMutex;
+ExtendedView extendedShown;
+float tickDesync = 0.0f;        // увод тела этого тика: сторона × величина (0 — десинка нет)
 
 // ---- переключения билдера ----
 // Модификатор и джиттер десинка шагают не на каждом отправленном пакете, а раз в «задержку» пакетов.
@@ -69,6 +75,17 @@ float rotatePhase = 0.0f;
 float spinYaw = 0.0f;
 // «Скиттер»: рваный порядок, по которому резольверу трудно угадать следующий шаг
 constexpr int skitterSequence[]{ -1, 1, 0, -1, 1, 0, -1, 0, 1, -1, 0, 1 };
+
+// ---- цикл чока ----
+// Десинк — это РАЗНИЦА между чокнутой и отправленной командами, поэтому всё, что шагает по
+// тикам (модификатор, спин, натуральность, сторона), обязано стоять на месте внутри одного
+// цикла чока: иначе эта разница прибавляется к уводу тела и ползунок десинка врёт.
+bool lastSentPacket = true;     // прошлый тик ушёл на сервер → этот начинает новый цикл
+bool cycleValid = false;
+AntiAimState cycleState{};      // настройки билдера, замороженные на цикл
+float cycleModifier = 0.0f;     // добавка модификатора, замороженная на цикл
+int pinnedSide = 1;             // сторона увода тела, выбранная на цикл
+bool pinnedValid = false;
 
 // ---- плавные переходы (натуральность) ----
 AntiAimState blendFrom{};
@@ -109,7 +126,6 @@ int flickCounter = 0;
 int flickAfterShift = 0;
 float flickDirection = 1.0f;
 bool wasFlicking = false;
-bool defensiveFlip = false;
 
 void toggleManual(const KeyBind& key, Manual direction) noexcept
 {
@@ -285,7 +301,9 @@ AaState resolveState(AaState state) noexcept
 {
     const auto& states = config.antiAim.states;
     const auto own = [&states](AaState s) { return states[static_cast<int>(s)].override; };
-    const bool exploitActive = tickbase::doubleTapEnabled() || config.exploits.defensive;
+    // «Фейклаг» — состояние для долгого чока: пока копится заряд (DT, дефенсив, «Дефенсив» эксплойтов),
+    // чок всё равно обрезан до 1 тика, и это состояние не наше
+    const bool exploitActive = tickbase::doubleTapEnabled() || config.defensive.enabled || config.antiAim.defensiveAa;
     if (!exploitActive && own(AaState::Fakelag))
         return AaState::Fakelag;
     if (state == AaState::AirCrouch && !own(state))
@@ -405,33 +423,6 @@ float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInter
         }
     }
     return bestYaw;
-}
-
-// Дефенсив AA: есть ли враг, который прямо сейчас целится в нас. Смотрим его присланный угол взгляда
-// (у чужих он интерполируется, но для «смотрит ли в нашу сторону» этого хватает) и направление с его глаз
-// на нашу голову. Возвращает yaw от нас на ближайшего такого врага — от него и уводим тело.
-bool enemyAimingAtUs(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, float fov, float& threatYaw) noexcept
-{
-    const auto head = localPlayer.get().getEyePosition();
-    bool found = false;
-    float bestFov = fov;
-    for (int i = 1; i <= engineInterfaces.getEngine().getMaxClients(); ++i) {
-        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
-        if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
-            || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()))
-            continue;
-        // m_vecViewOffset у чужих игроков не приходит — глаза примерно на 64 над ногами
-        auto enemyEye = entity.getAbsOrigin();
-        enemyEye.z += 64.0f;
-        const float toUs = (head - enemyEye).toAngle().y;
-        const float difference = std::abs(std::remainder(toUs - entity.eyeAngles().y, 360.0f));
-        if (difference <= bestFov) {
-            bestFov = difference;
-            threatYaw = (entity.getAbsOrigin() - head).toAngle().y;
-            found = true;
-        }
-    }
-    return found;
 }
 
 // Фристенд: куда спрятать голову от врага. Возвращает поворот yaw относительно направления на врага:
@@ -722,6 +713,481 @@ bool legitAllowed(const csgo::UserCmd* cmd, const ClientInterfaces& clientInterf
     return true;
 }
 
+// ======== план → поза → применение ========
+//
+// Тик антиаима проходит три стадии:
+//   1) план — кто владеет углами (билдер, фристенд, стена, ручной, safe head, наклон,
+//      extended yaw, легит), какой у него базовый yaw и какие права остаются билдеру;
+//   2) поза — pitch, «фейковый» yaw (его видят враги и по нему сервер ставит голову) и
+//      «настоящий» yaw (за ним сервер тянет ноги);
+//   3) применение — какой из двух углов уходит в эту команду, микродвижение под десинк, отчёт
+//      индикаторам.
+//
+// Раньше стадий не было. Права билдера описывались тремя флагами (noOffset/noModifier/noSnap)
+// и forceDesync, которые переписывались в восьми местах по ходу run(): побеждал тот режим, что
+// стоял ниже в тексте, приоритет нигде не был записан, и каждый новый режим добавлял ещё одну
+// запись флага. Пара углов тоже не была выражена: в команду писался один yaw, а «настоящий»
+// получался тем, что на чокнутом тике к нему дописывалась добавка — поэтому модификатор, спин
+// и натуральность, шагающие каждый тик, успевали развести чокнутую и отправленную команды, и
+// увод тела выходил не тот, что задан ползунком.
+
+// Владельцы по возрастанию силы: кто ниже, тот и забирает тик.
+enum class Owner { Builder, Freestand, Edge, Manual, SafeHead, Roll, Extended, Legit };
+
+struct Plan {
+    Owner owner = Owner::Builder;
+    float yaw = 0.0f;                   // базовый угол, к которому билдер добавляет своё
+    bool staticAngles = false;          // билдеру тик не отдаём: ни смещения, ни модификатора
+    bool allowSnap = true;              // можно ли отдать тик скрытым углам дефенсива
+    std::optional<int> forcedDesync;    // 0 — без десинка, ±1 — полный в эту сторону
+    float roll = 0.0f;
+    std::optional<float> freestandRaw;  // сырое направление укрытия (нужно дефенсиву «у стены»)
+};
+
+// Всё, что стадиям нужно знать о тике: посчитали один раз, дальше только читаем.
+struct Frame {
+    csgo::UserCmd* cmd = nullptr;
+    const EngineInterfaces* engine = nullptr;
+    const ClientInterfaces* clients = nullptr;
+    const Memory* memory = nullptr;
+    csgo::Vector camera{};          // взгляд камеры до подмены
+    csgo::Vector eye{};
+    float realtime = 0.0f;
+    float curtime = 0.0f;
+    bool sendPacket = false;        // эта команда уйдёт на сервер (иначе её чокнут)
+    bool cycleStart = false;        // с этого тика начинается новый цикл чока
+    bool legit = false;
+    bool haveThreat = false;
+    float toTarget = 0.0f;          // yaw на ближайшего по прицелу врага
+    float targetPitch = 0.0f;
+    csgo::Vector threatOrigin{};
+    AntiAimState st{};              // настройки билдера этого цикла
+    int inverterSide = 1;
+    bool defensiveOn = false;
+    float maxDesync = 58.0f;
+};
+
+// Поза, которая уходит на сервер в этом тике.
+struct Pose {
+    float pitch = 0.0f;
+    float fakeYaw = 0.0f;   // отправленная команда
+    float realYaw = 0.0f;   // чокнутые команды
+    float roll = 0.0f;
+    int side = 0;           // сторона увода тела (+1 влево, −1 вправо; 0 — без десинка)
+    float desync = 0.0f;    // увод тела в градусах, уже обрезанный по максимуму стойки
+};
+
+// Владелец сильнее — забирает план себе. Права только ужесточаются: статику уже не снять,
+// запрет скрытых углов не отменить, а сторону десинка задаёт сильнейший из тех, кто её требует.
+void claim(Plan& plan, Owner owner, bool staticAngles, bool allowSnap, std::optional<int> desync) noexcept
+{
+    if (static_cast<int>(owner) >= static_cast<int>(plan.owner))
+        plan.owner = owner;
+    plan.staticAngles = plan.staticAngles || staticAngles;
+    plan.allowSnap = plan.allowSnap && allowSnap;
+    if (desync)
+        plan.forcedDesync = desync;
+}
+
+// Максимальный увод тела для нашей стойки — его же считает сервер (CCSGOPlayerAnimState),
+// дальше он тело не пустит. Присед и скорость его режут, поэтому «58» в воздухе значит меньше.
+[[nodiscard]] float localMaxDesync() noexcept
+{
+    const float value = localPlayer.get().getMaxDesyncAngle();
+    return value > 1.0f ? std::clamp(value, 0.0f, 60.0f) : 58.0f;
+}
+
+// Чокнутую команду уводим ЗА цель с запасом: сервер доводит ноги не мгновенно, и ровно заданный
+// угол давал бы недовод. Запас фиксированный — до переделки тут стоял множитель ×2, из-за
+// которого всё от ~29° и выше упиралось в максимум стойки, и половина шкалы ничего не значила.
+constexpr float desyncMargin = 12.0f;
+
+// ---- стадия 1: план ----
+[[nodiscard]] Plan buildPlan(const Frame& f) noexcept
+{
+    const auto& aa = config.antiAim;
+    Plan plan;
+    plan.yaw = f.camera.y;
+    freestandActive = false;
+
+    if (f.legit) {
+        // E зажато (дверь, бомба, подбор): углы настоящие, но тело уводим по-прежнему —
+        // десинк мешает только прицелу, а прицел тут и не нужен
+        freestandSide = 0.0f;
+        freestandHoldTicks = 0;
+        claim(plan, Owner::Legit, true, false, std::nullopt);
+        return plan;
+    }
+
+    switch (static_cast<YawBase>(aa.yawBase)) {
+    case YawBase::Backward: plan.yaw += 180.0f; break;
+    case YawBase::AtTargets: plan.yaw = f.toTarget + 180.0f; break;
+    default: break;
+    }
+
+    // ---- фристенд (сырое направление нужно ещё и дефенсиву «у стены») ----
+    const bool freestandHeld = aa.freestandKey.isSet() && aa.freestandKey.isDown();
+    const bool wantFreestand = aa.freestanding && (freestandHeld || (!aa.freestandKey.isSet() && manual == Manual::None));
+    const bool wantEdgeBait = f.defensiveOn && aa.snaps[static_cast<int>(SnapState::EdgeBait)].mode != static_cast<int>(SnapMode::Default);
+    bool freestandOverridesManual = false;
+    if (wantFreestand || wantEdgeBait) {
+        csgo::Vector enemyEye;
+        bool found = false;
+        float toEnemy = atTargetsYaw(f.cmd, *f.engine, *f.clients, *f.memory, &enemyEye, &found, true);
+        // врагов не видно — считаем, что они там, куда смотрит камера (стену сбоку это не меняет)
+        if (!found) {
+            toEnemy = f.camera.y;
+            const float radians = Helpers::deg2rad(toEnemy);
+            enemyEye = { f.eye.x + std::cos(radians) * 2000.0f, f.eye.y + std::sin(radians) * 2000.0f, f.eye.z };
+        }
+        float offset = freestandYaw(f.engine->engineTrace(), enemyEye, toEnemy);
+        if (offset != 0.0f)
+            plan.freestandRaw = offset;
+        if (wantFreestand) {
+            if (offset != 0.0f)
+                freestandHoldTicks = 8;
+            // Гистерезис: новую сторону берём, только если она держится 3 тика подряд;
+            // пропало, от чего прятать, — ещё 8 тиков держим прошлую
+            if (offset != 0.0f && freestandSide != 0.0f && (offset > 0.0f) != (freestandSide > 0.0f)) {
+                if (++freestandFlipTicks < 3)
+                    offset = freestandSide * 90.0f;
+                else
+                    freestandFlipTicks = 0;
+            } else {
+                freestandFlipTicks = 0;
+            }
+            if (offset == 0.0f && freestandSide != 0.0f && freestandHoldTicks > 0) {
+                --freestandHoldTicks;
+                offset = freestandSide * 90.0f;
+            }
+            if (offset != 0.0f) {
+                plan.yaw = toEnemy + offset;
+                freestandActive = true;
+                freestandSide = offset > 0.0f ? 1.0f : -1.0f;
+                freestandOverridesManual = freestandHeld;
+                // сторону тела фристенд задаёт сам (ниже, в десинке): тело уходит туда же, куда голова
+                claim(plan, Owner::Freestand, aa.freestandStatic, true, std::nullopt);
+            } else {
+                freestandSide = 0.0f;
+            }
+        }
+    }
+    if (!wantFreestand) {
+        freestandSide = 0.0f;
+        freestandHoldTicks = 0;
+    }
+
+    // ---- edge yaw: стена вплотную — лицом в неё ----
+    if (aa.edgeYaw && (!aa.edgeKey.isSet() || aa.edgeKey.isDown()) && manual == Manual::None && !freestandActive) {
+        if (const auto edge = edgeYaw(f.engine->engineTrace())) {
+            plan.yaw = *edge;
+            claim(plan, Owner::Edge, aa.edgeStatic, true,
+                aa.edgeStatic ? std::optional<int>{ f.inverterSide } : std::nullopt);
+        }
+    }
+
+    // ---- ручной AA ----
+    {
+        const auto direction = freestandOverridesManual ? Manual::None : manual;
+        switch (direction) {
+        case Manual::Left: plan.yaw = f.camera.y + 90.0f; break;
+        case Manual::Right: plan.yaw = f.camera.y - 90.0f; break;
+        case Manual::Back: plan.yaw = f.camera.y + 180.0f; break;
+        case Manual::Forward: plan.yaw = f.camera.y; break;
+        default: break;
+        }
+        if (direction != Manual::None)
+            claim(plan, Owner::Manual, aa.staticOnManual, true,
+                aa.staticOnManual ? std::optional<int>{ f.inverterSide } : std::nullopt);
+    }
+
+    // ---- safe head: голова в «опасной» полосе — тело не уводим, иначе её проще задеть ----
+    if (manual == Manual::None && safeHeadActive(f.cmd, f.haveThreat, f.threatOrigin))
+        claim(plan, Owner::SafeHead, true, true, 0);
+
+    // ---- наклон ----
+    if (aa.roll != 0) {
+        float roll = static_cast<float>(std::clamp(aa.roll, -50, 50)) * (aa.inverter.isToggled() ? -1.0f : 1.0f);
+        const bool onGround = localPlayer.get().flags() & FL_ONGROUND;
+        if (localPlayer.get().velocity().length2D() > 5.0f || !onGround)
+            roll = std::clamp(roll, -40.0f, 40.0f);
+        plan.roll = roll;
+        claim(plan, Owner::Roll, true, false, roll > 0.0f ? 1 : -1);
+    }
+
+    // ---- extended yaw: пока он работает, углы стоят на месте ----
+    // LBY сервер ставит по углу чокнутой команды, а билдер между чокнутой и отправленной успел бы
+    // увести yaw модификатором — и тело встало бы не туда. В логе 07.11 при заданных 92° разница
+    // «взгляд ↔ LBY» гуляла от +34 до +180; статичный угол даёт ровно заданный.
+    const bool standing = (localPlayer.get().flags() & FL_ONGROUND)
+        && localPlayer.get().velocity().length2D() <= 2.0f
+        && std::abs(f.cmd->forwardmove) < 1.0f && std::abs(f.cmd->sidemove) < 1.0f
+        && !(f.cmd->buttons & csgo::UserCmd::IN_JUMP);
+    if (aa.extendedYaw > 0 && aa.desync && tickbase::isInstalled() && standing)
+        claim(plan, Owner::Extended, true, false, f.inverterSide);
+
+    return plan;
+}
+
+// ---- стадия 2: pitch ----
+[[nodiscard]] float buildPitch(const Frame& f, const Plan& plan) noexcept
+{
+    if (plan.owner == Owner::Legit)
+        return f.camera.x;
+    switch (static_cast<Pitch>(config.antiAim.pitch)) {
+    case Pitch::Down: return 89.0f;
+    case Pitch::Up: return -89.0f;
+    case Pitch::Zero: return 0.0f;
+    default: return f.camera.x;
+    }
+}
+
+// ---- стадия 2: скрытые углы на тиках окна дефенсива ----
+// Когда окно открыто, решает Defensive.cpp — тут только углы, как в NL: ядро даёт `hidden`,
+// скрипт отдаёт override_hidden_pitch/yaw. Возвращает true, если скрытый угол забрал yaw:
+// тогда билдеру тик не отдаём.
+[[nodiscard]] bool applyDefensiveSnap(const Frame& f, const Plan& plan, Pose& pose) noexcept
+{
+    if (!f.defensiveOn) {
+        // дефенсив выключили (или заряд ушёл под быструю стрельбу DT) — следующее окно с чистого листа
+        snap.ticks = 0;
+        snap.apex = 0;
+        snap.delayed = 0;
+        snap.haveRandomPitch = snap.haveRandomYaw = false;
+        return false;
+    }
+
+    const int lcLeft = defensive::windowLeft();
+    const DefensiveSnap* chosen = activeSnap(selectSnapState(f.cmd, plan.freestandRaw.has_value()));
+    bool inWindow = chosen && lcLeft > 0;
+    if (inWindow) {
+        ++snap.ticks;
+        // «Длительность» — сколько тиков окна занимать. Остаток окна идёт обычным AA: запись,
+        // которую сервер положит, когда окно закроется, должна быть защищённой (десинк), а не
+        // скрытым углом
+        inWindow = snap.ticks <= std::clamp(chosen->duration, 1, 13);
+    } else {
+        snap.ticks = 0;
+    }
+
+    if (!inWindow || !plan.allowSnap) {
+        if (lcLeft == 0 && snap.apex != 0) {
+            // окно закончилось — следующее начнётся с чистого листа
+            snap.counter = defensive::windowCounter();
+            snap.apex = 0;
+            snap.delayed = 0;
+            snap.haveRandomPitch = snap.haveRandomYaw = false;
+        }
+        return false;
+    }
+
+    if (!snap.active && snap.apex == 0)
+        snap.apex = defensive::windowLength();
+    snap.active = true;
+    if (snap.delayed >= chosen->yawDelay + 1) {
+        snap.jitter = !snap.jitter;
+        snap.delayed = 0;
+    } else if (f.sendPacket) {
+        ++snap.delayed;
+    }
+    if (const auto pitch = snapPitch(*chosen, f.curtime, lcLeft, f.camera.x, f.targetPitch))
+        pose.pitch = std::clamp(*pitch, -89.0f, 89.0f);
+    if (const auto offset = snapYaw(*chosen, f.curtime, lcLeft, plan.freestandRaw)) {
+        pose.fakeYaw = (f.haveThreat ? f.toTarget : f.camera.y) + *offset;
+        return true;
+    }
+    return false;
+}
+
+// ---- стадия 2: флики ----
+[[nodiscard]] bool applyFlicks(const Frame& f, Pose& pose) noexcept
+{
+    const auto& aa = config.antiAim;
+    bool flick = false;
+    if (aa.flicks && !f.legit) {
+        if (tickbase::isShifting())
+            flickAfterShift = 2;
+        flick = tickbase::isShifting() || flickAfterShift > 0;
+        if (!flick && aa.flickTrigger == static_cast<int>(FlickTrigger::Always) && f.sendPacket && ++flickCounter >= std::max(aa.flickEvery, 3)) {
+            flickCounter = 0;
+            flick = true;
+        }
+        if (!tickbase::isShifting() && f.sendPacket && flickAfterShift > 0)
+            --flickAfterShift;
+        // скрытые углы дефенсива главнее
+        if (snap.active)
+            flick = false;
+    }
+    if (flick) {
+        if (!wasFlicking) {
+            flickDirection = aa.flickSide == static_cast<int>(FlickSide::Random)
+                ? (std::uniform_int_distribution<int>{ 0, 1 }(rng) ? 1.0f : -1.0f) : -flickDirection;
+        }
+        pose.fakeYaw += aa.flickSide == static_cast<int>(FlickSide::Custom)
+            ? static_cast<float>(std::clamp(aa.flickYaw, -180, 180))
+            : flickDirection * static_cast<float>(aa.flickAngle);
+        if (aa.flickPitchOverride)
+            pose.pitch = static_cast<float>(std::clamp(aa.flickPitch, -89, 89));
+    }
+    wasFlicking = flick;
+    return flick;
+}
+
+// ---- стадия 2: сторона увода тела ----
+// Сторону выбираем один раз на цикл чока: чокнутая и отправленная команды обязаны считать её
+// одинаково, иначе пара углов разъезжается. До переделки сторона считалась каждый тик, и
+// нажатие инвертера или переворот фристенда посреди цикла ломали десинк на тик.
+[[nodiscard]] int pickSide(const Frame& f, const Plan& plan) noexcept
+{
+    if (!f.cycleStart && pinnedValid)
+        return pinnedSide;
+
+    const auto& aa = config.antiAim;
+    const auto& st = f.st;
+    int result = f.inverterSide;
+    if (st.desyncInvert)
+        result = -result;
+    if (aa.antiBrute && antiBruteFlip)
+        result = -result;
+    if (plan.forcedDesync && *plan.forcedDesync != 0) {
+        result = *plan.forcedDesync;
+    } else if (!plan.staticAngles) {
+        const auto mode = static_cast<DesyncMode>(st.desyncMode);
+        if (mode == DesyncMode::Jitter) {
+            // скиттер ведёт сторону своим порядком (минус — другая сторона), остальные — через раз
+            if (static_cast<YawModifier>(st.modifier) == YawModifier::Skitter) {
+                if (skitterSequence[phase % std::size(skitterSequence)] < 0)
+                    result = -result;
+            } else if (phase & 1) {
+                result = -result;
+            }
+        } else if (mode == DesyncMode::Random) {
+            result *= randomSide;
+        }
+    }
+    // при фристенде тело уводим туда же, куда голову: от врага за укрытие
+    if (freestandActive)
+        result = freestandSide > 0.0f ? 1 : -1;
+
+    pinnedSide = result;
+    pinnedValid = true;
+    return result;
+}
+
+// ---- стадия 2: extended yaw ----
+// Стоя ноги тянутся к m_flLowerBodyYawTarget, а LBY сервер ставит либо раз в ~1.1 с, либо
+// КАЖДУЮ команду, в которой мы двигаемся. Берём второй случай, и времени в нём нет вовсе:
+//   * чокнутая команда несёт yaw, уведённый на extendedYaw в сторону десинка;
+//   * на ней же идёт микродвижение — сервер считает нас идущими и тянет LBY за этим углом;
+//   * отправленная команда несёт настоящий взгляд: его и видят враги.
+// Угол взят за кламп билдера (до 180°), сервер сам упрёт тело в свой предел.
+void reportExtended(const Frame& f, Pose& pose, float extendedAngle) noexcept
+{
+    // «Модель сервера» рисуется по уводу тела. С extended yaw тело тянется к настоящему LBY,
+    // а не к ползунку десинка, — берём разницу прямо с сервера, её и покажем
+    const float netLby = localPlayer.get().lby();
+    if (f.sendPacket)
+        pose.desync = std::remainder(netLby - pose.fakeYaw, 360.0f);
+
+    // Раз в секунду в лог: ушёл ли LBY за уведённым углом. Держится около заданного (или упёрся
+    // в ~58 — дальше сервер тело не пускает) — работает; около нуля — сервер считает нас стоящими
+    if (f.sendPacket) {
+        static float lastLog = -10.0f;
+        if (f.realtime - lastLog > 1.0f || f.realtime < lastLog) {
+            lastLog = f.realtime;
+            char text[160];
+            std::snprintf(text, sizeof(text), "[extended yaw] взгляд %.0f, LBY с сервера %.0f, разница %+.0f (задано %.0f, сторона %+d)",
+                pose.fakeYaw, netLby, std::remainder(netLby - pose.fakeYaw, 360.0f), extendedAngle, pose.side);
+            ragebot::logToFile(text);
+        }
+    }
+
+    std::scoped_lock lock{ extendedMutex };
+    extendedShown.active = true;
+    const auto origin = localPlayer.get().getAbsOrigin();
+    extendedShown.origin[0] = origin.x;
+    extendedShown.origin[1] = origin.y;
+    extendedShown.origin[2] = origin.z;
+    extendedShown.lby = netLby;
+    if (f.sendPacket)
+        extendedShown.eyeYaw = pose.fakeYaw;
+    extendedShown.flickYaw = extendedShown.eyeYaw + pose.side * extendedAngle;
+}
+
+// ---- стадия 2: десинк, пара углов ----
+void buildDesync(const Frame& f, const Plan& plan, Pose& pose, bool flick) noexcept
+{
+    const auto& aa = config.antiAim;
+    const auto& st = f.st;
+    const auto mode = static_cast<DesyncMode>(st.desyncMode);
+    const bool forcedOff = plan.forcedDesync && *plan.forcedDesync == 0;
+    const bool forcedOn = plan.forcedDesync && *plan.forcedDesync != 0;
+    const bool enabled = aa.desync && tickbase::isInstalled() && !forcedOff && (mode != DesyncMode::Off || forcedOn);
+    if (!enabled) {
+        pose.side = 0;
+        pose.desync = 0.0f;
+        pose.realYaw = pose.fakeYaw;
+        pinnedValid = false;
+        return;
+    }
+
+    pose.side = pickSide(f, plan);
+
+    // Величина: ползунок стороны, обрезанный по максимуму стойки. Статика (ручной, стена, наклон,
+    // extended yaw) уводит тело на полный максимум.
+    const int limit = forcedOn ? 60 : (pose.side > 0 ? st.desyncLeft : st.desyncRight);
+    const float target = std::min(static_cast<float>(std::clamp(limit, 0, 60)), f.maxDesync);
+    pose.desync = static_cast<float>(pose.side) * target;
+
+    // добавка к yaw по стороне: голова идёт за десинком, а не стоит посередине
+    if (!plan.staticAngles)
+        pose.fakeYaw += static_cast<float>(pose.side > 0 ? st.addLeft : st.addRight);
+
+    // Пара углов. Чокнутые команды несут угол, уведённый за цель; отправленная — настоящий взгляд.
+    // На флике увод не трогаем: сам флик и так разносит углы.
+    const float extendedAngle = static_cast<float>(std::clamp(aa.extendedYaw, 0, 180));
+    const float chokedOffset = plan.owner == Owner::Extended ? extendedAngle : target + desyncMargin;
+    pose.realYaw = flick ? pose.fakeYaw : pose.fakeYaw + static_cast<float>(pose.side) * chokedOffset;
+
+    if (plan.owner == Owner::Extended)
+        reportExtended(f, pose, extendedAngle);
+}
+
+// ---- стадия 3: микродвижение под десинк ----
+// Сервер решает, обновлять ли LBY, по нашей скорости (порог > 0.1 ед/с):
+//  * с extended yaw движение нужно ровно на чокнутой команде — той, что несёт уведённый угол:
+//    сервер видит скорость, ставит LBY на этот угол, и дальше ноги тянутся к нему (100°/с).
+//    Отправленную команду оставляем без движения: трение за тик гасит скорость в ноль, сервер
+//    идёт «стоячей» веткой и LBY не трогает — иначе он тут же уехал бы на настоящий взгляд.
+//    Установившаяся скорость = sv_accelerate × forwardmove × интервал ≈ 0.086 × forwardmove,
+//    поэтому значения тут не «доли max_speed», как в lua, а единицы в секунду; присед режет
+//    wishspeed на 0.34 — там нужно больше.
+//  * без extended yaw, стоя, движение нужно наоборот крошечное, чтобы LBY не обновлялся вовсе.
+void applyBodyMovement(const Frame& f, bool extended) noexcept
+{
+    const auto& player = localPlayer.get();
+    const int flags = player.flags();
+    if (extended) {
+        if (!f.sendPacket) {
+            const float micro = (flags & FL_DUCKING) ? 12.0f : 5.0f;
+            // знак через тик: иначе за минуту стояния набегает заметное сползание
+            f.cmd->forwardmove = (f.cmd->commandNumber & 1) ? micro : -micro;
+            f.cmd->sidemove = 0.0f;
+        } else {
+            f.cmd->forwardmove = 0.0f;
+            f.cmd->sidemove = 0.0f;
+        }
+        return;
+    }
+    const bool still = (flags & FL_ONGROUND) && player.velocity().length2D() < 3.0f
+        && std::abs(f.cmd->forwardmove) < 1.0f && std::abs(f.cmd->sidemove) < 1.0f
+        && !(f.cmd->buttons & csgo::UserCmd::IN_JUMP);
+    if (still) {
+        const float micro = (flags & FL_DUCKING) ? 3.25f : 1.1f;
+        f.cmd->sidemove = (f.cmd->commandNumber & 1) ? micro : -micro;
+    }
+}
+
 }
 
 void updateInput() noexcept
@@ -792,14 +1258,27 @@ int desyncSide() noexcept
     return side;
 }
 
-static float sentPitch = 0.0f, sentYaw = 0.0f;
+static float sentPitch = 0.0f, sentYaw = 0.0f, sentDesync = 0.0f, sentRoll = 0.0f;
 static bool hasSent = false;
+// взгляд камеры до подмены — для предпросмотра в меню (видно, насколько углы уведены от настоящих)
+static float cameraPitch = 0.0f, cameraYaw = 0.0f;
 
 void storeSentAngles(float pitch, float yaw) noexcept
 {
     sentPitch = pitch;
     sentYaw = yaw;
+    sentDesync = tickDesync;
+    sentRoll = currentRoll;
     hasSent = true;
+}
+
+bool sentServerPose(float& pitch, float& yaw, float& desync, float& roll) noexcept
+{
+    pitch = sentPitch;
+    yaw = sentYaw;
+    desync = sentDesync;
+    roll = sentRoll;
+    return hasSent;
 }
 
 bool sentAngles(float& pitch, float& yaw) noexcept
@@ -809,17 +1288,39 @@ bool sentAngles(float& pitch, float& yaw) noexcept
     return hasSent;
 }
 
+void cameraAngles(float& pitch, float& yaw) noexcept
+{
+    pitch = cameraPitch;
+    yaw = cameraYaw;
+}
+
 void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, bool shotThisTick) noexcept
 {
     auto& aa = config.antiAim;
+    // взгляд камеры запоминаем до любых выходов — меню показывает его даже с выключенным AA
+    cameraPitch = cmd->viewangles.x;
+    cameraYaw = cmd->viewangles.y;
     currentRoll = 0.0f;
+    tickDesync = 0.0f;
     snap.active = false;
-    if (!aa.enabled || !localPlayer || !localPlayer.get().isAlive())
+    {
+        std::scoped_lock lock{ extendedMutex };
+        extendedShown.active = false;
+    }
+    if (!aa.enabled || !localPlayer || !localPlayer.get().isAlive()) {
+        pinnedValid = false;
+        cycleValid = false;
         return;
+    }
 
-    const float realtime = memory.globalVars->realtime;
-    const float curtime = memory.globalVars->currenttime;
-    const auto camera = cmd->viewangles;
+    Frame f;
+    f.cmd = cmd;
+    f.engine = &engineInterfaces;
+    f.clients = &clientInterfaces;
+    f.memory = &memory;
+    f.camera = cmd->viewangles;
+    f.realtime = memory.globalVars->realtime;
+    f.curtime = memory.globalVars->currenttime;
 
     // ---- анти-брутфорс: триггеры и таймер ----
     if (aa.antiBrute && (aa.antiBruteTriggers & AbEnemyShot))
@@ -827,8 +1328,8 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     else
         pendingImpacts.clear();
     if (aa.antiBrute && (aa.antiBruteTriggers & AbLocalShot) && shotThisTick)
-        triggerAntiBrute(realtime);
-    if (!aa.antiBrute || (aa.antiBruteReset > 0.0f && lastAntiBrute >= 0.0f && realtime - lastAntiBrute > aa.antiBruteReset))
+        triggerAntiBrute(f.realtime);
+    if (!aa.antiBrute || (aa.antiBruteReset > 0.0f && lastAntiBrute >= 0.0f && f.realtime - lastAntiBrute > aa.antiBruteReset))
         if (lastAntiBrute >= 0.0f || haveOriginal)
             resetAntiBrute();
 
@@ -837,7 +1338,6 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         return;
 
     // ---- легит AA на E: первый тик E уходит как есть (дверь, бомба), дальше E забираем себе ----
-    bool legit = false;
     if (cmd->buttons & csgo::UserCmd::IN_USE) {
         if (!aa.legitAa)
             return;
@@ -848,7 +1348,7 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         if (!legitAllowed(cmd, clientInterfaces))
             return;
         cmd->buttons &= ~csgo::UserCmd::IN_USE;
-        legit = true;
+        f.legit = true;
     } else {
         legitWait = false;
     }
@@ -877,7 +1377,7 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         }
         if ((cmd->buttons & csgo::UserCmd::IN_ATTACK) && ready) {
             if (aa.antiBrute && (aa.antiBruteTriggers & AbLocalShot))
-                triggerAntiBrute(realtime);
+                triggerAntiBrute(f.realtime);
             return;
         }
     }
@@ -886,338 +1386,94 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     if (shotThisTick)
         return;
 
-    const bool sendPacket = tickbase::sendPacket();
+    // Цикл чока: тик после отправленного пакета начинает новый. Всё, что шагает по тикам,
+    // шагает здесь — чокнутая и отправленная команды должны нести один и тот же угол билдера.
+    f.sendPacket = tickbase::sendPacket();
+    f.cycleStart = lastSentPacket || !cycleValid;
+    lastSentPacket = f.sendPacket;
 
     // ---- угроза: ближайший по прицелу враг ----
     csgo::Vector threatEye{};
-    bool haveThreat = false;
-    const float toTarget = atTargetsYaw(cmd, engineInterfaces, clientInterfaces, memory, &threatEye, &haveThreat);
-    csgo::Vector threatOrigin = threatEye;
-    threatOrigin.z -= 64.0f;
-    const auto eye = localPlayer.get().getEyePosition();
-    const float targetPitch = haveThreat ? (threatEye - eye).toAngle().x : camera.x;
+    f.toTarget = atTargetsYaw(cmd, engineInterfaces, clientInterfaces, memory, &threatEye, &f.haveThreat);
+    f.threatOrigin = threatEye;
+    f.threatOrigin.z -= 64.0f;
+    f.eye = localPlayer.get().getEyePosition();
+    f.targetPitch = f.haveThreat ? (threatEye - f.eye).toAngle().x : f.camera.x;
+    f.maxDesync = localMaxDesync();
+    f.inverterSide = aa.inverter.isToggled() ? 1 : -1;
+    // Дефенсив AA (скрытые углы, LC-триггеры, Force LC). Как в Neverlose, у него свой заряд: галка DT
+    // не нужна. Нужен детур CL_Move (на нём держится заряд) и чтобы заряд не был отдан второй пуле DT —
+    // в быстрой стрельбе рывки его бы съедали, и DT оставался бы пустым.
+    f.defensiveOn = !f.legit && aa.defensiveAa && defensive::enabled();
 
-    // ---- состояние и его настройки ----
-    activeState = detectState(cmd);
-    const AaState settingsState = resolveState(activeState);
-    AntiAimState st = blended(settingsState, realtime);
-    // анти-брутфорс «Подстройка»: настройки чуть уводим в случайную сторону, его брутфорс промахивается
-    if (antiBruteWeight != 0.0f) {
-        st.yawOffset += static_cast<int>(std::lround(antiBruteWeight * 15.0f));
-        st.degree = std::max(0, static_cast<int>(std::lround(st.degree * (1.0f + antiBruteWeight))));
-        const float scale = 1.0f - std::abs(antiBruteWeight) * 0.5f;
-        st.desyncLeft = static_cast<int>(std::lround(st.desyncLeft * scale));
-        st.desyncRight = static_cast<int>(std::lround(st.desyncRight * scale));
-    }
-
-    if (sendPacket && ++packetsSinceSwitch >= switchWait) {
-        packetsSinceSwitch = 0;
-        switchWait = nextSwitchWait(st);
-        ++phase;
-        const float spread = static_cast<float>(std::clamp(st.randomize, 0, 90));
-        switchRandom = spread > 0.0f ? std::uniform_real_distribution<float>{ -spread, spread }(rng) : 0.0f;
-        const float half = static_cast<float>(st.degree) * 0.5f;
-        randomYaw = half > 0.0f ? std::uniform_real_distribution<float>{ -half, half }(rng) : 0.0f;
-        randomSide = std::uniform_int_distribution<int>{ 0, 1 }(rng) ? 1 : -1;
-    }
-
-    // Что «запрещают» особые режимы — как флаги no_offset/no_modifier/force_desync в hysteria
-    bool noOffset = false, noModifier = false, noSnap = false;
-    std::optional<int> forceDesync;     // 0 — без десинка, ±1 — полный в эту сторону
-
-    // ---- pitch ----
-    if (legit) {
-        cmd->viewangles.x = camera.x;
-    } else {
-        switch (static_cast<Pitch>(aa.pitch)) {
-        case Pitch::Down: cmd->viewangles.x = 89.0f; break;
-        case Pitch::Up: cmd->viewangles.x = -89.0f; break;
-        case Pitch::Zero: cmd->viewangles.x = 0.0f; break;
-        default: break;
+    // ---- настройки билдера: один раз на цикл ----
+    if (f.cycleStart) {
+        activeState = detectState(cmd);
+        AntiAimState st = blended(resolveState(activeState), f.realtime);
+        // анти-брутфорс «Подстройка»: настройки чуть уводим в случайную сторону, его брутфорс промахивается
+        if (antiBruteWeight != 0.0f) {
+            st.yawOffset += static_cast<int>(std::lround(antiBruteWeight * 15.0f));
+            st.degree = std::max(0, static_cast<int>(std::lround(st.degree * (1.0f + antiBruteWeight))));
+            const float scale = 1.0f - std::abs(antiBruteWeight) * 0.5f;
+            st.desyncLeft = static_cast<int>(std::lround(st.desyncLeft * scale));
+            st.desyncRight = static_cast<int>(std::lround(st.desyncRight * scale));
         }
-    }
-
-    // ---- база yaw ----
-    float yaw = camera.y;
-    freestandActive = false;
-    if (legit) {
-        noOffset = noModifier = noSnap = true;
-    } else {
-        switch (static_cast<YawBase>(aa.yawBase)) {
-        case YawBase::Backward: yaw += 180.0f; break;
-        case YawBase::AtTargets: yaw = toTarget + 180.0f; break;
-        default: break;
+        // переключение фазы — по циклам, а не по пакетам: «задержка» в билдере считается в них же
+        if (++packetsSinceSwitch >= switchWait) {
+            packetsSinceSwitch = 0;
+            switchWait = nextSwitchWait(st);
+            ++phase;
+            const float spread = static_cast<float>(std::clamp(st.randomize, 0, 90));
+            switchRandom = spread > 0.0f ? std::uniform_real_distribution<float>{ -spread, spread }(rng) : 0.0f;
+            const float half = static_cast<float>(st.degree) * 0.5f;
+            randomYaw = half > 0.0f ? std::uniform_real_distribution<float>{ -half, half }(rng) : 0.0f;
+            randomSide = std::uniform_int_distribution<int>{ 0, 1 }(rng) ? 1 : -1;
         }
+        cycleState = st;
+        // модификатор считаем тут же: спин и «вращение» двигают свою фазу, и делать это каждый
+        // тик нельзя — чокнутая команда уехала бы от отправленной на шаг спина
+        cycleModifier = modifierYaw(st, static_cast<float>(st.degree) + switchRandom);
+        cycleValid = true;
     }
+    f.st = cycleState;
 
-    const int inverterSide = aa.inverter.isToggled() ? 1 : -1;
+    // ---- 1) план ----
+    Plan plan = buildPlan(f);
 
-    // Дефенсив AA (скрытые углы, LC-триггеры, Force LC) — только с включённым DT (галка + клавиша).
-    // DT выключен — обычный AA, тикбейс ради дефенсива не трогаем.
-    const bool defensiveAaOn = !legit && aa.defensiveAa && tickbase::doubleTapEnabled();
-
-    // ---- фристенд (сырое направление нужно ещё и дефенсиву «у стены») ----
-    std::optional<float> freestandRaw;
-    const bool freestandHeld = aa.freestandKey.isSet() && aa.freestandKey.isDown();
-    const bool wantFreestand = !legit && aa.freestanding && (freestandHeld || (!aa.freestandKey.isSet() && manual == Manual::None));
-    const bool wantEdgeBait = defensiveAaOn && aa.snaps[static_cast<int>(SnapState::EdgeBait)].mode != static_cast<int>(SnapMode::Default);
-    bool freestandOverridesManual = false;
-    if (wantFreestand || wantEdgeBait) {
-        csgo::Vector enemyEye;
-        bool found = false;
-        float toEnemy = atTargetsYaw(cmd, engineInterfaces, clientInterfaces, memory, &enemyEye, &found, true);
-        // врагов не видно — считаем, что они там, куда смотрит камера (стену сбоку это не меняет)
-        if (!found) {
-            toEnemy = camera.y;
-            const float radians = Helpers::deg2rad(toEnemy);
-            enemyEye = { eye.x + std::cos(radians) * 2000.0f, eye.y + std::sin(radians) * 2000.0f, eye.z };
-        }
-        float offset = freestandYaw(engineInterfaces.engineTrace(), enemyEye, toEnemy);
-        if (offset != 0.0f)
-            freestandRaw = offset;
-        if (wantFreestand) {
-            if (offset != 0.0f)
-                freestandHoldTicks = 8;
-            // Гистерезис: новую сторону берём, только если она держится 3 тика подряд;
-            // пропало, от чего прятать, — ещё 8 тиков держим прошлую
-            if (offset != 0.0f && freestandSide != 0.0f && (offset > 0.0f) != (freestandSide > 0.0f)) {
-                if (++freestandFlipTicks < 3)
-                    offset = freestandSide * 90.0f;
-                else
-                    freestandFlipTicks = 0;
-            } else {
-                freestandFlipTicks = 0;
-            }
-            if (offset == 0.0f && freestandSide != 0.0f && freestandHoldTicks > 0) {
-                --freestandHoldTicks;
-                offset = freestandSide * 90.0f;
-            }
-            if (offset != 0.0f) {
-                yaw = toEnemy + offset;
-                freestandActive = true;
-                freestandSide = offset > 0.0f ? 1.0f : -1.0f;
-                freestandOverridesManual = freestandHeld;
-                if (aa.freestandStatic)
-                    noOffset = noModifier = true;
-            } else {
-                freestandSide = 0.0f;
-            }
-        }
+    // ---- 2) поза ----
+    Pose pose;
+    pose.roll = plan.roll;
+    pose.pitch = buildPitch(f, plan);
+    pose.fakeYaw = plan.yaw;
+    // скрытый угол забрал yaw — дальше билдер к нему уже ничего не добавляет: ни смещения,
+    // ни модификатора, ни добавки по стороне, и сторона десинка на этих тиках не джиттерится
+    if (applyDefensiveSnap(f, plan, pose))
+        plan.staticAngles = true;
+    if (!plan.staticAngles) {
+        pose.fakeYaw += static_cast<float>(f.st.yawOffset);
+        pose.fakeYaw += cycleModifier;
     }
-    if (!wantFreestand) {
-        freestandSide = 0.0f;
-        freestandHoldTicks = 0;
+    const bool flick = applyFlicks(f, pose);
+    buildDesync(f, plan, pose, flick);
+
+    // ---- 3) применение ----
+    cmd->viewangles.x = std::clamp(pose.pitch, -89.0f, 89.0f);
+    // вот и весь десинк: отправленная команда несёт угол головы, чокнутые — угол, за которым
+    // сервер тянет ноги
+    cmd->viewangles.y = std::remainder(f.sendPacket ? pose.fakeYaw : pose.realYaw, 360.0f);
+    currentRoll = pose.roll;
+    tickDesync = pose.desync;
+    if (pose.side != 0) {
+        side = pose.side;           // индикаторы: без десинка сторону не меняем
+        applyBodyMovement(f, plan.owner == Owner::Extended);
     }
-
-    // ---- edge yaw: стена вплотную — лицом в неё ----
-    const bool edgeWanted = !legit && aa.edgeYaw && (!aa.edgeKey.isSet() || aa.edgeKey.isDown()) && manual == Manual::None && !freestandActive;
-    if (edgeWanted) {
-        if (const auto edge = edgeYaw(engineInterfaces.engineTrace())) {
-            yaw = *edge;
-            if (aa.edgeStatic) {
-                noOffset = noModifier = true;
-                forceDesync = inverterSide;
-            }
-        }
-    }
-
-    // ---- увод от прицела (враг смотрит на нас) ----
-    if (!legit && aa.defensive) {
-        float threatYaw = 0.0f;
-        if (enemyAimingAtUs(engineInterfaces, clientInterfaces, memory, static_cast<float>(aa.defensiveFov), threatYaw)) {
-            if (aa.defensiveJitter && sendPacket)
-                defensiveFlip = !defensiveFlip;
-            const float direction = defensiveFlip ? 1.0f : -1.0f;
-            yaw = threatYaw + direction * static_cast<float>(std::clamp(aa.defensiveYaw, 0, 180));
-            freestandActive = false;
-            freestandOverridesManual = false;
-            cmd->viewangles.x = static_cast<float>(std::clamp(aa.defensivePitch, -89, 89));
-        }
-    }
-
-    // ---- ручной AA ----
-    if (!legit) {
-        const auto direction = freestandOverridesManual ? Manual::None : manual;
-        switch (direction) {
-        case Manual::Left: yaw = camera.y + 90.0f; break;
-        case Manual::Right: yaw = camera.y - 90.0f; break;
-        case Manual::Back: yaw = camera.y + 180.0f; break;
-        case Manual::Forward: yaw = camera.y; break;
-        default: break;
-        }
-        if (direction != Manual::None && aa.staticOnManual) {
-            noOffset = noModifier = true;
-            forceDesync = inverterSide;
-        }
-    }
-
-    // ---- safe head ----
-    if (!legit && manual == Manual::None && safeHeadActive(cmd, haveThreat, threatOrigin)) {
-        noOffset = noModifier = true;
-        forceDesync = 0;
-    }
-
-    // ---- roll ----
-    if (!legit && aa.roll != 0) {
-        float roll = static_cast<float>(std::clamp(aa.roll, -50, 50)) * (aa.inverter.isToggled() ? -1.0f : 1.0f);
-        const bool onGround = localPlayer.get().flags() & FL_ONGROUND;
-        if (localPlayer.get().velocity().length2D() > 5.0f || !onGround)
-            roll = std::clamp(roll, -40.0f, 40.0f);
-        currentRoll = roll;
-        noOffset = noModifier = noSnap = true;
-        forceDesync = roll > 0.0f ? 1 : -1;
-    }
-
-    // ---- дефенсив AA (скрытые углы) ----
-    int lcLeft = tickbase::defensiveTicksLeft();
-    const DefensiveSnap* chosenSnap = nullptr;
-    const bool triggerWants = defensiveAaOn && aa.lcTriggers && (aa.lcTriggerStates & (1 << static_cast<int>(activeState)));
-    if (defensiveAaOn) {
-        chosenSnap = activeSnap(selectSnapState(cmd, freestandRaw.has_value()));
-        // LC включён (триггер этого состояния или Force LC) — скрытые углы держим всегда, а не только
-        // 2–3 тика окна после рывка: между рывками окно идёт по кругу «длительность → 1», как настоящее.
-        // Но только пока нас никто не видит. Под прицелом лагкомп по нам сломан лишь в настоящем окне
-        // после сдвига, а синтетическое окно показывало врагу голову вверх/спин без защиты — он её
-        // спокойно бектрекал и забирал (в воздухе с Force LC так было постоянно). Под прицелом — только
-        // настоящие окна, между ними обычный AA с десинком.
-        const bool always = chosenSnap && (triggerWants || chosenSnap->forceLc) && !tickbase::threatened();
-        static int synthetic = 0;
-        if (always && lcLeft == 0) {
-            const int length = std::clamp(chosenSnap->duration, 1, 13);
-            synthetic = synthetic > 1 ? synthetic - 1 : length;
-            lcLeft = synthetic;
-        } else {
-            synthetic = 0;
-        }
-        bool inWindow = chosenSnap && lcLeft > 0;
-        if (inWindow) {
-            ++snap.ticks;
-            inWindow = always || snap.ticks <= std::clamp(chosenSnap->duration, 1, 13);
-        } else {
-            snap.ticks = 0;
-        }
-        if (inWindow && !noSnap) {
-            if (!snap.active && snap.apex == 0)
-                snap.apex = lcLeft;
-            snap.active = true;
-            if (snap.delayed >= chosenSnap->yawDelay + 1) {
-                snap.jitter = !snap.jitter;
-                snap.delayed = 0;
-            } else if (sendPacket) {
-                ++snap.delayed;
-            }
-            if (const auto pitch = snapPitch(*chosenSnap, curtime, lcLeft, camera.x, targetPitch))
-                cmd->viewangles.x = std::clamp(*pitch, -89.0f, 89.0f);
-            if (const auto offset = snapYaw(*chosenSnap, curtime, lcLeft, freestandRaw)) {
-                yaw = (haveThreat ? toTarget : camera.y) + *offset;
-                noOffset = noModifier = true;
-            }
-        } else if (lcLeft == 0 && snap.apex != 0) {
-            // окно закончилось — следующее начнётся с чистого листа
-            snap.counter = (snap.counter + 1) & 0xFFFF;
-            snap.apex = 0;
-            snap.delayed = 0;
-            snap.haveRandomPitch = snap.haveRandomYaw = false;
-        }
-    } else {
-        // DT выключили посреди окна — следующее включение начнётся с чистого листа
-        snap.ticks = 0;
-        snap.apex = 0;
-        snap.delayed = 0;
-        snap.haveRandomPitch = snap.haveRandomYaw = false;
-    }
-
-    // ---- ломать лагкомп: Force LC у дефенсива и LC-триггеры по состояниям ----
-    if (!legit) {
-        const bool snapWants = chosenSnap && chosenSnap->forceLc;
-        if (snapWants || triggerWants)
-            tickbase::requestBreakLc();
-    }
-
-    if (!noOffset)
-        yaw += static_cast<float>(st.yawOffset);
-    const float degree = static_cast<float>(st.degree) + switchRandom;
-    const float modifier = noModifier ? 0.0f : modifierYaw(st, degree);
-
-    // ---- флики ----
-    bool flick = false;
-    if (aa.flicks && !legit) {
-        if (tickbase::isShifting())
-            flickAfterShift = 2;
-        flick = tickbase::isShifting() || flickAfterShift > 0;
-        if (!flick && aa.flickTrigger == static_cast<int>(FlickTrigger::Always) && sendPacket && ++flickCounter >= std::max(aa.flickEvery, 3)) {
-            flickCounter = 0;
-            flick = true;
-        }
-        if (!tickbase::isShifting() && sendPacket && flickAfterShift > 0)
-            --flickAfterShift;
-        // скрытые углы дефенсива главнее
-        if (snap.active)
-            flick = false;
-    }
-    if (flick) {
-        if (!wasFlicking) {
-            flickDirection = aa.flickSide == static_cast<int>(FlickSide::Random)
-                ? (std::uniform_int_distribution<int>{ 0, 1 }(rng) ? 1.0f : -1.0f) : -flickDirection;
-        }
-        yaw += aa.flickSide == static_cast<int>(FlickSide::Custom)
-            ? static_cast<float>(std::clamp(aa.flickYaw, -180, 180))
-            : flickDirection * static_cast<float>(aa.flickAngle);
-        if (aa.flickPitchOverride)
-            cmd->viewangles.x = static_cast<float>(std::clamp(aa.flickPitch, -89, 89));
-    }
-    wasFlicking = flick;
-
-    // ---- десинк: на чокнутых тиках тянем тело в сторону, реальный угол уходит в отправленном ----
-    const auto desyncMode = static_cast<DesyncMode>(st.desyncMode);
-    const bool desyncOn = aa.desync && tickbase::isInstalled() && (desyncMode != DesyncMode::Off || (forceDesync && *forceDesync != 0));
-    if (desyncOn && !(forceDesync && *forceDesync == 0)) {
-        side = inverterSide;
-        if (st.desyncInvert)
-            side = -side;
-        if (aa.antiBrute && antiBruteFlip)
-            side = -side;
-        if (forceDesync) {
-            side = *forceDesync;
-        } else if (!noModifier) {
-            if (desyncMode == DesyncMode::Jitter) {
-                // скиттер ведёт сторону своим порядком (минус — другая сторона), остальные — через раз
-                if (static_cast<YawModifier>(st.modifier) == YawModifier::Skitter) {
-                    if (skitterSequence[phase % std::size(skitterSequence)] < 0)
-                        side = -side;
-                } else if (phase & 1) {
-                    side = -side;
-                }
-            } else if (desyncMode == DesyncMode::Random) {
-                side *= randomSide;
-            }
-        }
-        // при фристенде тело уводим туда же, куда голову: от врага за укрытие
-        if (freestandActive)
-            side = freestandSide > 0.0f ? 1 : -1;
-
-        // добавка к yaw по стороне: голова идёт за десинком, а не стоит посередине
-        yaw += modifier + (noOffset ? 0.0f : static_cast<float>(side > 0 ? st.addLeft : st.addRight));
-
-        // ручной/статика/roll — десинк на полную; иначе — из билдера
-        const int limit = forceDesync ? 60 : (side > 0 ? st.desyncLeft : st.desyncRight);
-        const float amount = static_cast<float>(std::clamp(limit, 0, 60));
-        if (!sendPacket && !flick)
-            yaw += side * std::min(amount * 2.0f, 120.0f);
-
-        // микродвижение стоя, чтобы сервер не обновлял LBY
-        const int flags = localPlayer.get().flags();
-        if ((flags & FL_ONGROUND) && localPlayer.get().velocity().length2D() < 3.0f
-            && std::abs(cmd->forwardmove) < 1.0f && std::abs(cmd->sidemove) < 1.0f && !(cmd->buttons & csgo::UserCmd::IN_JUMP)) {
-            const float micro = (flags & FL_DUCKING) ? 3.25f : 1.1f;
-            cmd->sidemove = (cmd->commandNumber & 1) ? micro : -micro;
-        }
-    } else {
-        yaw += modifier;
-    }
-
-    cmd->viewangles.y = std::remainder(yaw, 360.0f);
     // слайдвок — в movement::fixMovement, после того как кнопки выставлены под реальный ввод
+}
+
+ExtendedView extendedView() noexcept
+{
+    std::scoped_lock lock{ extendedMutex };
+    return extendedShown;
 }
 
 void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory& memory, bool forceRemove) noexcept

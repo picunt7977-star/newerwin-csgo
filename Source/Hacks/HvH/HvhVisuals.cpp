@@ -12,6 +12,7 @@
 
 #include "HvhConfig.h"
 #include "HvhGui.h"
+#include "AntiAim.h"
 #include "HvhVisuals.h"
 #include "Ragebot.h"
 
@@ -490,6 +491,41 @@ void onKill() noexcept
     pendingKill = true;
 }
 
+// extended yaw: у ног три луча — отправленный взгляд (белый), куда ломаем LBY (акцент, пунктир)
+// и LBY, который прислал сервер (акцент). Работает — LBY-луч стоит на пунктире, а не на взгляде.
+void drawExtendedYaw(ImDrawList* drawList) noexcept
+{
+    if (!config.view.serverModel || config.antiAim.extendedYaw <= 0)
+        return;
+    const auto view = antiaim::extendedView();
+    if (!view.active)
+        return;
+    const csgo::Vector origin{ view.origin[0], view.origin[1], view.origin[2] + 2.0f };
+    ImVec2 center;
+    if (!Helpers::worldToScreen(origin, center))
+        return;
+    const auto ray = [&](float yaw, float length, ImU32 color, bool dashed, const char* label) {
+        const float rad = Helpers::deg2rad(yaw);
+        const csgo::Vector end{ origin.x + std::cos(rad) * length, origin.y + std::sin(rad) * length, origin.z };
+        ImVec2 tip;
+        if (!Helpers::worldToScreen(end, tip))
+            return;
+        if (dashed) {
+            for (int k = 0; k < 8; k += 2) {
+                const float a = k / 8.0f, b = (k + 1) / 8.0f;
+                drawList->AddLine({ center.x + (tip.x - center.x) * a, center.y + (tip.y - center.y) * a },
+                                  { center.x + (tip.x - center.x) * b, center.y + (tip.y - center.y) * b }, color, 2.0f);
+            }
+        } else {
+            drawList->AddLine(center, tip, color, 2.0f);
+        }
+        shadowText(drawList, { tip.x + 3.0f, tip.y - 7.0f }, color, label);
+    };
+    ray(view.eyeYaw, 40.0f, IM_COL32(255, 255, 255, 200), false, "взгляд");
+    ray(view.flickYaw, 40.0f, withAlpha(ui::color::accent, 0.6f), true, "");
+    ray(view.lby, 32.0f, withAlpha(ui::color::accent, 1.0f), false, "LBY");
+}
+
 void draw(ImDrawList* drawList, float realtime) noexcept
 {
     GameData::Lock lock;
@@ -502,6 +538,7 @@ void draw(ImDrawList* drawList, float realtime) noexcept
     drawGrenadeTimers(drawList, realtime);
     drawDamageNumbers(drawList);
     drawSpreadCircle(drawList);
+    drawExtendedYaw(drawList);
     drawKillFlash(drawList);
 }
 

@@ -7,6 +7,8 @@
 
 #include <imgui/imgui.h>
 
+#include "Autowall.h"
+#include "Extras.h"
 #include "HvhConfig.h"
 #include "HvhGui.h"
 #include "Movement.h"
@@ -16,6 +18,7 @@
 #include <GameData.h>
 #include <Helpers.h>
 #include <CSGO/ConVar.h>
+#include <CSGO/Constants/ConVarNames.h>
 #include <CSGO/Cvar.h>
 #include <CSGO/Engine.h>
 #include <CSGO/Entity.h>
@@ -24,6 +27,11 @@
 #include <CSGO/EntityList.h>
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/EngineInterfaces.h>
+#include <Interfaces/OtherInterfaces.h>
+#include <CSGO/matrix3x4.h>
+#include <CSGO/AnimationLayer.h>
+#include <CSGO/WeaponData.h>
+#include <CSGO/WeaponId.h>
 #include <Memory.h>
 #include <Netvars.h>
 #include <RetSpoof/RetSpoofGadgets.h>
@@ -45,6 +53,17 @@ bool peekReturning = false;
 bool peekTeleported = false;    // заряд на этот возврат уже потрачен
 int peekReturnTicks = 0;
 csgo::Vector peekOrigin;
+
+// AI peek: Idle — ищем точку; Moving — идём к ней; Cooldown — ждём возврата автопика и паузу
+enum class AiPeekState { Idle, Moving, Cooldown };
+AiPeekState aiState = AiPeekState::Idle;
+float aiYaw = 0.0f;             // куда идти (мировой yaw)
+float aiDistance = 0.0f;        // насколько отойти от точки автопика
+float aiDeadline = 0.0f;        // realtime: не вышли на цель за это время — назад
+float aiCooldownUntil = 0.0f;
+int aiSafeCount = 0;            // сколько проверок подряд точка держится
+float aiSafeYaw = 0.0f;
+int aiScanTick = 0;
 
 // Сколько пройдём за сдвиг ticks команд, если каждую жмём к точке: разгон sv_accelerate от текущей скорости
 [[nodiscard]] float shiftCoverage(float speed, float maxSpeed, int ticks, float interval) noexcept
@@ -181,32 +200,9 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
     cycleLow = std::min(cycleLow, amount);
 }
 
-namespace
-{
-// Увидит ли враг нашу голову через `ahead` секунд, если и он, и мы продолжим двигаться как сейчас.
-// Его глаз двигаем только по горизонтали (прыжок врага не угадать), свой — по полной скорости.
-bool willSee(const EngineInterfaces& engineInterfaces, const Memory& memory, const csgo::Entity& enemy,
-             const csgo::Vector& ourEye, const csgo::Vector& ourVelocity, float ahead) noexcept
-{
-    const auto enemyVelocity = enemy.velocity();
-    const csgo::Vector from = enemy.getEyePosition() + csgo::Vector{ enemyVelocity.x * ahead, enemyVelocity.y * ahead, 0.0f };
-    const csgo::Vector to = ourEye + ourVelocity * ahead;
-    for (const csgo::Vector& point : { to + csgo::Vector{ 0.0f, 0.0f, 5.0f }, to - csgo::Vector{ 0.0f, 0.0f, 20.0f } }) {
-        if (memory.lineGoesThroughSmoke(from, point, 1))
-            continue;
-        csgo::Trace trace;
-        engineInterfaces.engineTrace().traceRay({ from, point }, 0x46004009, enemy.getPOD(), trace);
-        if (trace.entity == localPlayer.get().getPOD() || trace.fraction > 0.97f)
-            return true;
-    }
-    return false;
-}
-}
-
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept
 {
     static bool teleportWasDown = false;
-    static std::array<bool, 65> enemyWasVisible{};
 
     const auto& ex = config.exploits;
     const bool teleportDown = ex.teleportKey.isSet() && ex.teleportKey.isDown();
@@ -214,88 +210,15 @@ void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& 
     teleportWasDown = teleportDown;
 
     if (!localPlayer || !localPlayer.get().isAlive() || !tickbase::isInstalled()) {
-        enemyWasVisible.fill(false);
         tickbase::setThreat(false);
         return;
     }
-
-    if (teleportPressed && tickbase::isCharged()) {
+    if (teleportPressed && tickbase::isCharged())
         tickbase::requestShift();
-        return;
-    }
 
-    // Кто нас сейчас видит: для рывка «враг только что увидел» и чтобы не дозаряжаться посреди перестрелки
-    bool newlySpotted = false, anyVisible = false;
-
-    const auto& aa = config.antiAim;
-    const bool peekCheck = aa.peekDefensive && tickbase::doubleTapEnabled() && tickbase::defensiveAllowed()
-        && tickbase::isCharged() && !tickbase::isShifting() && tickbase::defensiveTicksLeft() == 0;
-    const float ahead = static_cast<float>(std::clamp(aa.peekTicks, 2, 16)) * memory.globalVars->intervalPerTick;
-    const csgo::Vector ourEye = localPlayer.get().getEyePosition();
-    const csgo::Vector ourVelocity = localPlayer.get().velocity();
-    bool peekSoon = false;
-    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
-    for (int i = 1; i <= maxClients; ++i) {
-        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
-        if (!entity.getPOD() || entity.getNetworkable().isDormant() || !entity.isAlive() || !localPlayer.get().isOtherEnemy(memory, entity)) {
-            enemyWasVisible[i] = false;
-            continue;
-        }
-        const bool visible = localPlayer.get().visibleTo(engineInterfaces, memory, entity);
-        if (visible && !enemyWasVisible[i])
-            newlySpotted = true;
-        anyVisible = anyVisible || visible;
-        enemyWasVisible[i] = visible;
-        // пик: сейчас не видит, а через peekTicks тиков (оба продолжают двигаться как сейчас) — увидит
-        if (peekCheck && !visible && !peekSoon)
-            peekSoon = willSee(engineInterfaces, memory, entity, ourEye, ourVelocity, ahead);
-    }
-    tickbase::setThreat(anyVisible);
-
-    // Дефенсив на пике: рывок до того, как враг нас увидел (или в тик, когда увидел — тут и стоя:
-    // окно скрытых углов, а его лагкомп берёт старую запись). Записи лагкомпа на выглядывании нет —
-    // его чит стреляет по нам за стеной. В окне работают снапы дефенсив AA («У стены» — у стены).
-    if (peekCheck && (peekSoon || newlySpotted)) {
-        static float lastPeekShift = -10.0f;
-        const float now = memory.globalVars->realtime;
-        if (now < lastPeekShift)
-            lastPeekShift = -10.0f;
-        if (now - lastPeekShift > 0.5f) {
-            // зажат автопик — оставляем 6 тиков на телепорт назад
-            const bool peekHeld = config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown();
-            const int charged = tickbase::chargedTicks();
-            if (!peekHeld) {
-                tickbase::requestShift();
-                lastPeekShift = now;
-                return;
-            }
-            if (charged >= 12) {
-                tickbase::requestShift(charged - 6);
-                lastPeekShift = now;
-                return;
-            }
-        }
-    }
-
-    // дефенсив DT рвётся при выглядывании и без отдельной галки «Дефенсив»
-    if (!ex.defensive && !tickbase::defensiveDoubleTap())
-        return;
-    // пока зажат автопик, заряд бережём под телепорт назад
-    if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
-        return;
-
-    // Дефенсив: враг только что увидел нас — рывок на заряженные тики, его лагкомп по нашей прошлой позиции
-    // не работает. Не чаще раза в секунду: враг то пропадал, то появлялся, и рывков было по три подряд
-    // (лог 01.11 12:53:12), а после каждого 6 тиков зарядки — стоишь и не стреляешь.
-    static float lastSpotShift = -10.0f;
-    const float now = memory.globalVars->realtime;
-    if (now < lastSpotShift)
-        lastSpotShift = -10.0f;
-    // стоя рывок ничего не даёт — нужна скорость
-    if (newlySpotted && now - lastSpotShift > 1.0f && tickbase::isCharged() && tickbase::defensiveAllowed() && localPlayer.get().velocity().length2D() > 60.0f) {
-        tickbase::requestShift();
-        lastSpotShift = now;
-    }
+    (void)engineInterfaces;
+    (void)clientInterfaces;
+    (void)memory;
 }
 
 namespace
@@ -343,6 +266,38 @@ void autoBuy(const csgo::Engine& engine) noexcept
         engine.clientCmdUnrestricted(command.c_str());
 }
 
+// Серверные лимиты: сколько команд сервер обрабатывает за один свой тик
+// (sv_maxusrcmdprocessticks). Больше этого держать в пачке бессмысленно — хвост он выкинет.
+// Cvar реплицируется не на всех сборках; если его нет, предел остаётся 14.
+//
+// Сглаживания ошибки предсказания тут БОЛЬШЕ НЕТ. Попытка размазать рывки через cl_smooth /
+// cl_smoothtime была ошибкой: cl_smoothtime — это время, за которое клиент ДОГОНЯЕТ серверную
+// позицию, то есть всё это время своя модель и камера едут в прошлом. С дефенсивом расхождение
+// держится постоянно, поэтому 0.5 с превращались в постоянное отставание себя от себя
+// («моделька идёт не со мной»). Рывок длится тики, а отставание — полсекунды: лекарство было
+// хуже болезни. Правильное лечение рывков — не создавать их: заряд чоком (ChargeStyle::Choke),
+// на котором команды не теряются вовсе.
+void exploitTuning(const csgo::Cvar& cvar) noexcept
+{
+    static csgo::ConVarPOD* processPod = nullptr;
+    static bool resolved = false;
+
+    if (!resolved) {
+        resolved = true;
+        processPod = cvar.findVar(csgo::sv_maxusrcmdprocessticks);
+
+        // Чиним за собой: версия от 07.11 форсила cl_smoothtime 0.5, а cvar архивный — значение
+        // могло уехать в config.cfg. Ровно 0.5 ставили только мы, свои настройки не трогаем.
+        if (const auto pod = cvar.findVar(csgo::cl_smoothtime)) {
+            const auto smoothTime = csgo::ConVar::from(retSpoofGadgets->client, pod);
+            if (std::abs(smoothTime.getFloat() - 0.5f) < 0.001f)
+                smoothTime.setValue(0.1f);
+        }
+    }
+
+    tickbase::setProcessLimit(processPod ? csgo::ConVar::from(retSpoofGadgets->client, processPod).getInt() : 0);
+}
+
 void fakeDuckStats(float& sent, float& low) noexcept
 {
     sent = fdSentDuck;
@@ -360,6 +315,8 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
     if (!key.isSet() || !key.isDown() || !localPlayer || !localPlayer.get().isAlive()) {
         peekActive = false;
         peekReturning = false;
+        aiState = AiPeekState::Idle;
+        aiSafeCount = 0;
         tickbase::holdShotShift(false);
         return;
     }
@@ -389,7 +346,9 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
         ragebot::logToFile(text);
     }
     constexpr auto moveButtons = csgo::UserCmd::IN_FORWARD | csgo::UserCmd::IN_BACK | csgo::UserCmd::IN_MOVELEFT | csgo::UserCmd::IN_MOVERIGHT;
-    if (config.movement.autoPeekMode == static_cast<int>(AutoPeekMode::ShotOrRelease) && !(cmd->buttons & moveButtons))
+    // AI peek сам ведёт без WASD — «отпустил WASD» тогда не считается
+    if (config.movement.autoPeekMode == static_cast<int>(AutoPeekMode::ShotOrRelease) && !(cmd->buttons & moveButtons)
+        && !(config.movement.aiPeek && aiState != AiPeekState::Idle))
         peekReturning = true;
 
     if (!peekReturning)
@@ -467,6 +426,261 @@ void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noex
     cmd->sidemove = -std::sin(relative) * 450.0f;
 }
 
+// AI peek. Зажат автопик, WASD не жмём: раз в 2 тика проверяем направления вокруг (8–16 штук) на 2 дистанциях
+// (половина и полный разгон за ~0.3 с), откуда пробиваем ближайшего к прицелу врага (голова / грудь / таз) на
+// мин. урон рейджа. Точка держится aiPeekSafety проверок подряд — идём туда; дальше стреляет рейдж (автостоп
+// его), после выстрела автопик возвращает назад. Не дошли/не выстрелили — возврат сами, пауза 0.4 с.
+void aiPeek(csgo::UserCmd* cmd, float viewPitch, float viewYaw, bool rageHasTarget, const EngineInterfaces& engineInterfaces,
+            const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, const Memory& memory) noexcept
+{
+    const auto& mv = config.movement;
+    const float now = memory.globalVars->realtime;
+    if (aiCooldownUntil > now + 5.0f)
+        aiCooldownUntil = 0.0f;
+    constexpr auto moveButtons = csgo::UserCmd::IN_FORWARD | csgo::UserCmd::IN_BACK | csgo::UserCmd::IN_MOVELEFT | csgo::UserCmd::IN_MOVERIGHT;
+    if (!mv.aiPeek || !config.rage.enabled || !peekActive || !localPlayer || !localPlayer.get().isAlive()
+        || (cmd->buttons & (moveButtons | csgo::UserCmd::IN_JUMP))) {
+        aiState = AiPeekState::Idle;
+        aiSafeCount = 0;
+        return;
+    }
+
+    if (aiState == AiPeekState::Cooldown) {
+        if (peekReturning || now < aiCooldownUntil)
+            return;
+        aiState = AiPeekState::Idle;
+        aiSafeCount = 0;
+    }
+
+    const auto origin = localPlayer.get().getAbsOrigin();
+    const float fromStart = std::hypot(origin.x - peekOrigin.x, origin.y - peekOrigin.y);
+
+    if (aiState == AiPeekState::Moving) {
+        // выстрел был — автопик уже возвращает
+        if (peekReturning) {
+            aiState = AiPeekState::Cooldown;
+            aiCooldownUntil = now + 0.4f;
+            return;
+        }
+        // рейдж нашёл точку — он тормозит и стреляет, не мешаем
+        if (rageHasTarget)
+            return;
+        if (fromStart > aiDistance * 1.15f + 4.0f || now > aiDeadline) {
+            peekReturning = true;
+            aiState = AiPeekState::Cooldown;
+            aiCooldownUntil = now + 0.4f;
+            return;
+        }
+        const float relative = Helpers::deg2rad(aiYaw - viewYaw);
+        cmd->forwardmove = std::cos(relative) * 450.0f;
+        cmd->sidemove = -std::sin(relative) * 450.0f;
+        return;
+    }
+
+    // ---- Idle: ищем точку ----
+    if (peekReturning || rageHasTarget || !localPlayer.get().isOnGround() || ++aiScanTick % 2 != 0)
+        return;
+    const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon());
+    if (!weapon.getPOD() || weapon.clip() <= 0)
+        return;
+    const auto type = weapon.getWeaponType();
+    if (type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4 || weapon.itemDefinitionIndex() == WeaponId::Taser)
+        return;
+    const auto data = weapon.getWeaponData();
+    if (!data)
+        return;
+    // выйти успеем к готовности оружия (идти ~0.3 с)
+    const float serverTime = memory.globalVars->serverTime();
+    if (std::max(weapon.nextPrimaryAttack(), localPlayer.get().nextAttack()) > serverTime + 0.3f)
+        return;
+
+    // цель — враг ближе всех к прицелу
+    const auto eye = localPlayer.get().getEyePosition();
+    const float pitchRad = Helpers::deg2rad(viewPitch), yawRad = Helpers::deg2rad(viewYaw);
+    const csgo::Vector aimDir{ std::cos(pitchRad) * std::cos(yawRad), std::cos(pitchRad) * std::sin(yawRad), -std::sin(pitchRad) };
+    int targetIndex = 0;
+    float bestDot = std::cos(Helpers::deg2rad(std::clamp(config.rage.fov, 1.0f, 180.0f)));
+    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
+    for (int i = 1; i <= maxClients; ++i) {
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+        if (!entity.getPOD() || entity.getNetworkable().isDormant() || !entity.isAlive() || entity.gunGameImmunity()
+            || !localPlayer.get().isOtherEnemy(memory, entity))
+            continue;
+        auto to = entity.getAbsOrigin() + csgo::Vector{ 0.0f, 0.0f, 48.0f } - eye;
+        const float length = to.length();
+        if (length < 1.0f)
+            continue;
+        to /= length;
+        const float dot = to.x * aimDir.x + to.y * aimDir.y + to.z * aimDir.z;
+        if (dot > bestDot) {
+            bestDot = dot;
+            targetIndex = i;
+        }
+    }
+    if (!targetIndex) {
+        aiSafeCount = 0;
+        return;
+    }
+    const auto enemy = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(targetIndex));
+    static csgo::matrix3x4 bones[128];
+    if (!enemy.setupBones(bones, 128, 0x100, 0.0f))
+        return;
+    // голова (8), грудь (6), таз (0) — с множителями хитгрупп
+    struct AimPoint { csgo::Vector position; int hitgroup; };
+    const std::array<AimPoint, 3> points{ AimPoint{ bones[8].origin(), HitGroup::Head }, AimPoint{ bones[6].origin(), HitGroup::Chest },
+                                          AimPoint{ bones[0].origin(), HitGroup::Stomach } };
+    const int setting = std::max(extras::currentMinDamage(), 1);
+    const int health = std::max(enemy.health(), 1);
+    const float need = static_cast<float>(setting > 100 ? health + (setting - 100) : std::min(setting, health));
+
+    const auto& engineTrace = engineInterfaces.engineTrace();
+    const auto eyeOffset = eye - origin;
+    const float interval = memory.globalVars->intervalPerTick;
+    const float maxSpeed = std::clamp(data->maxSpeed, 50.0f, 260.0f);
+    const float reach = shiftCoverage(localPlayer.get().velocity().length2D(), maxSpeed, static_cast<int>(0.3f / interval), interval);
+    const auto enemyOrigin = enemy.getAbsOrigin();
+    const float toEnemyYaw = Helpers::rad2deg(std::atan2(enemyOrigin.y - origin.y, enemyOrigin.x - origin.x));
+
+    // направления: сначала поперёк линии на врага (так выглядывают из-за угла), потом остальные
+    const int count = std::clamp(mv.aiPeekQuality * 16 / 100, 6, 16);
+    std::array<float, 16> yaws{};
+    for (int k = 0; k < count; ++k)
+        yaws[k] = toEnemyYaw + 360.0f * static_cast<float>(k) / static_cast<float>(count);
+    std::sort(yaws.begin(), yaws.begin() + count, [toEnemyYaw](float a, float b) {
+        return std::abs(90.0f - std::abs(normalizeYaw(a - toEnemyYaw))) < std::abs(90.0f - std::abs(normalizeYaw(b - toEnemyYaw)));
+    });
+
+    const auto reachable = [&](const csgo::Vector& dir, float distance) {
+        // проход на уровне колен и груди (+16 ед. — полуширина хитбокса игрока), и под ногами есть пол
+        for (const float height : { 20.0f, 52.0f }) {
+            csgo::Trace trace;
+            const csgo::Vector from{ origin.x, origin.y, origin.z + height };
+            engineTrace.traceRay({ from, from + dir * (distance + 16.0f) }, 0x201400B, { localPlayer.get().getPOD() }, trace);
+            if (trace.fraction < 1.0f)
+                return false;
+        }
+        const auto spot = origin + dir * distance;
+        csgo::Trace ground;
+        engineTrace.traceRay({ spot + csgo::Vector{ 0.0f, 0.0f, 18.0f }, spot - csgo::Vector{ 0.0f, 0.0f, 24.0f } }, 0x201400B, { localPlayer.get().getPOD() }, ground);
+        return ground.fraction < 1.0f;
+    };
+
+    bool found = false;
+    float foundYaw = 0.0f, foundDistance = 0.0f;
+    for (int k = 0; k < count && !found; ++k) {
+        const float yawRadK = Helpers::deg2rad(yaws[k]);
+        const csgo::Vector dir{ std::cos(yawRadK), std::sin(yawRadK), 0.0f };
+        for (const float part : { 0.5f, 1.0f }) {
+            const float distance = reach * part;
+            if (distance < 8.0f || !reachable(dir, distance))
+                break;
+            const auto from = origin + dir * distance + eyeOffset;
+            for (const auto& point : points) {
+                const float raw = autowall::getDamageBetween(engineInterfaces, interfaces, from, point.position, data, config.rage.autowall);
+                if (raw > 0.0f && autowall::scaleDamage(enemy, point.hitgroup, data, raw) >= need) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                foundYaw = yaws[k];
+                foundDistance = distance;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        aiSafeCount = 0;
+        return;
+    }
+    // одна и та же сторона несколько проверок подряд — не дёргаемся на случайную щель
+    aiSafeCount = aiSafeCount > 0 && std::abs(normalizeYaw(foundYaw - aiSafeYaw)) < 35.0f ? aiSafeCount + 1 : 1;
+    aiSafeYaw = foundYaw;
+    if (aiSafeCount < std::clamp(mv.aiPeekSafety, 1, 16))
+        return;
+    aiState = AiPeekState::Moving;
+    aiYaw = foundYaw;
+    aiDistance = foundDistance;
+    aiDeadline = now + 0.8f;
+    aiSafeCount = 0;
+}
+
+bool aiPeekMoving() noexcept
+{
+    return aiState == AiPeekState::Moving;
+}
+
+// Авто хайдшоты (как в hysteria): DT включён, а мы на земле стоим / идём на shift / сидим — быстрая стрельба
+// уступает хайдшотам. Не на автопике стоя (там выглядываем — DT), не в воздухе, не с дробовиками/пулемётами
+void autoHideShots(const csgo::UserCmd* cmd) noexcept
+{
+    const auto& ex = config.exploits;
+    bool engage = false;
+    if (ex.autoHideShots && tickbase::doubleTapEnabled() && localPlayer && localPlayer.get().isAlive()
+        && localPlayer.get().isOnGround() && !(cmd->buttons & csgo::UserCmd::IN_JUMP)) {
+        const bool ducking = (localPlayer.get().flags() & (1 << 1)) != 0;
+        const bool slow = localPlayer.get().velocity().length2D() < 5.0f || (cmd->buttons & csgo::UserCmd::IN_SPEED);
+        const bool peekHeld = config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown();
+        if ((slow && !peekHeld) || ducking) {
+            if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
+                const auto id = weapon.itemDefinitionIndex();
+                const auto type = weapon.getWeaponType();
+                const auto data = weapon.getWeaponData();
+                const bool deagle = id == WeaponId::Deagle;
+                bool allowed = data && !data->fullAuto && type != WeaponType::Pistol;     // снайперки, бёрст
+                if (deagle)
+                    allowed = ex.autoHsDeagle;
+                else if (type == WeaponType::Pistol || type == WeaponType::SubMachinegun || type == WeaponType::Rifle)
+                    allowed = ex.autoHsRifles;
+                if (id == WeaponId::Revolver || id == WeaponId::Taser || type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4)
+                    allowed = false;
+                engage = allowed;
+            }
+        }
+    }
+    tickbase::setAutoHideShots(engage);
+}
+
+// Аним брейкер: после клиентской анимации своей модели (RENDER_START, после оригинала) — правим позы и слой.
+// Индексы поз из модели игрока: 0 strafe_yaw, 6 jump_fall, 7 move_yaw, 12 body_pitch; слой 6 — MOVEMENT_MOVE
+void animBreaker(float realtime) noexcept
+{
+    static bool wasInAir = false;
+    static float landedAt = -10.0f;
+    const auto& aa = config.antiAim;
+    if (!aa.enabled || !aa.animBreaker || !localPlayer || !localPlayer.get().isAlive()) {
+        wasInAir = false;
+        return;
+    }
+    if (realtime < landedAt)
+        landedAt = -10.0f;
+    const bool inAir = !localPlayer.get().isOnGround();
+    if (wasInAir && !inAir)
+        landedAt = realtime;
+    wasInAir = inAir;
+
+    auto& poses = localPlayer.get().poseParameters();
+    if (inAir) {
+        const auto air = static_cast<AnimBreak>(aa.breakerAir);
+        if (air == AnimBreak::Static) {
+            poses[6] = 1.0f;
+        } else if (air == AnimBreak::Moonwalk) {
+            const auto layers = localPlayer.get().animOverlays();
+            if (layers && localPlayer.get().animOverlayCount() > csgo::LAYER_MOVEMENT_MOVE)
+                layers[csgo::LAYER_MOVEMENT_MOVE].weight = 1.0f;
+        }
+    } else {
+        const auto ground = static_cast<AnimBreak>(aa.breakerGround);
+        if (ground == AnimBreak::Static)
+            poses[0] = 1.0f;
+        else if (ground == AnimBreak::Moonwalk)
+            poses[7] = 0.0f;
+        // кивок головой при приземлении (~0.3 с) — держим pitch ровно
+        if (aa.breakerLandPitch && realtime - landedAt < 0.3f)
+            poses[12] = 0.5f;
+    }
+}
+
 void fixMovement(csgo::UserCmd* cmd, float viewYaw) noexcept
 {
     // поворачиваем вектор ввода на разницу между камерой и отправляемым yaw
@@ -485,8 +699,12 @@ void fixMovement(csgo::UserCmd* cmd, float viewYaw) noexcept
     if (cmd->sidemove > 1.0f) cmd->buttons |= UserCmd::IN_MOVERIGHT;
     else if (cmd->sidemove < -1.0f) cmd->buttons |= UserCmd::IN_MOVELEFT;
 
-    // слайдвок: кнопки наоборот — анимация ног идёт «в обратку»
-    if (config.antiAim.enabled && config.antiAim.slideWalk && localPlayer && localPlayer.get().isOnGround()) {
+    // слайдвок: кнопки наоборот — анимация ног идёт «в обратку». Аним брейкер: «Статика» на земле его
+    // включает (ноги не шагают — это видят и враги), «Мунвок» — выключает (ноги шагают, у себя — задом)
+    const auto& aa = config.antiAim;
+    const auto ground = static_cast<AnimBreak>(aa.animBreaker ? aa.breakerGround : 0);
+    const bool slide = (aa.slideWalk && ground != AnimBreak::Moonwalk) || ground == AnimBreak::Static;
+    if (aa.enabled && slide && localPlayer && localPlayer.get().isOnGround()) {
         const auto swap = [cmd](int a, int b) {
             const bool hasA = cmd->buttons & a;
             const bool hasB = cmd->buttons & b;

@@ -20,6 +20,8 @@ void update(const OtherInterfaces& interfaces, float frameTime) noexcept;
 void onShotResult(const csgo::Vector& position, bool hit) noexcept;
 // рейдж: мин. урон текущего оружия — для индикатора
 void setMinDamage(int value, bool overridden) noexcept;
+// его же — для AI peek (то, что рейдж выставил на этом тике; >100 = хп + N)
+[[nodiscard]] int currentMinDamage() noexcept;
 // player_death: трештолк
 void onDeath(const csgo::Engine& engine, int attacker, int victim, int local, bool headshot) noexcept;
 

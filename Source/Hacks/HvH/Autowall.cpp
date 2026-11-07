@@ -184,10 +184,17 @@ float getDamageToPoint(const EngineInterfaces& engineInterfaces, const OtherInte
 {
     if (!localPlayer || !weaponData)
         return 0.0f;
+    return getDamageBetween(engineInterfaces, interfaces, localPlayer.get().getEyePosition(), point, weaponData, penetrate);
+}
+
+float getDamageBetween(const EngineInterfaces& engineInterfaces, const OtherInterfaces& interfaces, const csgo::Vector& from, const csgo::Vector& point, const csgo::WeaponInfo* weaponData, bool penetrate) noexcept
+{
+    if (!localPlayer || !weaponData)
+        return 0.0f;
 
     const auto& engineTrace = engineInterfaces.engineTrace();
 
-    const auto eye = localPlayer.get().getEyePosition();
+    const auto eye = from;
     csgo::Vector start = eye;
     auto direction = point - start;
     const float totalDistance = direction.length();
