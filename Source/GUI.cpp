@@ -1034,7 +1034,12 @@ void GUI::renderGuiStyle2(const EngineInterfaces& engineInterfaces, const Client
     }
     case Tab::World: {
         static int sub = 0;
-        switch (subTabs({ "Визуалы", "Скоуп и гранаты", "Приколюхи" }, sub)) {
+        switch (subTabs({ "Визуалы", "Скоуп и гранаты", "Приколюхи", "Мир" }, sub)) {
+        case 3: {
+            auto& sky = features.visuals.skyboxSettings();
+            hvh::gui::drawWorldLookTab(&sky.enabled, &sky.skybox, SkyboxChanger::skyboxList.data(), static_cast<int>(SkyboxChanger::skyboxList.size()));
+            break;
+        }
         case 0: {
             constexpr float rightWidth = 260.0f;
             const auto avail = ImGui::GetContentRegionAvail();

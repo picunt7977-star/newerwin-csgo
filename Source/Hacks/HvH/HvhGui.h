@@ -72,6 +72,8 @@ void drawAntiAimTab() noexcept;
 void drawWorldGroup() noexcept;
 void drawMovementTab() noexcept;
 void drawVisualsTab() noexcept;
+// «Мир»: пресеты, цвет стен/пропов/неба, скайбокс (поля SkyboxChanger Osiris), туман, подсветка, искры
+void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skyboxNames, int skyboxCount) noexcept;
 // флаги ESP, точка прицела, скелет при выстреле, Tab — во вкладке «Визуалы» рядом с визуалами Osiris
 void drawEspRageGroup(const ImVec2& size) noexcept;
 // флаги справа от ESP врага — и в HvH-визуалах, и во вкладке ESP игроков

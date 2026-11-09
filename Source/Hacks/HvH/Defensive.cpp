@@ -52,17 +52,29 @@ int shiftWindow = 0;        // тиков пачки ещё впереди (по
 bool confirmed = false;     // текущее окно подтверждено сервером, а не только предсказано
 
 // ---- замер отката ----
-// Откат виден только по m_nTickBase, который приходит в снапшоте, то есть с опозданием на пинг.
-// Поэтому после каждого рывка ждём дедлайн (пинг + запас) и берём пик отката за это время.
+// Откат виден по m_nTickBase, который приходит в снапшоте, то есть с опозданием на пинг.
+//
+// Первая версия привязывала замер к пачке: после каждой ставила дедлайн (пинг + запас) и брала
+// пик отката за это время. Это не работало совсем — проверено на логах 07.11: 279 пачек, 9
+// удачных замеров (3%), серии до 274 пустых подряд, и вердикт «сервер не откатывает» в 21:26:21
+// при том, что через минуту тот же сервер откатывал на 8 и 14 тиков.
+// Причина: пачки идут чаще, чем приходит ответ сервера (в режиме «чоком» — каждые 7-8 тиков,
+// а дедлайн это пинг + 6), и каждая новая пачка обнуляла `peak` и рестартовала дедлайн. Замер
+// почти никогда не доживал до конца, а три «пустых» подряд выключали модуль на 30 секунд.
+//
+// Теперь замер не привязан к пачке вовсе: следим за откатом непрерывно. Откат ≥ 2 тиков — это
+// эпизод, и его пик пишется в среднее, когда эпизод закончился. Сколько пачек его вызвало и
+// какой был пинг — не важно.
 float learned = 0.0f;
 int samples = 0;
-int peak = 0;
-int confirmWait = 0;
-int probesFailed = 0;
+int peak = 0;               // пик текущего эпизода отката
+bool inRollback = false;    // откат виден прямо сейчас
+int pulsesSinceRollback = 0;// пачек с последнего эпизода: много и ни одного — сервер не откатывает
 int pulses = 0;
 bool chokeActive = false;   // в этом тике дефенсив работает чоком, а не пропусками
 Verdict serverVerdict = Verdict::Unknown;
 float verdictAt = -1.0f;    // realtime, когда поставили вердикт «не откатывает» — перепроверим
+int foreignRollbacks = 0;   // откатов без нашей пачки (не окна) с прошлой строки лога
 
 // ---- наблюдение ----
 int sincePulse = 1000;      // тиков с последнего рывка
@@ -158,19 +170,6 @@ struct Sight {
     return sight;
 }
 
-// Сколько тиков ждать ответа сервера: пинг туда-обратно плюс запас на интерполяцию снапшота
-[[nodiscard]] int confirmDeadline(const EngineInterfaces& engineInterfaces, const Memory& memory) noexcept
-{
-    const auto channel = engineInterfaces.getEngine().getNetworkChannel();
-    float latency = 0.0f;
-    if (channel) {
-        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
-        latency = net.getLatency(0) + net.getLatency(1);
-    }
-    const float interval = memory.globalVars->intervalPerTick > 0.0f ? memory.globalVars->intervalPerTick : 1.0f / 64.0f;
-    return std::clamp(static_cast<int>(std::lround(latency / interval)) + 6, 8, 40);
-}
-
 // Длина отката, которую ждём от сервера. Пока замеров нет — верхняя оценка: больше, чем тиков в
 // пачке, сервер не откатит.
 [[nodiscard]] int expectedRollback(int shifted) noexcept
@@ -178,38 +177,27 @@ struct Sight {
     return samples > 0 ? std::clamp(static_cast<int>(std::lround(learned)), 1, 14) : shifted;
 }
 
-// Замер закончился: сервер откатывает или нет
-void closeProbe(float realtime) noexcept
+// Эпизод отката закончился: пишем его пик в среднее
+void closeRollback() noexcept
 {
-    char text[256];
-    if (peak >= 2) {
-        learned = samples == 0 ? static_cast<float>(peak) : learned + (static_cast<float>(peak) - learned) * 0.3f;
-        ++samples;
-        probesFailed = 0;
-        serverVerdict = Verdict::RollsBack;
-        std::snprintf(text, sizeof(text), "[дефенсив] рывок %d: сервер откатил %d тик., в среднем %.1f (замеров %d)",
-            pulses, peak, learned, samples);
-    } else {
-        ++probesFailed;
-        // окна после пачки не было — что бы мы ни предсказали, тики уже не защищены
-        left = 0;
-        confirmed = false;
-        if (samples == 0 && probesFailed >= 3) {
-            serverVerdict = Verdict::Ignores;
-            verdictAt = realtime;
-            std::snprintf(text, sizeof(text), "[дефенсив] сервер тикбейс не откатывает (3 рывка подряд пустых) — "
-                                              "работают только тики внутри пачки, заряд больше не жжём");
-        } else {
-            std::snprintf(text, sizeof(text), "[дефенсив] рывок %d: откат %d тик. — пусто (подряд пустых %d)",
-                pulses, peak, probesFailed);
-        }
+    if (peak < 2) {
+        peak = 0;
+        return;
     }
-    peak = 0;
+    learned = samples == 0 ? static_cast<float>(peak) : learned + (static_cast<float>(peak) - learned) * 0.3f;
+    ++samples;
+    char text[256];
+    std::snprintf(text, sizeof(text), "[дефенсив] откат %d тик. (в среднем %.1f, эпизодов %d, пачек с прошлого %d, чужих откатов %d)",
+        peak, learned, samples, pulsesSinceRollback, foreignRollbacks);
+    foreignRollbacks = 0;
     ragebot::logToFile(text);
+    peak = 0;
+    pulsesSinceRollback = 0;
 }
 
 // ---- стадия 2: окно ----
-void advanceWindow(const EngineInterfaces& engineInterfaces, const Memory& memory, float realtime) noexcept
+// rttTicks — пинг туда-обратно в тиках: столько ждём, пока откат от нашей пачки дойдёт снапшотом
+void advanceWindow(float realtime, int rttTicks) noexcept
 {
     // Пачка прошла — открываем окно по факту её длины, а не по догадке о том, сколько будет заряда
     if (const int shifted = tickbase::takeShiftPack(); shifted > 0) {
@@ -217,10 +205,12 @@ void advanceWindow(const EngineInterfaces& engineInterfaces, const Memory& memor
         left = after;
         // длину окна уже поставил первый тик пачки — тут только уточняем, если пачка вышла длиннее
         length = std::max(length, shifted + after);
-        confirmed = false;
-        peak = 0;
-        confirmWait = confirmDeadline(engineInterfaces, memory);
+        // Номер окна. В режиме «чоком» сюда приходят все пачки, и до этой правки счётчик не
+        // двигался вовсе: его крутил только блок isShifting(), а чоковая пачка — не сдвиг.
+        // Из-за этого рисунки скрытых углов, которые зависят от номера окна, стояли на месте.
+        counter = (counter + 1) & 0xFFFF;
         ++pulses;
+        ++pulsesSinceRollback;
         sincePulse = 0;
     }
 
@@ -229,32 +219,58 @@ void advanceWindow(const EngineInterfaces& engineInterfaces, const Memory& memor
     if (sincePulse < 1000)
         ++sincePulse;
 
-    const int deficit = tickbase::rawDeficit();
-    if (confirmWait > 0) {
-        --confirmWait;
+    // ---- замер: откат ловим непрерывно, а не по дедлайну от пачки ----
+    // Два тика и меньше — это обычный шум предсказания, а не откат.
+    //
+    // 09.11: откат, перед которым НЕ было нашей пачки/сдвига, — не окно. По логу 09.11 таких было
+    // 753 за 11 минут («пачек с прошлого 0» в каждой строке): поправки предсказания, коррекция часов
+    // сервера после фейклага 14. Их принимали за окно — AA показывал скрытые углы (рандом pitch/yaw)
+    // ~16% времени без всякой защиты, и сервер их записывал: 5 из 9 попаданий по нам 09.11 пришлись
+    // именно на «скрытые углы». Окно — только если наша пачка ушла не раньше, чем RTT + запас назад.
+    const int rawDeficit = tickbase::rawDeficit();
+    const bool ownCause = sincePulse <= rttTicks + 8;
+    if (rawDeficit >= 2 && !ownCause && !inRollback) {
+        static int lastForeign = 0;
+        if (rawDeficit != lastForeign)
+            ++foreignRollbacks;
+        lastForeign = rawDeficit;
+    }
+    const int deficit = ownCause || inRollback ? rawDeficit : 0;
+    if (deficit >= 2) {
+        // Окно открылось (или продлилось). Чей сдвиг его вызвал — наш рывок, наша чоковая пачка,
+        // телепорт автопика или вторая пуля DT — неважно: защита от него одна и та же.
+        if (!inRollback && left == 0)
+            counter = (counter + 1) & 0xFFFF;
+        inRollback = true;
         peak = std::max(peak, deficit);
-        if (deficit >= 2) {
-            confirmed = true;
-            // по факту окно может быть длиннее нашей оценки — верим серверу, а не себе
-            left = std::max(left, deficit);
-        }
-        if (confirmWait == 0)
-            closeProbe(realtime);
-    } else if (confirmed && deficit > 0) {
-        left = std::max(left, deficit);
-    } else if (serverVerdict == Verdict::RollsBack && deficit > 0 && left == 0) {
-        // Откат от чужого сдвига — телепорта автопика или второй пули DT. Окно от него такое же
-        // настоящее, как от нашего рывка, и заряда оно не стоит: берём даром.
-        left = deficit;
-        length = std::max(length, deficit);
         confirmed = true;
-        counter = (counter + 1) & 0xFFFF;
+        serverVerdict = Verdict::RollsBack;
+        verdictAt = -1.0f;
+        // по факту окно может быть длиннее нашей оценки — верим серверу, а не себе
+        left = std::max(left, deficit);
+        length = std::max(length, deficit);
+    } else {
+        if (inRollback) {
+            inRollback = false;
+            closeRollback();
+        }
+        if (left == 0)
+            confirmed = false;
+        // Сервер не откатывает вовсе: много пачек прошло, и ни одна не дала отката. Порог тут
+        // большой намеренно — раньше хватало трёх «пустых» замеров подряд, и модуль выключал себя
+        // на сервере, который на самом деле откатывал на 8-14 тиков (логи 07.11, 21:26).
+        if (serverVerdict == Verdict::Unknown && pulsesSinceRollback >= 40) {
+            serverVerdict = Verdict::Ignores;
+            verdictAt = realtime;
+            ragebot::logToFile("[дефенсив] сервер тикбейс не откатывает (40 пачек без отката) — "
+                               "работают только тики внутри пачки, заряд больше не жжём");
+        }
     }
 
     // Вердикт «не откатывает» снимаем через полминуты: карта могла смениться, cvar — тоже
     if (serverVerdict == Verdict::Ignores && verdictAt >= 0.0f && (realtime - verdictAt > 30.0f || realtime < verdictAt)) {
         serverVerdict = Verdict::Unknown;
-        probesFailed = 0;
+        pulsesSinceRollback = 0;
         verdictAt = -1.0f;
     }
 }
@@ -264,8 +280,9 @@ void reset() noexcept
     left = length = 0;
     shiftWindow = 0;
     confirmed = false;
-    confirmWait = 0;
+    inRollback = false;
     peak = 0;
+    pulsesSinceRollback = 0;
     sincePulse = 1000;
     lastShots = 0;
     shotHold = 0;
@@ -331,7 +348,13 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
     const int chargeTarget = std::clamp(cfg.chargeTicks, 4, 14);
 
     // ---- стадия 2: окно ----
-    advanceWindow(engineInterfaces, memory, realtime);
+    int rttTicks = 16;
+    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel()) {
+        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
+        const float rtt = net.getLatency(0) + net.getLatency(1);
+        rttTicks = std::clamp(static_cast<int>(std::ceil(rtt / memory.globalVars->intervalPerTick)), 2, 40);
+    }
+    advanceWindow(realtime, rttTicks);
 
     // Каким способом открываем окна. Дефенсивному режиму DT собственный заряд не нужен, так что
     // чоку он не мешает.
@@ -365,9 +388,13 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
 
     const bool keyDown = cfg.key.isSet() && cfg.key.isDown();
 
-    trigger = ((cfg.triggers & DefPeek) && (sight.peeking || sight.justSeen))
-        || ((cfg.triggers & DefVisible) && sight.sees)
-        || ((cfg.triggers & DefNear) && sight.nearest < 1200.0f)
+    // Рейдж держит цель и оружие готово — пик/видимость/близость окна не открывают: чок задержал бы
+    // выстрел в пачке (сервер получает его позже, враг успевает убить первым), а рывок откатил бы наш
+    // тикбейс прямо перед выстрелом. Окно — только сразу после выстрела, пока оружие перезаряжается.
+    const bool aiming = ragebot::aimingNow() && !justShot && shotHold == 0;
+    trigger = (!aiming && (cfg.triggers & DefPeek) && (sight.peeking || sight.justSeen))
+        || (!aiming && (cfg.triggers & DefVisible) && sight.sees)
+        || (!aiming && (cfg.triggers & DefNear) && sight.nearest < 1200.0f)
         || ((cfg.triggers & DefKey) && keyDown)
         || ((cfg.triggers & DefShot) && shotHold > 0);
 
@@ -418,9 +445,14 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
 
     // ---- строка для меню ----
     const bool choking = chokeStyle;
-    if (left > 0 || shiftWindow > 0)
-        std::snprintf(status, sizeof(status), confirmed ? "Окно: %d тик. (сервер подтвердил)" : "Окно: %d тик. (ждём подтверждения)",
+    if (windowLeft() > 0)
+        std::snprintf(status, sizeof(status), confirmed ? "Окно: %d тик. (сервер подтвердил откат)" : "Окно: %d тик.",
             windowLeft());
+    else if (left > 0 || shiftWindow > 0)
+        // пачка прошла, окно предсказано, но сервер ещё ни разу не показал отката — скрытые углы
+        // в такое окно не идут: за ними не было бы защиты
+        std::snprintf(status, sizeof(status), "Пачка прошла, отката от сервера ещё не видели (пачек %d)",
+            pulsesSinceRollback);
     else if (serverVerdict == Verdict::Ignores)
         setStatus("Сервер тикбейс не откатывает: скрытые углы отключены, перепроверим через 30 с");
     else if (!ownWindows)

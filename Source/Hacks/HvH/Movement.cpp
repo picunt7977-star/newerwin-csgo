@@ -159,14 +159,22 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
 {
     static int badSends = 0;
     static float cycleLow = 1.0f;
+    static int prevChoked = -1;     // чок на прошлом тике: по нему видно, полной ли пачкой ушёл пакет
 
     const auto& key = config.movement.fakeDuckKey;
+    const bool was = fakeDucking;
     fakeDucking = key.isSet() && key.isDown() && tickbase::isInstalled()
         && localPlayer && localPlayer.get().isAlive() && localPlayer.get().isOnGround();
+    // Урезанный чок раньше жил до перезапуска игры: каждый ранний пакет (выстрел, DT) считался
+    // «сервер выкинул присед», лимит падал 14 → 13 → ... → 4 и не возвращался — модель на сервере
+    // переставала садиться вовсе. Каждое нажатие ФД начинаем с полного чока.
+    if (fakeDucking && !was)
+        tickbase::setFakeDuckChoke(14);
     tickbase::setFakeDuck(fakeDucking);
     if (!fakeDucking) {
         badSends = 0;
         cycleLow = 1.0f;
+        prevChoked = -1;
         fdSentDuck = fdLowDuck = -1.0f;
         return;
     }
@@ -184,11 +192,16 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
     if (!duckAmountOffset)
         return;
     const float amount = std::clamp(*reinterpret_cast<const float*>(std::uintptr_t(localPlayer.get().getPOD()) + duckAmountOffset), 0.0f, 1.0f);
+    // ушедшая пачка была полной — только тогда её присед что-то говорит о сервере
+    const bool fullPack = prevChoked + 1 >= limit;
+    prevChoked = choked;
     if (choked == 0) {
         fdSentDuck = amount;
         fdLowDuck = cycleLow;
         cycleLow = 1.0f;
-        if (amount < 0.5f) {
+        if (!fullPack) {
+            // пакет ушёл раньше (первый цикл после нажатия, сдвиг) — не улика
+        } else if (amount < 0.5f) {
             if (++badSends >= 2) {
                 tickbase::setFakeDuckChoke(limit - 1);
                 badSends = 0;

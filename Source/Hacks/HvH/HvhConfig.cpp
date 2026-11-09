@@ -134,6 +134,7 @@ json toJson() noexcept
     r["Resolver safe when unsure"] = rage.resolverSafeWhenUnsure;
     r["Resolver steps"] = rage.resolverSteps;
     r["Safe point"] = rage.safePoint;
+    r["Strict shots"] = rage.strictShots;
     r["Knife bot"] = rage.knifeBot;
     r["Knife bot mode"] = rage.knifeBotMode;
     r["Zeus bot"] = rage.zeusBot;
@@ -258,6 +259,30 @@ json toJson() noexcept
     j["View"]["Kill flash"] = config.view.killFlash;
     j["View"]["Grenade timers"] = config.view.grenadeTimers;
     j["View"]["Shot capsules"] = config.view.shotCapsules;
+    j["View"]["Impact sparks"] = config.view.impactSparks;
+    j["View"]["Spark color"] = { config.view.sparkColor[0], config.view.sparkColor[1], config.view.sparkColor[2], config.view.sparkColor[3] };
+    j["View"]["Spark count"] = config.view.sparkCount;
+    j["View"]["Spark size"] = config.view.sparkSize;
+
+    {
+        const auto& w = config.world;
+        auto& o = j["World"];
+        const auto rgb = [](const float* c) { return json::array({ c[0], c[1], c[2] }); };
+        o["Enabled"] = w.enabled;
+        o["Preset"] = w.preset;
+        o["Wall color"] = rgb(w.wallColor);
+        o["Prop color"] = rgb(w.propColor);
+        o["Prop alpha"] = w.propAlpha;
+        o["Sky color on"] = w.skyColorOn;
+        o["Sky color"] = rgb(w.skyColor);
+        o["Fog"] = w.fog;
+        o["Fog color"] = rgb(w.fogColor);
+        o["Fog start"] = w.fogStart;
+        o["Fog end"] = w.fogEnd;
+        o["Fog density"] = w.fogDensity;
+        o["Ambient"] = w.ambient;
+        o["Ambient color"] = rgb(w.ambientColor);
+    }
 
     auto& m = j["Movement"];
     writeKey(m, "Auto peek key", config.movement.autoPeekKey);
@@ -265,6 +290,7 @@ json toJson() noexcept
     m["Auto peek teleport ticks"] = config.movement.peekTeleportTicks;
     writeKey(m, "Fake duck key", config.movement.fakeDuckKey);
     m["Fast ladder"] = config.movement.fastLadder;
+    m["Super toss"] = config.movement.superToss;
     m["No fall damage"] = config.movement.noFallDamage;
     m["AI peek"] = config.movement.aiPeek;
     m["AI peek quality"] = config.movement.aiPeekQuality;
@@ -337,6 +363,7 @@ void fromJson(const json& j) noexcept
         read(r, "Resolver safe when unsure", rage.resolverSafeWhenUnsure);
         read(r, "Resolver steps", rage.resolverSteps);
         read(r, "Safe point", rage.safePoint);
+        read(r, "Strict shots", rage.strictShots);
         read(r, "Knife bot", rage.knifeBot);
         read(r, "Knife bot mode", rage.knifeBotMode);
         read(r, "Zeus bot", rage.zeusBot);
@@ -516,6 +543,46 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Kill flash", config.view.killFlash);
         read(j["View"], "Grenade timers", config.view.grenadeTimers);
         read(j["View"], "Shot capsules", config.view.shotCapsules);
+        read(j["View"], "Impact sparks", config.view.impactSparks);
+        if (const auto& color = j["View"]["Spark color"]; color.is_array() && color.size() == 4) {
+            for (std::size_t i = 0; i < 4; ++i) {
+                if (color[i].is_number())
+                    config.view.sparkColor[i] = std::clamp(color[i].get<float>(), 0.0f, 1.0f);
+            }
+        }
+        read(j["View"], "Spark count", config.view.sparkCount);
+        config.view.sparkCount = std::clamp(config.view.sparkCount, 4, 60);
+        read(j["View"], "Spark size", config.view.sparkSize);
+        config.view.sparkSize = std::clamp(config.view.sparkSize, 0.3f, 3.0f);
+    }
+
+    if (j.contains("World") && j["World"].is_object()) {
+        auto& w = config.world;
+        const auto& o = j["World"];
+        const auto rgb = [&o](const char* name, float* c) {
+            if (const auto it = o.find(name); it != o.end() && it->is_array() && it->size() == 3) {
+                for (std::size_t i = 0; i < 3; ++i) {
+                    if ((*it)[i].is_number())
+                        c[i] = std::clamp((*it)[i].get<float>(), 0.0f, 1.0f);
+                }
+            }
+        };
+        read(o, "Enabled", w.enabled);
+        read(o, "Preset", w.preset);
+        rgb("Wall color", w.wallColor);
+        rgb("Prop color", w.propColor);
+        read(o, "Prop alpha", w.propAlpha);
+        w.propAlpha = std::clamp(w.propAlpha, 0.1f, 1.0f);
+        read(o, "Sky color on", w.skyColorOn);
+        rgb("Sky color", w.skyColor);
+        read(o, "Fog", w.fog);
+        rgb("Fog color", w.fogColor);
+        read(o, "Fog start", w.fogStart);
+        read(o, "Fog end", w.fogEnd);
+        read(o, "Fog density", w.fogDensity);
+        w.fogDensity = std::clamp(w.fogDensity, 0.0f, 1.0f);
+        read(o, "Ambient", w.ambient);
+        rgb("Ambient color", w.ambientColor);
     }
 
     if (j.contains("Movement") && j["Movement"].is_object()) {
@@ -530,6 +597,7 @@ void fromJson(const json& j) noexcept
         read(m, "Auto peek teleport ticks", config.movement.peekTeleportTicks);
         read(m, "Fake duck key", config.movement.fakeDuckKey);
         read(m, "Fast ladder", config.movement.fastLadder);
+        read(m, "Super toss", config.movement.superToss);
         read(m, "No fall damage", config.movement.noFallDamage);
         read(m, "AI peek", config.movement.aiPeek);
         read(m, "AI peek quality", config.movement.aiPeekQuality);

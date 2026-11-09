@@ -101,6 +101,9 @@ public:
         configurator("Bullet Tracers", bulletTracers);
     }
 
+    // для вкладки «Мир» в HvH-меню
+    [[nodiscard]] SkyboxChanger& skyboxSettings() noexcept { return skyboxChanger; }
+
 private:
     const Memory& memory;
     OtherInterfaces interfaces;

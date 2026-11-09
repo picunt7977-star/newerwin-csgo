@@ -112,6 +112,7 @@ struct SnapRuntime {
     int ticks = 0;              // тиков в текущем окне
     int apex = 0;               // длина окна на входе
     int counter = 0;            // номер окна
+    int seenCounter = -1;       // номер окна, который мы уже обслуживаем (для сброса на новом)
     int delayed = 0;
     bool jitter = false;
     bool haveRandomPitch = false, haveRandomYaw = false;
@@ -958,6 +959,16 @@ constexpr float desyncMargin = 12.0f;
     }
 
     const int lcLeft = defensive::windowLeft();
+    // Новое окно — новый отсчёт «длительности». Без этого счётчик тиков жил через границу окон:
+    // когда окна идут вплотную (а с дефенсивом «чоком» это норма), он перешагивал «Длительность»
+    // и скрытые углы отключались до первого тика без окна. Со стороны — «иногда не работает».
+    if (const int windowId = defensive::windowCounter(); windowId != snap.seenCounter) {
+        snap.seenCounter = windowId;
+        snap.ticks = 0;
+        snap.apex = 0;
+        snap.delayed = 0;
+        snap.haveRandomPitch = snap.haveRandomYaw = false;
+    }
     const DefensiveSnap* chosen = activeSnap(selectSnapState(f.cmd, plan.freestandRaw.has_value()));
     bool inWindow = chosen && lcLeft > 0;
     if (inWindow) {

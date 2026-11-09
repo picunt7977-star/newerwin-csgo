@@ -174,6 +174,8 @@ void Visuals::colorWorld() noexcept
 {
     if (!visualsConfig.world.enabled && !visualsConfig.sky.enabled)
         return;
+    if (hvh::config.world.enabled)   // мир красит HvH-модуль «Вид мира» — не спорим с ним каждый кадр
+        return;
 
     for (short h = interfaces.getMaterialSystem().firstMaterial(); h != interfaces.getMaterialSystem().invalidMaterial(); h = interfaces.getMaterialSystem().nextMaterial(h)) {
         const auto mat = csgo::Material::from(retSpoofGadgets->client, interfaces.getMaterialSystem().getMaterial(h));
@@ -576,10 +578,12 @@ void Visuals::updateEventListeners(bool forceRemove) noexcept
     static DefaultEventListener listener;
     static bool listenerRegistered = false;
 
-    if (bulletTracers.enabled && !listenerRegistered) {
+    // bullet_impact нужен и трассерам Osiris, и искрам HvH-визуалов
+    const bool wanted = bulletTracers.enabled || hvh::config.view.impactSparks;
+    if (wanted && !forceRemove && !listenerRegistered) {
         engineInterfaces.getGameEventManager(memory.getEventDescriptor).addListener(&listener, csgo::bullet_impact);
         listenerRegistered = true;
-    } else if ((!bulletTracers.enabled || forceRemove) && listenerRegistered) {
+    } else if ((!wanted || forceRemove) && listenerRegistered) {
         engineInterfaces.getGameEventManager(memory.getEventDescriptor).removeListener(&listener);
         listenerRegistered = false;
     }

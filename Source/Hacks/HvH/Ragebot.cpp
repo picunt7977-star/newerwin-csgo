@@ -24,6 +24,7 @@
 #include "Resolver.h"
 #include "Defensive.h"
 #include "Tickbase.h"
+#include "Movement.h"
 #include "RadarSpotted.h"
 
 #include <Helpers.h>
@@ -86,6 +87,8 @@ bool minDamageOverride = false;
 bool forceBody = false;
 bool forceShot = false;
 int target = 0;
+bool fireReadyNow = false;      // оружие готово к выстрелу сейчас или в ближайшие тики (последний тик рейджа)
+int fireReadyTick = -1000;
 const char* statusText = "";
 float localDiedAt = -1.0f;
 const Memory* memoryPtr = nullptr;
@@ -212,7 +215,7 @@ struct Brain {
     std::uint8_t guessRight = 0, guessWrong = 0;   // фристенд-догадка против доказанной стороны (его антиаим бывает наоборот)
     float layerFoundAt = -1.0f;     // simtime последней учтённой находки по слоям
     int misses = 0;                 // подряд, сбрасывается попаданием
-    float aheadBias = 0.0f;         // своя поправка прогноза «вперёд» (у каждого чита свой рисунок чока)
+    float aheadBias = -0.3f;        // своя поправка прогноза «вперёд», в долях обновления (у каждого чита свой рисунок чока)
     int aheadChecks = 0;
     std::uint8_t headShots = 0, headHits = 0, bodyShots = 0, bodyHits = 0;
     // Сторона ног по слоям на каждом обновлении (бит 1 — «+»). Джиттер десинка взгляд не трогает —
@@ -711,7 +714,9 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
 
 // Окно отката сервера: цель не дальше 0.2 с от «правильного» времени и не старше sv_maxunlag
 // (serverTime — наш тикбейс, то есть время выполнения команды на сервере)
-[[nodiscard]] bool recordValid(float simulationTime, float serverTime, float latencyIn, float lerp, float maxUnlag, float interval) noexcept
+// margin — запас у края sv_maxunlag: логи 04–09.11, бектрек 12+ тиков — 4/13 (30%) против 84–100% у 9–11:
+// пока выстрел едет (чок + пинг), сервер успевает выкинуть запись с края окна
+[[nodiscard]] bool recordValid(float simulationTime, float serverTime, float latencyIn, float lerp, float maxUnlag, float interval, float margin = 0.0f) noexcept
 {
     // сервер берёт lerp в целых тиках
     const float lerpTicks = std::floor(0.5f + lerp / interval) * interval;
@@ -720,7 +725,7 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
     // он сочтёт невалидной и откатит врага в другое время
     if (std::abs(correct - (serverTime - simulationTime)) >= 0.19f)
         return false;
-    return simulationTime >= serverTime - maxUnlag;
+    return simulationTime >= serverTime - maxUnlag + margin;
 }
 
 // ---------- прогноз для врагов вне окна отката ----------
@@ -729,7 +734,9 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
 // к нему, пока летит наш выстрел. Движение — по самим записям (смещение, поворот дугой, гравитация, земля).
 // Сервер чаще берёт на обновление меньше расчёта: ставим модель между N−1 и N, «устойчивые» точки — по обеим.
 
-float aheadBias = 0.0f;   // общая поправка числа обновлений по проверкам промахов — пока своей у игрока мало
+// Общая поправка (в долях обновления) по проверкам промахов — пока своей у игрока мало. Старт −0.3:
+// логи 04–09.11 — сервер брал меньше обновлений 21 раз, больше — 10
+float aheadBias = -0.3f;
 
 [[nodiscard]] int typicalChoke(const PlayerRecords& list) noexcept
 {
@@ -744,7 +751,10 @@ float aheadBias = 0.0f;   // общая поправка числа обновл
 }
 
 // step — полшага (половина смещения за обновление): модели N−1 и N = out ∓ step
-int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, float latency, float interval, float gravity, float bias, csgo::Vector& step) noexcept
+// phaseOut — где внутри периода пакетов врага окажется наш выстрел на сервере (0..1, −1 — враг молчит);
+// riskOut — фаза у границы: сервер может взять и N−1, и N, ±1 обновление — монетка
+int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, float latency, float interval, float gravity, float bias, csgo::Vector& step,
+                 float* phaseOut = nullptr, bool* riskOut = nullptr) noexcept
 {
     const auto& newest = list.at(0);
     const int choke = typicalChoke(list);
@@ -752,9 +762,42 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
     // дольше обычного молчит — не шлёт (зарядка DT) или simtime ушёл назад (дефенсив, запись не принята):
     // у сервера ровно наша запись. Запас на дрожание сети: не меньше периода + 30 мс
     const float silence = realtime - newest.receivedAt;
-    const float elapsed = std::clamp(silence + latency, 0.0f, 0.5f);
-    const int updates = silence > std::max(updateTime * 1.5f, updateTime + 0.03f)
-        ? 0 : std::max(static_cast<int>(elapsed / updateTime) + static_cast<int>(std::lround(bias)), 0);
+    // Сколько пакетов врага сервер успеет обработать, пока до него едет наш выстрел. Раньше — floor от
+    // (тишина + пинг) / период по одной свежей записи: её время прихода дрожит на тик и больше, а выстрел,
+    // пришедший на границу пакета, — монетка между N−1 и N. Логи 04–09.11: из 89 промахов прогноза
+    // 31 — «сервер взял ±N обн.», 24 — «позиция верна, сервер был между обновлениями».
+    // Теперь сетка прихода пакетов — по медиане остатков времён прихода нескольких записей по модулю
+    // периода, а близость к границе отдаётся наружу: там рейдж ждёт середину периода.
+    float anchor = newest.receivedAt;
+    float jitter = interval;
+    {
+        std::array<float, 6> residual{};
+        const int n = std::min(list.count, static_cast<int>(residual.size()));
+        for (int age = 0; age < n; ++age)
+            residual[age] = std::remainder(list.at(age).receivedAt - newest.receivedAt, updateTime);
+        if (n >= 3) {
+            auto sorted = residual;
+            std::sort(sorted.begin(), sorted.begin() + n);
+            const float median = sorted[n / 2];
+            anchor += median;
+            float spread = 0.0f;
+            for (int k = 0; k < n; ++k)
+                spread += std::abs(std::remainder(residual[k] - median, updateTime));
+            jitter = spread / static_cast<float>(n) + interval * 0.5f;
+        }
+    }
+    const bool silent = silence > std::max(updateTime * 1.5f, updateTime + 0.03f);
+    // поправка — сдвиг фазы в долях обновления, а не целое число обновлений (раньше lround: 0.34 = 0)
+    const float grid = std::clamp(realtime - anchor + latency, 0.0f, 0.5f) / updateTime + bias;
+    const int updates = silent ? 0 : std::max(static_cast<int>(std::floor(grid)), 0);
+    const float phase = silent ? -1.0f : grid - std::floor(grid);
+    const float margin = std::clamp((jitter + interval) / updateTime, 0.1f, 0.45f);
+    // период в тик — граница ничего не стоит (сдвиг за обновление крошечный)
+    const bool risky = !silent && updateTime > interval * 1.5f && (phase < margin || phase > 1.0f - margin);
+    if (phaseOut)
+        *phaseOut = phase;
+    if (riskOut)
+        *riskOut = risky;
     const int ticks = std::min(updates * choke, static_cast<int>(0.3f / interval));
 
     // время между записями: у дефенсива simtime почти стоит, а враг идёт по настоящему времени —
@@ -815,7 +858,11 @@ int predictAhead(const PlayerRecords& list, LagRecord& out, float realtime, floa
 
     step = csgo::Vector{};
     const csgo::Vector full{ velocity.x * updateTime, velocity.y * updateTime, onGround ? 0.0f : velocity.z * updateTime };
-    if (updates > 0) {
+    if (updates > 0 && !risky) {
+        // фаза в середине периода: сервер возьмёт ровно N-е обновление — модель на N, «устойчивые»
+        // точки проверяем с допуском в четверть шага (дрожание сети)
+        step = full * 0.25f;
+    } else if (updates > 0) {
         step = full * 0.5f;
         position -= step;
     } else {
@@ -1232,6 +1279,7 @@ struct ShotRecord {
     RecordKind kind = RecordKind::Live;
     int backtrackTicks = 0;
     int updatesAhead = 0;
+    float aheadPhase = -1.0f;       // фаза выстрела внутри периода пакетов врага (прогноз)
     float predictedSimulationTime = 0.0f;
     csgo::Vector predictedOrigin{}; // где стояла модель, по которой стреляли
     bool jitter = false;            // враг джиттерил: сервер мог взять другую фазу позы
@@ -1310,7 +1358,9 @@ void scoreGuess(Brain& brain, float guess, float truth) noexcept
         length += std::snprintf(text + length, sizeof(text) - length, " [безопасная]");
     if (length > 0 && length < static_cast<int>(sizeof(text))) {
         if (shot.kind == RecordKind::Ahead || shot.kind == RecordKind::Extrapolated)
-            length += std::snprintf(text + length, sizeof(text) - length, " +%d обн.", shot.updatesAhead);
+            length += shot.aheadPhase >= 0.0f
+                ? std::snprintf(text + length, sizeof(text) - length, " +%d обн. (фаза %.2f)", shot.updatesAhead, shot.aheadPhase)
+                : std::snprintf(text + length, sizeof(text) - length, " +%d обн.", shot.updatesAhead);
         else if (shot.backtrackTicks > 0)
             length += std::snprintf(text + length, sizeof(text) - length, " бт %dт", shot.backtrackTicks);
     }
@@ -1486,6 +1536,7 @@ struct Target {
     AimPoint point;
     AimPoint fallback;          // вторая группа (тело вместо головы и наоборот) — если по первой нет хитшанса
     float score = -1.0f;
+    float reliability = 1.0f;   // оценка шанса, что модель верна (без хитшанса разброса)
     float fov = 0.0f;
     int minDamage = 0;
     RecordKind kind = RecordKind::Live;
@@ -1493,6 +1544,7 @@ struct Target {
     csgo::Vector origin{};
     int backtrackTicks = 0;
     int updatesAhead = 0;
+    float aheadPhase = -1.0f;
     int choke = 1;
     float side = 0.0f;
     SideSource source = SideSource::None;
@@ -1538,6 +1590,12 @@ bool minDamageOverrideActive() noexcept { return minDamageOverride; }
 bool forceBodyActive() noexcept { return forceBody; }
 bool forceShotActive() noexcept { return forceShot; }
 int currentTarget() noexcept { return target; }
+bool aimingNow() noexcept
+{
+    // рейдж не запускался пару тиков (нож, граната, мёртв) — считаем, что не целимся
+    const int now = memoryPtr ? memoryPtr->globalVars->tickCount : 0;
+    return target != 0 && fireReadyNow && now - fireReadyTick <= 2;
+}
 const char* status() noexcept { return statusText; }
 
 float resolverOffsetFor(int index) noexcept
@@ -2101,6 +2159,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         : ticksToStop(localPlayer.get().velocity().length2D(), autoStopTarget(stopMode, stopMaxSpeed), stopMaxSpeed, moveVars, interval);
     const float readyIn = std::max({ localPlayer.get().nextAttack(), weapon.nextPrimaryAttack(), revolverReadyAt }) - serverTime;
     const bool readySoon = readyIn <= interval * static_cast<float>(std::max(stopTicks, 1));
+    fireReadyNow = canShoot || readyIn <= interval * static_cast<float>(std::max(stopTicks, 4));
+    fireReadyTick = memory.globalVars->tickCount;
 
     // Между выстрелами полный поиск не нужен (автоволл — самое дорогое): только ради раннего стопа/скопа
     // или отрисовки точек — дешёвый (одна запись), для отрисовки раз в 4 тика
@@ -2123,7 +2183,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const bool doubleTapKill = doubleTapReady && weaponData->cycletime <= 0.4f;
     // команда этого тика чокается — уйдёт со следующим пакетом (выстрел его форсирует), на тик позже;
     // с DT сдвиг уходит тем же пакетом, что и выстрел
-    const float sendDelay = tickbase::isInstalled() && !tickbase::sendPacket() && !doubleTapReady ? interval : 0.0f;
+    float sendDelay = tickbase::isInstalled() && !tickbase::sendPacket() && !doubleTapReady ? interval : 0.0f;
+    // Фейкдак: выстрел едет в чоке до конца цикла — сервер получит его через (лимит − чок) тиков
+    if (movement::isFakeDucking())
+        sendDelay = interval * static_cast<float>(std::max(tickbase::fakeDuckChoke() - tickbase::chokedCommands(), 1));
     statusText = "нет целей";
 
     float latencyOut = 0.0f, latencyIn = 0.0f;
@@ -2182,10 +2245,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         std::array<Candidate, 4> candidates{};
         int candidateCount = 0;
         csgo::Vector aheadStep{};
+        float aheadPhase = -1.0f;
+        bool aheadRisk = false;
 
         if (list.count && list.at(0).breakingLagComp) {
             // ломает лагкомп: сервер стреляет по текущей позиции — только прогноз
-            const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep);
+            const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep, &aheadPhase, &aheadRisk);
             candidates[candidateCount++] = { &predicted, RecordKind::Extrapolated, 0, updates };
         } else {
             int onshot = -1, standing = -1, newest = -1, oldest = -1;
@@ -2195,7 +2260,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 // всё, что старше разрыва, недостижимо — выстрел уйдёт по текущей позиции
                 if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
                     break;
-                if (record.animStale || !recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval))
+                if (record.animStale || !recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval, sendDelay + 2.0f * interval))
                     continue;
                 if (newest < 0)
                     newest = age;
@@ -2222,7 +2287,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 add(oldest, RecordKind::Oldest);
 
             if (candidateCount == 0 && list.count) {
-                const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep);
+                const int updates = predictAhead(list, predicted, realtime, latencyOut + latencyIn + sendDelay, interval, gravity, brain.aheadChecks >= 2 ? brain.aheadBias : aheadBias, aheadStep, &aheadPhase, &aheadRisk);
                 candidates[candidateCount++] = { &predicted, RecordKind::Ahead, 0, updates };
             }
             if (candidateCount == 0) {
@@ -2357,6 +2422,22 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             //  * край капсулы ×0.9, сквозь стену ×0.85.
             // Выбор — по пользе: убить сейчас (1.5) > убить двумя пулями DT (1.1) > урон (урон/хп), всё × надёжность.
             const bool checkSafe = !cheap && resolve;
+            // Строгий отбор (логи 04–09.11, 412 выстрелов по живым): прогноз в воздухе 21%, прогноз по
+            // джиттеру/флипам 32–41%, небезопасные точки 20–43%, голова в прыжке/на джиттере ~30%.
+            // Отброшенное попадало в 36%, оставшееся — в 65%. Лучше подождать тик-другой настоящую запись.
+            // Перебор и «не десинкает» не трогаем — там сторона известна (7/7, 3/6).
+            const bool strict = rage.strictShots && checkSafe && source != SideSource::NoDesync && source != SideSource::Brute;
+            if (strict && predictedRecord && (airborne || jittering(brain) || desyncFlipping(brain))) {
+                statusText = "строгий: ждём настоящую запись";
+                continue;
+            }
+            // Выстрел придёт к серверу на границе пакета врага — сервер возьмёт N−1 или N наугад. Если за
+            // обновление враг сдвигается заметно (> 4 ед.), ждём середину периода: это не дольше полупериода
+            // (при чоке 14 — до ~100 мс), а попадание перестаёт быть монеткой.
+            if (predictedRecord && aheadRisk && !cheap && aheadStep.length() * 2.0f > 4.0f) {
+                statusText = "прогноз: ждём середину обновления";
+                continue;
+            }
             static Capsules centerCaps;
             if (checkSafe) {
                 buildCapsules(*set, record.bones, centerCaps);
@@ -2437,11 +2518,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 AimPoint point;
                 float score = -1.0f;
                 bool safe = false;
+                float reliability = 1.0f;
             };
             Scored head, body, any;
-            const auto offer = [](Scored& slot, const AimPoint& point, float score, bool safe) {
+            const auto offer = [](Scored& slot, const AimPoint& point, float score, bool safe, float reliability) {
                 if (score > slot.score)
-                    slot = { point, score, safe };
+                    slot = { point, score, safe, reliability };
             };
             viewPointCount = 0;
 
@@ -2462,10 +2544,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 const float shrink = (brain.misses >= 2 ? 0.4f : brain.misses == 1 ? 0.7f : 1.0f) * (predictedRecord ? 0.75f : 1.0f);
                 const float maxScale = (isHead ? settings.headScale : settings.bodyScale) * sideScale;
                 float trust = 1.0f;
+                // логи 04–08.11 по «вперёд»: голова 30%, тело 43% (на настоящих записях 65–90%)
                 if (predictedRecord)
-                    trust *= isHead ? 0.6f : 0.7f;
-                // прогноз в воздухе: стрейф меняет курс между обновлениями (сессия 01:09 — 3 промаха подряд по прыгающему)
+                    trust *= isHead ? 0.5f : 0.7f;
+                // прогноз в воздухе: стрейф меняет курс между обновлениями — 12 из 55 (22%)
                 if (predictedRecord && airborne)
+                    trust *= 0.5f;
+                // прогноз по джиттерящему/перекидывающему десинк: 20 из 64 (31%)
+                if (predictedRecord && (jittering(brain) || desyncFlipping(brain)))
                     trust *= 0.75f;
                 if (isHead && headBanned)
                     trust *= 0.35f;
@@ -2566,7 +2652,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                         if (p > 0 && pointBudget-- <= 0)
                             break;
                         const bool safe = isSafe(points[p], isHead);
-                        if (safeRequired && checkSafe && !safe)
+                        if ((safeRequired || strict) && checkSafe && !safe)
+                            continue;
+                        // голова у прыгающего/джиттерящего — мимо даже по общей точке (31% и 29%)
+                        if (strict && isHead && (source == SideSource::Air || source == SideSource::Jitter))
                             continue;
                         const bool sideSafe = !safe && isSideSafe(points[p], isHead);
                         // Край головы — только если он общий для всех трёх скелетов. Логи 31.10–01.11: край головы
@@ -2599,8 +2688,13 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             const float blur = (points[p] - eye).length() * cone + 0.001f;
                             damage *= static_cast<float>(weaponData->bullets) * std::clamp(8.0f * 8.0f / (blur * blur), 0.1f, 1.0f);
                         }
-                        const bool lethal = damage >= hp;
-                        const bool qualified = damage >= static_cast<float>(minDamage);
+                        // Сквозь стену автоволл переоценивает пробитие («пуля застряла» — 23 промаха с уроном
+                        // от 8 до 191). В строгом режиме урон через стену засчитываем с запасом 20%.
+                        const float openDamageHere = static_cast<float>(weaponData->damage) * std::pow(weaponData->rangeModifier, (points[p] - eye).length() / 500.0f);
+                        const bool throughWall = baseDamage < openDamageHere * 0.97f;
+                        const float countedDamage = strict && throughWall ? damage * 0.8f : damage;
+                        const bool lethal = countedDamage >= hp;
+                        const bool qualified = countedDamage >= static_cast<float>(minDamage);
                         // конечность — если набирает мин. урон (раньше только наповал: торчащую руку игнорили)
                         if (isLimb && !lethal && !qualified)
                             continue;
@@ -2617,6 +2711,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             reliability *= 0.7f;
                         if (headUnsafe)
                             reliability *= 0.8f;
+                        // Логи 04–08.11 по настоящим записям: голова по догадке 42% против 82% у тела,
+                        // небезопасная голова в воздухе 1 из 5, по джиттеру 0 из 3 — при сомнительной стороне тело
+                        if (isHead && source == SideSource::Guess)
+                            reliability *= 0.65f;
+                        if (isHead && !safe && (source == SideSource::Air || source == SideSource::Jitter))
+                            reliability *= 0.55f;
                         if (headEdgeUnsafe)
                             reliability *= 0.8f;
                         // Прогноз: точка, не попадающая в обе соседние модели (N−1 и N) — скидка. Раньше голову
@@ -2637,9 +2737,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                         const float value = lethal ? 1.5f : doubleTapKill && damage * 2.0f >= hp ? 1.1f : damage / hp;
                         const float score = value * reliability;
                         const AimPoint point{ points[p], damage, baseDamage, isHead, p > 0, group, sideSafe, safe && checkSafe };
-                        offer(any, point, score, safe);
+                        offer(any, point, score, safe, reliability);
                         if (qualified)
-                            offer(isHead ? head : body, point, score, safe);
+                            offer(isHead ? head : body, point, score, safe, reliability);
                         // центр уже убивает надёжно — края хуже по хитшансу, автоволл на них не тратим
                         if (p == 0 && lethal && reliability >= trust * 0.99f && !viewOnly)
                             break;
@@ -2683,6 +2783,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.point = chosen.point;
                 t.fallback = other.score >= 0.0f ? other.point : AimPoint{};
                 t.score = chosen.score;
+                t.reliability = chosen.reliability;
                 t.fov = fov;
                 t.minDamage = effectiveMinDamage;
                 t.kind = candidates[c].kind;
@@ -2690,6 +2791,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.origin = record.origin;
                 t.backtrackTicks = list.count && candidates[c].age > 0 ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
                 t.updatesAhead = candidates[c].updatesAhead;
+                t.aheadPhase = predictedRecord ? aheadPhase : -1.0f;
                 t.choke = record.choked;
                 t.side = side;
                 t.source = source;
@@ -2820,16 +2922,37 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         chance = hitchance(weapon, weaponData, entity, eye, angle, capsules, t.point.baseDamage, t.minDamage);
         if (firstChance < 0)
             firstChance = chance;
-        if (chance < settings.hitchance && t.fallback.damage > 0.0f) {
+        // Прогнозная запись («вперёд», экстраполяция) — отдельный разговор. Хитшанс считает только
+        // разброс по сидам и ничего не знает о том, что сама запись может быть выдумана неверно, а
+        // статистика по ней плохая: за 07.11 по прогнозу 18 попаданий на 47 промахов (28%), по
+        // реальным записям — 216 на 59 (79%). Это почти половина всех промахов сессии.
+        // Поэтому планку для прогноза поднимаем: пусть лучше рейдж промолчит и дождётся записи.
+        const bool predictedShot = t.kind == RecordKind::Ahead || t.kind == RecordKind::Extrapolated;
+        const int needChance = predictedShot ? std::min(settings.hitchance + 25, 95) : settings.hitchance;
+        // Хитшанс по прогнозу почти всегда 100% — мажет сама модель. Порог надёжности: медленному оружию
+        // (скаут, AWP, дигл/R8 — промах стоит секунду, за которую убивают нас) по плохому прогнозу не
+        // стрелять, ждать настоящую запись; автоматам промах дешевле — порог ниже. Наповал по надёжной
+        // точке проходит всегда (тело на земле без джиттера ≈ 0.7).
+        if (predictedShot) {
+            const auto group = groupOf(weapon);
+            const bool slowWeapon = group == WeaponGroup::Scout || group == WeaponGroup::Awp || group == WeaponGroup::Heavy;
+            const float needReliability = slowWeapon ? 0.42f : 0.28f;
+            if (t.reliability < needReliability) {
+                if (firstChance < 0)
+                    firstChance = 0;
+                continue;
+            }
+        }
+        if (chance < needChance && t.fallback.damage > 0.0f) {
             const auto fallbackAngle = (t.fallback.position - eye).toAngle();
             if (const int fallbackChance = hitchance(weapon, weaponData, entity, eye, fallbackAngle, capsules, t.fallback.baseDamage, t.minDamage);
-                fallbackChance >= settings.hitchance) {
+                fallbackChance >= needChance) {
                 t.point = t.fallback;
                 angle = fallbackAngle;
                 chance = fallbackChance;
             }
         }
-        if (chance >= settings.hitchance)
+        if (chance >= needChance)
             chosenSlot = k;
     }
     if (chosenSlot < 0) {
@@ -2851,6 +2974,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     if (tickbase::hideShotsActive() && tickbase::isInstalled() && tickbase::sendPacket() && !tickbase::isShifting()) {
         tickbase::chokeNextPacket();
         statusText = "хайдшот: выстрел в след. тике";
+        return false;
+    }
+
+    // Фейкдак: стреляем только с последнего тика стоя (Movement.cpp: первая половина пачки — встаём,
+    // вторая — садимся). Это самая высокая точка глаза за цикл — ради неё ФД и нужен. Раньше рейдж
+    // стрелял на любом тике: с полуприседа (в укрытие) и форсил пакет — враги видели нас стоя.
+    if (movement::isFakeDucking() && tickbase::chokedCommands() != tickbase::fakeDuckChoke() / 2 - 1) {
+        statusText = "фейкдак: ждём верхнюю точку";
         return false;
     }
 
@@ -2891,6 +3022,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.kind = best.kind;
     shot.backtrackTicks = best.backtrackTicks;
     shot.updatesAhead = best.updatesAhead;
+    shot.aheadPhase = best.aheadPhase;
     shot.predictedSimulationTime = best.simulationTime;
     shot.predictedOrigin = best.origin;
     shot.jitter = jittering(brains[best.index]) || desyncFlipping(brains[best.index]);

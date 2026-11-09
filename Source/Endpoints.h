@@ -121,6 +121,10 @@ void fireGameEvent(csgo::GameEventPOD* eventPointer)
         break;
     case fnv::hash(csgo::bullet_impact):
         globalContext->features->visuals.bulletTracer(event);
+        if (localPlayer && globalContext->getEngineInterfaces().getEngine().getPlayerForUserID(event.getInt("userid")) == localPlayer.get().getNetworkable().index()) {
+            const auto eye = localPlayer.get().getEyePosition();
+            hvh::visuals::onImpact(event.getFloat("x"), event.getFloat("y"), event.getFloat("z"), eye.x, eye.y, eye.z);
+        }
         break;
     }
 }
@@ -309,6 +313,8 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
         globalContext->getEngineInterfaces(), clientInterfaces, globalContext->getOtherInterfaces(), *globalContext->memory);
     hvh::movement::autoPeek(cmd, currentViewAngles.y, ragebotShot || manualShot, globalContext->memory->globalVars->intervalPerTick);
     hvh::antiaim::run(cmd, globalContext->getEngineInterfaces(), clientInterfaces, *globalContext->memory, ragebotShot);
+    // супертосс — после антиаима (тот во время броска углы не трогает), до фикса движения
+    const bool superTossed = hvh::grenade::superToss(cmd, *globalContext->memory);
     hvh::grenade::update(globalContext->getEngineInterfaces(), *globalContext->memory);
     hvh::visuals::onCreateMove(cmd);
     hvh::visuals::collectGrenades(clientInterfaces, *globalContext->memory);
@@ -328,7 +334,7 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
 
     cmd->viewangles.normalize();
     // с рейджем/антиаимом угол команды почти всегда не совпадает с камерой — движение чиним всегда
-    if (hvh::config.rage.enabled || hvh::config.antiAim.enabled) {
+    if (hvh::config.rage.enabled || hvh::config.antiAim.enabled || superTossed) {
         hvh::movement::fixMovement(cmd, currentViewAngles.y);
         hvh::antiaim::fixRollMovement(cmd);
     }
@@ -572,6 +578,7 @@ void FASTCALL_CONV ClientHooks::frameStageNotify(FASTCALL_THIS(csgo::ClientPOD* 
         features->misc.preserveKillfeed();
         features->misc.disablePanoramablur();
         features->visuals.colorWorld();
+        hvh::world::apply(globalContext->getOtherInterfaces(), globalContext->getEngineInterfaces().getEngine().isInGame());
         features->misc.updateEventListeners();
         features->visuals.updateEventListeners();
         hvh::antiaim::updateEventListener(globalContext->getEngineInterfaces(), *globalContext->memory);
@@ -615,7 +622,7 @@ bool FASTCALL_CONV ClientModeHooks::shouldDrawFog(FASTCALL_THIS(csgo::ClientMode
     }
 #endif
 
-    return !globalContext->features->visuals.shouldRemoveFog();
+    return hvh::world::fogActive() || !globalContext->features->visuals.shouldRemoveFog();
 }
 
 bool FASTCALL_CONV ClientModeHooks::shouldDrawViewModel(FASTCALL_THIS(csgo::ClientMode* thisptr)) noexcept

@@ -72,6 +72,7 @@ struct RageConfig {
     // попадание почти гарантировано, а «край головы» при неверной стороне — промах
     bool resolverSafeWhenUnsure = true;
     int resolverSteps = 9;          // сколько углов-кандидатов перебирать на обновление (5/9/17)
+    bool strictShots = true;        // строгий отбор: по десинкерам только безопасные точки, без прогноза по прыгающим/джиттерящим
     int safePoint = 1;              // 0 — выкл, 1 — после промаха, 2 — всегда (по десинкерам)
     // Нож: бьёт сам, когда враг в досягаемости (ЛКМ — 48 ед., ПКМ — 32 ед., в спину ×3).
     // 0 — только наповал, 1 — любой удар, если враг в досягаемости
@@ -319,6 +320,10 @@ struct ViewConfig {
     bool killFlash = true;          // вспышка краёв экрана при убийстве
     bool grenadeTimers = true;      // над дымом и огнём — сколько им осталось
     bool shotCapsules = true;       // хитбоксы цели в момент выстрела (зелёные — попал, красные — мимо)
+    bool impactSparks = false;      // искры там, куда пришла своя пуля
+    float sparkColor[4]{ 1.0f, 0.62f, 0.2f, 1.0f };
+    int sparkCount = 18;            // искр на одно попадание пули
+    float sparkSize = 1.0f;         // множитель скорости разлёта / длины хвостов
     // из hysteria (Extras.cpp)
     bool aspectRatio = false;
     float aspectRatioValue = 1.5f;  // 1.25 — 5:4, 1.33 — 4:3, 1.5 — 3:2, 1.6 — 16:10, 1.78 — 16:9
@@ -350,6 +355,7 @@ struct MovementConfig {
     int peekTeleportTicks = 14;     // заряд под телепорт назад (больше «Тиков сдвига» DT — телепорт дальше)
     KeyBind fakeDuckKey;
     bool fastLadder = false;
+    bool superToss = false;         // граната летит по прицелу с учётом своей скорости (бег/прыжок)
     bool noFallDamage = false;      // jumpbug в тик приземления: урон от падения не засчитывается
     // AI peek (при зажатом автопике и без WASD): ищет вокруг точку в паре шагов, откуда пробиваем
     // ближайшего к прицелу врага на мин. урон, выходит туда сам, после выстрела автопик возвращает
@@ -387,7 +393,27 @@ struct AutoBuyConfig {
     int extras = BuyArmor | BuyTaser | BuyHe | BuySmoke | BuyMolotov | BuyDefuser;
 };
 
+// Вид мира: цвет стен/пропов/неба, свой туман, подсветка. Применяется в RENDER_START
+// (перебор материалов раз в полсекунды и при смене настроек), при выключении — всё обратно
+struct WorldConfig {
+    bool enabled = false;
+    int preset = 0;                 // последний выбранный пресет (только для меню)
+    float wallColor[3]{ 1.0f, 1.0f, 1.0f };
+    float propColor[3]{ 1.0f, 1.0f, 1.0f };
+    float propAlpha = 1.0f;         // прозрачность пропов (ящики, машины)
+    bool skyColorOn = false;
+    float skyColor[3]{ 1.0f, 1.0f, 1.0f };
+    bool fog = false;               // свой туман (fog_override)
+    float fogColor[3]{ 0.6f, 0.6f, 0.65f };
+    float fogStart = 0.0f;
+    float fogEnd = 3000.0f;
+    float fogDensity = 0.5f;
+    bool ambient = false;           // подсветка (mat_ambient_light_*)
+    float ambientColor[3]{ 0.05f, 0.05f, 0.1f };
+};
+
 struct Config {
+    WorldConfig world;
     ViewConfig view;
     RageConfig rage;
     AntiAimConfig antiAim;

@@ -1,3 +1,4 @@
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -760,6 +761,11 @@ void drawRageTab() noexcept
                 ImGui::SetTooltip("Выкл — точки, общие для всех сторон десинка, просто в приоритете\n"
                                   "(остальные оцениваются по доверию к стороне, голова — строже).\n"
                                   "После промаха / Всегда — стрелять ТОЛЬКО в такие точки.");
+            ImGui::Checkbox("Строгий отбор выстрелов", &rage.strictShots);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("По десинкерам — только точки, общие для всех сторон; без прогноза по прыгающим\n"
+                                  "и джиттерящим; голова в прыжке/на джиттере не бьётся; сквозь стену — с запасом урона.\n"
+                                  "Логи 04–09.11: такие выстрелы попадали в 65%%, отброшенные — в 36%%.");
         }
         sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
         keybind("Мин. урон (override)", rage.minDamageOverrideKey);
@@ -1767,6 +1773,120 @@ void drawVisualsTab() noexcept
     endGroup();
 }
 
+bool colorEdit3(const char* label, float* rgb) noexcept
+{
+    float rgba[4]{ rgb[0], rgb[1], rgb[2], 1.0f };
+    const bool changed = colorEdit(label, rgba);
+    if (changed) {
+        rgb[0] = rgba[0];
+        rgb[1] = rgba[1];
+        rgb[2] = rgba[2];
+    }
+    return changed;
+}
+
+namespace
+{
+
+struct WorldPreset {
+    const char* name;
+    float wall[3], prop[3], sky[3];
+    bool fog;
+    float fogColor[3], fogStart, fogEnd, fogDensity;
+    bool ambient;
+    float ambientColor[3];
+    const char* skybox;
+};
+
+constexpr WorldPreset worldPresets[]{
+    { "Ночь",    { 0.22f, 0.22f, 0.30f }, { 0.40f, 0.40f, 0.50f }, { 0.25f, 0.25f, 0.45f }, true, { 0.05f, 0.06f, 0.12f }, 300.0f, 5000.0f, 0.50f, true, { 0.04f, 0.04f, 0.10f }, "sky_csgo_night02" },
+    { "Закат",   { 0.95f, 0.68f, 0.55f }, { 1.00f, 0.75f, 0.62f }, { 1.00f, 0.60f, 0.45f }, true, { 1.00f, 0.55f, 0.35f }, 200.0f, 3500.0f, 0.35f, true, { 0.10f, 0.04f, 0.02f }, "sky_day02_05" },
+    { "Неон",    { 0.35f, 0.25f, 0.60f }, { 0.70f, 0.35f, 1.00f }, { 0.70f, 0.30f, 1.00f }, true, { 0.55f, 0.10f, 0.90f },   0.0f, 2600.0f, 0.45f, true, { 0.16f, 0.00f, 0.28f }, "sky_lunacy" },
+    { "Сакура",  { 1.00f, 0.72f, 0.85f }, { 1.00f, 0.80f, 0.90f }, { 1.00f, 0.65f, 0.85f }, true, { 1.00f, 0.60f, 0.80f }, 300.0f, 4000.0f, 0.30f, true, { 0.10f, 0.03f, 0.07f }, "sky_csgo_cloudy01" },
+    { "Туман",   { 0.62f, 0.62f, 0.65f }, { 0.68f, 0.68f, 0.70f }, { 0.75f, 0.75f, 0.78f }, true, { 0.72f, 0.72f, 0.75f },   0.0f, 1500.0f, 0.85f, false, { 0.0f, 0.0f, 0.0f }, "sky_csgo_cloudy01" },
+    { "Кислота", { 0.50f, 0.80f, 0.35f }, { 0.55f, 0.90f, 0.40f }, { 0.45f, 1.00f, 0.30f }, true, { 0.30f, 0.85f, 0.20f }, 100.0f, 2600.0f, 0.45f, true, { 0.03f, 0.12f, 0.02f }, "sky_l4d_rural02_ldr" },
+    { "Лёд",     { 0.65f, 0.80f, 1.00f }, { 0.75f, 0.88f, 1.00f }, { 0.60f, 0.85f, 1.00f }, true, { 0.70f, 0.85f, 1.00f }, 200.0f, 3500.0f, 0.40f, true, { 0.02f, 0.05f, 0.10f }, "vertigoblue_hdr" },
+};
+
+void applyWorldPreset(const WorldPreset& p, bool* skyboxEnabled, int* skybox, const char* const* skyboxNames, int skyboxCount) noexcept
+{
+    auto& w = config.world;
+    std::copy(std::begin(p.wall), std::end(p.wall), w.wallColor);
+    std::copy(std::begin(p.prop), std::end(p.prop), w.propColor);
+    std::copy(std::begin(p.sky), std::end(p.sky), w.skyColor);
+    w.skyColorOn = true;
+    w.fog = p.fog;
+    std::copy(std::begin(p.fogColor), std::end(p.fogColor), w.fogColor);
+    w.fogStart = p.fogStart;
+    w.fogEnd = p.fogEnd;
+    w.fogDensity = p.fogDensity;
+    w.ambient = p.ambient;
+    std::copy(std::begin(p.ambientColor), std::end(p.ambientColor), w.ambientColor);
+    w.enabled = true;
+    for (int i = 0; i < skyboxCount; ++i) {
+        if (std::strcmp(skyboxNames[i], p.skybox) == 0) {
+            *skybox = i;
+            *skyboxEnabled = true;
+            break;
+        }
+    }
+}
+
+}
+
+void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skyboxNames, int skyboxCount) noexcept
+{
+    auto& w = config.world;
+    auto& view = config.view;
+    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    const float height = ImGui::GetContentRegionAvail().y;
+
+    if (beginGroup("Вид мира", { width, height })) {
+        toggle("Включить", &w.enabled);
+        const char* presetNames[IM_ARRAYSIZE(worldPresets) + 1]{ "Свой" };
+        for (int i = 0; i < IM_ARRAYSIZE(worldPresets); ++i)
+            presetNames[i + 1] = worldPresets[i].name;
+        if (combo("Пресет", &w.preset, presetNames, IM_ARRAYSIZE(presetNames)) && w.preset > 0)
+            applyWorldPreset(worldPresets[w.preset - 1], skyboxEnabled, skybox, skyboxNames, skyboxCount);
+        if (colorEdit3("Стены", w.wallColor)) w.preset = 0;
+        if (colorEdit3("Пропы", w.propColor)) w.preset = 0;
+        sliderFloat("Прозрачность пропов", &w.propAlpha, 0.1f, 1.0f, "%.2f");
+        toggle("Цвет неба", &w.skyColorOn);
+        if (w.skyColorOn && colorEdit3("Небо", w.skyColor)) w.preset = 0;
+        toggle("Скайбокс", skyboxEnabled);
+        if (*skyboxEnabled)
+            combo("Небо (скайбокс)", skybox, skyboxNames, skyboxCount);
+        ImGui::Dummy({ 0.0f, 6.0f });
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
+        ImGui::TextWrapped("Пресет ставит всё сразу: цвета, туман, подсветку и небо. Дальше можно подкрутить руками. Новые текстуры карты докрашиваются раз в секунду.");
+        ImGui::PopStyleColor();
+    }
+    endGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    if (beginGroup("Туман, свет, искры", { width, height })) {
+        toggle("Свой туман", &w.fog);
+        if (w.fog) {
+            colorEdit3("Цвет тумана", w.fogColor);
+            sliderFloat("Начало", &w.fogStart, 0.0f, 3000.0f, "%.0f ед.");
+            sliderFloat("Конец", &w.fogEnd, 200.0f, 10000.0f, "%.0f ед.");
+            sliderFloat("Плотность", &w.fogDensity, 0.0f, 1.0f, "%.2f");
+        }
+        toggle("Подсветка", &w.ambient);
+        if (w.ambient)
+            colorEdit3("Цвет подсветки", w.ambientColor);
+        ImGui::Dummy({ 0.0f, 6.0f });
+        toggle("Искры от пуль", &view.impactSparks);
+        if (view.impactSparks) {
+            colorEdit("Цвет искр", view.sparkColor);
+            sliderInt("Количество", &view.sparkCount, 4, 60);
+            sliderFloat("Разлёт", &view.sparkSize, 0.3f, 3.0f, "x%.1f");
+        }
+    }
+    endGroup();
+}
+
 void drawAutoBuyTab() noexcept
 {
     auto& b = config.autoBuy;
@@ -1822,6 +1942,11 @@ void drawMovementTab() noexcept
         static constexpr const char* strafeModes[]{ "Выкл", "По камере", "WASD" };
         combo("Автострейф", &m.autoStrafe, strafeModes, IM_ARRAYSIZE(strafeModes));
         toggle("Быстрая лестница", &m.fastLadder);
+        toggle("Супертосс", &m.superToss);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Граната летит туда, куда смотрит прицел, даже на бегу и в прыжке:\n"
+                              "в тик броска угол подбирается так, чтобы своя скорость не уводила её в сторону.\n"
+                              "Траектория гранаты рисуется с учётом супертосса.");
         toggle("Без урона от падения", &m.noFallDamage);
         ImGui::Dummy({ 0.0f, 6.0f });
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));

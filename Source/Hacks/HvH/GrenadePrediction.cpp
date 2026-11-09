@@ -20,6 +20,7 @@
 #include <CSGO/EngineTrace.h>
 #include <CSGO/GlobalVars.h>
 #include <CSGO/LocalPlayer.h>
+#include <CSGO/UserCmd.h>
 #include <CSGO/WeaponId.h>
 
 namespace hvh::grenade
@@ -77,6 +78,41 @@ Path shared;
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
+// ---- супертосс ----
+// Бросок (CBaseCSGrenade::ThrowGrenade): pitch' = pitch − (90 − |pitch|)·10/90, скорость гранаты
+// v = forward(pitch', yaw) · s + скорость_игрока · 1.25, где s = clamp(750·0.9) · (0.3 + 0.7·сила).
+// Хотим, чтобы v смотрел туда же, куда forward прицела d: ищем единичный f и k > 0, что f·s + w = k·d.
+// |k·d − w| = s  →  k = d·w + sqrt((d·w)² − |w|² + s²). Решения нет (своя скорость больше броска и
+// направлена не туда — слабый бросок ПКМ на бегу/в прыжке) — тогда супертосс не трогает бросок.
+
+[[nodiscard]] float throwPitch(float pitch) noexcept
+{
+    if (pitch < -90.0f)
+        pitch += 360.0f;
+    else if (pitch > 90.0f)
+        pitch -= 360.0f;
+    return pitch - (90.0f - std::abs(pitch)) * 10.0f / 90.0f;
+}
+
+// обратное к throwPitch на [-90, 90]: при pitch ≥ 0 p' = (10p − 90)/9, при pitch < 0 p' = (8p − 90)/9
+[[nodiscard]] float inverseThrowPitch(float adjusted) noexcept
+{
+    return adjusted >= -10.0f ? (9.0f * adjusted + 90.0f) / 10.0f : (9.0f * adjusted + 90.0f) / 8.0f;
+}
+
+[[nodiscard]] float throwSpeed(float strength) noexcept
+{
+    return std::clamp(750.0f * 0.9f, 15.0f, 750.0f) * (strength * 0.7f + 0.3f);
+}
+
+// k — итоговая скорость гранаты вдоль d; ≤ 0 — решения нет
+[[nodiscard]] float tossScale(const csgo::Vector& d, const csgo::Vector& w, float speed) noexcept
+{
+    const float dw = d.x * w.x + d.y * w.y + d.z * w.z;
+    const float disc = dw * dw - (w.x * w.x + w.y * w.y + w.z * w.z) + speed * speed;
+    return disc >= 0.0f ? dw + std::sqrt(disc) : -1.0f;
+}
+
 void simulate(const EngineInterfaces& engineInterfaces, const Memory& memory, WeaponId weapon, float strength, Path& path) noexcept
 {
     const auto engineTrace = engineInterfaces.engineTrace();
@@ -84,15 +120,10 @@ void simulate(const EngineInterfaces& engineInterfaces, const Memory& memory, We
 
     // как в CBaseCSGrenade::ThrowGrenade
     auto angles = engineInterfaces.getEngine().getViewAngles();
-    float pitch = angles.x;
-    if (pitch < -90.0f)
-        pitch += 360.0f;
-    else if (pitch > 90.0f)
-        pitch -= 360.0f;
-    pitch -= (90.0f - std::abs(pitch)) * 10.0f / 90.0f;
+    const float pitch = throwPitch(angles.x);
 
     const auto forward = angleForward(pitch, angles.y);
-    const float speed = std::clamp(750.0f * 0.9f, 15.0f, 750.0f) * (strength * 0.7f + 0.3f);
+    const float speed = throwSpeed(strength);
 
     auto src = localPlayer.get().getAbsOrigin() + localPlayer.get().viewOffset();
     src.z += strength * 12.0f - 12.0f;
@@ -102,6 +133,11 @@ void simulate(const EngineInterfaces& engineInterfaces, const Memory& memory, We
     src = trace.endpos - forward * 6.0f;
 
     auto velocity = localPlayer.get().velocity() * 1.25f + forward * speed;
+    // супертосс: граната идёт ровно по прицелу, своя скорость меняет только дальность
+    if (config.movement.superToss) {
+        if (const float k = tossScale(forward, localPlayer.get().velocity() * 1.25f, speed); k > 1.0f)
+            velocity = forward * k;
+    }
 
     const float interval = memory.globalVars->intervalPerTick;
     const bool fused = weapon == WeaponId::HeGrenade || weapon == WeaponId::Flashbang;
@@ -172,6 +208,45 @@ void update(const EngineInterfaces& engineInterfaces, const Memory& memory) noex
 
     std::scoped_lock lock{ mutex };
     shared = std::move(path);
+}
+
+bool superToss(csgo::UserCmd* cmd, const Memory& memory) noexcept
+{
+    if (!config.movement.superToss || !localPlayer || !localPlayer.get().isAlive())
+        return false;
+    const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon());
+    if (!weapon.getPOD() || !isGrenade(weapon.itemDefinitionIndex()))
+        return false;
+    if (!Netvars::get(fnv::hash("CBaseCSGrenade->m_fThrowTime")) || !Netvars::get(fnv::hash("CBaseCSGrenade->m_flThrowStrength")))
+        return false;
+    // бросок происходит в ItemPostFrame, когда curtime дошёл до m_fThrowTime. Тик в тик по тикбейсу
+    // не угадать (предсказание могло уже прибавить тик) — подменяем угол в обоих кандидатах: граната
+    // берёт угол один раз, лишний тик ни на что не влияет
+    const float throwTime = weapon.throwTime();
+    const float interval = memory.globalVars->intervalPerTick;
+    if (throwTime <= 0.0f || memory.globalVars->serverTime() + interval < throwTime)
+        return false;
+
+    const float strength = std::clamp(weapon.throwStrength(), 0.0f, 1.0f);
+    const float speed = throwSpeed(strength);
+    // куда целимся — угол камеры (антиаим во время броска углы не трогает, но берём из команды до него)
+    const auto d = angleForward(throwPitch(cmd->viewangles.x), cmd->viewangles.y);
+    const auto w = localPlayer.get().velocity() * 1.25f;
+    if (w.x * w.x + w.y * w.y + w.z * w.z < 1.0f)
+        return false;   // стоим — компенсировать нечего
+    const float k = tossScale(d, w, speed);
+    if (k <= 1.0f)
+        return false;   // решения нет — бросаем как есть
+    auto f = d * k - w;
+    const float length = std::sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+    if (length < 0.001f)
+        return false;
+    f = f * (1.0f / length);
+
+    const float adjusted = Helpers::rad2deg(-std::asin(std::clamp(f.z, -1.0f, 1.0f)));
+    cmd->viewangles.x = std::clamp(inverseThrowPitch(adjusted), -89.0f, 89.0f);
+    cmd->viewangles.y = Helpers::rad2deg(std::atan2(f.y, f.x));
+    return true;
 }
 
 void draw(ImDrawList* drawList) noexcept

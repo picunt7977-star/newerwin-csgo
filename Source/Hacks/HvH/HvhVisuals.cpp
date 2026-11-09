@@ -4,7 +4,11 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <chrono>
+#include <cstring>
 #include <mutex>
+#include <random>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -22,6 +26,12 @@
 #include <fnv.h>
 #include <Netvars.h>
 #include <Interfaces/ClientInterfaces.h>
+#include <Interfaces/OtherInterfaces.h>
+#include <CSGO/ConVar.h>
+#include <CSGO/Cvar.h>
+#include <CSGO/Material.h>
+#include <CSGO/MaterialSystem.h>
+#include <CSGO/PODs/ConVar.h>
 #include <CSGO/ClientClass.h>
 #include <CSGO/Constants/ClassId.h>
 #include <CSGO/Entity.h>
@@ -80,6 +90,27 @@ std::vector<GrenadeTimer> grenadeTimers;
 constexpr float smokeDuration = 18.0f;    // дым держится ~18 с с момента раскрытия
 constexpr float fireDuration = 7.0f;      // inferno_flame_lifetime
 constexpr float smokeRadius = 144.0f;
+
+// искры от своих пуль: события приходят в игровом потоке, физика и отрисовка — в потоке рендера
+struct PendingImpact {
+    csgo::Vector point;
+    csgo::Vector from;
+};
+struct Spark {
+    csgo::Vector position;
+    csgo::Vector velocity;
+    float life;
+    float maxLife;
+};
+struct ImpactFlash {
+    csgo::Vector position;
+    double at;
+};
+std::mutex impactMutex;
+std::vector<PendingImpact> pendingImpacts;
+std::vector<Spark> sparks;
+std::vector<ImpactFlash> impactFlashes;
+std::minstd_rand sparkRng{ 1337 };
 
 [[nodiscard]] ImU32 withAlpha(ImU32 color, float alpha) noexcept
 {
@@ -278,6 +309,100 @@ void drawDamageNumbers(ImDrawList* drawList) noexcept
         const ImU32 color = number.headshot ? IM_COL32(255, 70, 70, 255) : IM_COL32(255, 230, 120, 255);
         const auto size = textSize(text);
         shadowText(drawList, { screen.x - size.x * 0.5f, screen.y }, withAlpha(color, 1.0f - t * t), text);
+    }
+}
+
+[[nodiscard]] float randomUnit() noexcept
+{
+    return std::uniform_real_distribution<float>{ 0.0f, 1.0f }(sparkRng);
+}
+
+void spawnSparks(const PendingImpact& impact, double now) noexcept
+{
+    csgo::Vector back = impact.from - impact.point;     // к стрелку — туда в основном и летят искры
+    const float backLength = back.length();
+    back = backLength > 0.001f ? back / backLength : csgo::Vector{ 0.0f, 0.0f, 1.0f };
+
+    const float size = config.view.sparkSize;
+    const int count = std::clamp(config.view.sparkCount, 4, 60);
+    for (int i = 0; i < count && sparks.size() < 900; ++i) {
+        // случайное направление на сфере, развёрнутое в полусферу к стрелку, плюс подброс вверх
+        const float z = randomUnit() * 2.0f - 1.0f;
+        const float a = randomUnit() * 6.2831853f;
+        const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+        csgo::Vector dir{ r * std::cos(a), r * std::sin(a), z };
+        if (dir.dotProduct(back) < 0.0f)
+            dir = dir * -1.0f;
+        dir = dir + back * 0.55f;
+        dir.z += 0.45f;
+        if (const float l = dir.length(); l > 0.001f)
+            dir = dir / l;
+        const float speed = (110.0f + randomUnit() * 380.0f) * size;
+        sparks.push_back({ impact.point + back * 1.5f, dir * speed, 0.0f, 0.3f + randomUnit() * 0.6f });
+    }
+    impactFlashes.push_back({ impact.point + back * 1.5f, now });
+}
+
+void drawSparks(ImDrawList* drawList) noexcept
+{
+    const double now = ImGui::GetTime();
+    static double lastFrame = now;
+    const float dt = std::clamp(static_cast<float>(now - lastFrame), 0.0f, 0.05f);
+    lastFrame = now;
+
+    {
+        std::scoped_lock lock{ impactMutex };
+        for (const auto& impact : pendingImpacts) {
+            // пробитие даёт несколько импактов почти в одной точке — хватит одной вспышки
+            const bool duplicate = std::any_of(impactFlashes.begin(), impactFlashes.end(), [&](const ImpactFlash& f) {
+                return now - f.at < 0.05 && f.position.distTo(impact.point) < 4.0f;
+            });
+            if (!duplicate)
+                spawnSparks(impact, now);
+        }
+        pendingImpacts.clear();
+    }
+
+    const float drag = std::exp(-2.2f * dt);
+    for (auto& spark : sparks) {
+        spark.velocity.z -= 620.0f * dt;     // тяжелее обычной гравитации — красиво падают дугой
+        spark.velocity = spark.velocity * drag;
+        spark.position += spark.velocity * dt;
+        spark.life += dt;
+    }
+    std::erase_if(sparks, [](const Spark& spark) { return spark.life >= spark.maxLife; });
+    std::erase_if(impactFlashes, [now](const ImpactFlash& f) { return now - f.at > 0.25; });
+
+    if (!config.view.impactSparks)
+        return;
+
+    const auto* c = config.view.sparkColor;
+    const ImU32 tint = IM_COL32(static_cast<int>(c[0] * 255), static_cast<int>(c[1] * 255), static_cast<int>(c[2] * 255), 255);
+    const float alphaScale = c[3];
+    const float tailScale = 0.035f * config.view.sparkSize;
+
+    for (const auto& flash : impactFlashes) {
+        const float t = static_cast<float>(now - flash.at) / 0.25f;
+        ImVec2 screen;
+        if (!Helpers::worldToScreen(flash.position, screen))
+            continue;
+        const float radius = 3.0f + t * 12.0f;
+        drawList->AddCircleFilled(screen, radius * 1.8f, withAlpha(tint, (1.0f - t) * 0.18f * alphaScale), 20);
+        drawList->AddCircleFilled(screen, radius * 0.6f, withAlpha(IM_COL32(255, 250, 225, 255), (1.0f - t) * 0.9f * alphaScale), 16);
+    }
+
+    for (const auto& spark : sparks) {
+        const float t = spark.life / spark.maxLife;
+        ImVec2 head, tail;
+        if (!Helpers::worldToScreen(spark.position, head) || !Helpers::worldToScreen(spark.position - spark.velocity * tailScale, tail))
+            continue;
+        // сначала почти белая (раскалённая), к концу жизни — цвет из настроек
+        const float heat = std::clamp(1.0f - t * 1.6f, 0.0f, 1.0f);
+        const auto lerp = [heat](int hot, float cold) { return static_cast<int>(hot * heat + cold * 255.0f * (1.0f - heat)); };
+        const ImU32 core = IM_COL32(lerp(255, c[0]), lerp(245, c[1]), lerp(200, c[2]), 255);
+        const float alpha = std::pow(1.0f - t, 1.3f) * alphaScale;
+        drawList->AddLine(tail, head, withAlpha(tint, alpha * 0.28f), 4.0f);
+        drawList->AddLine(tail, head, withAlpha(core, alpha), 1.5f);
     }
 }
 
@@ -485,6 +610,15 @@ void onDamage(int victimIndex, int damage, bool headshot) noexcept
         pendingDamage.push_back({ victimIndex, damage, headshot });
 }
 
+void onImpact(float x, float y, float z, float fromX, float fromY, float fromZ) noexcept
+{
+    if (!config.view.impactSparks)
+        return;
+    std::scoped_lock lock{ impactMutex };
+    if (pendingImpacts.size() < 32)
+        pendingImpacts.push_back({ { x, y, z }, { fromX, fromY, fromZ } });
+}
+
 void onKill() noexcept
 {
     std::scoped_lock lock{ eventMutex };
@@ -539,7 +673,144 @@ void draw(ImDrawList* drawList, float realtime) noexcept
     drawDamageNumbers(drawList);
     drawSpreadCircle(drawList);
     drawExtendedYaw(drawList);
+    drawSparks(drawList);
     drawKillFlash(drawList);
+}
+
+}
+
+namespace hvh::world
+{
+
+namespace
+{
+
+bool materialsTouched = false;      // на материалах сейчас наши цвета — при выключении вернуть белый
+bool cvarsTouched = false;
+std::size_t lastKey = 0;
+std::chrono::steady_clock::time_point lastPass{};
+
+[[nodiscard]] std::size_t settingsKey(const WorldConfig& w) noexcept
+{
+    std::size_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](float value) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        hash = (hash ^ bits) * 1099511628211ull;
+    };
+    for (int i = 0; i < 3; ++i) {
+        mix(w.wallColor[i]); mix(w.propColor[i]); mix(w.skyColor[i]); mix(w.fogColor[i]); mix(w.ambientColor[i]);
+    }
+    mix(w.propAlpha); mix(w.fogStart); mix(w.fogEnd); mix(w.fogDensity);
+    mix(w.enabled ? 1.0f : 0.0f); mix(w.skyColorOn ? 1.0f : 0.0f); mix(w.fog ? 1.0f : 0.0f); mix(w.ambient ? 1.0f : 0.0f);
+    return hash;
+}
+
+void setCvar(csgo::Cvar cvar, const char* name, float value) noexcept
+{
+    if (const auto var = cvar.findVar(name))
+        csgo::ConVar::from(retSpoofGadgets->client, var).setValue(value);
+}
+
+void setCvar(csgo::Cvar cvar, const char* name, const char* value) noexcept
+{
+    if (const auto var = cvar.findVar(name))
+        csgo::ConVar::from(retSpoofGadgets->client, var).setValue(value);
+}
+
+void modulateMaterials(const OtherInterfaces& interfaces, bool on) noexcept
+{
+    const auto& w = config.world;
+    const auto materials = interfaces.getMaterialSystem();
+    for (short h = materials.firstMaterial(); h != materials.invalidMaterial(); h = materials.nextMaterial(h)) {
+        const auto mat = csgo::Material::from(retSpoofGadgets->client, materials.getMaterial(h));
+        if (mat.getPOD() == nullptr || !mat.isPrecached())
+            continue;
+        const char* group = mat.getTextureGroupName();
+        if (group == nullptr)
+            continue;
+        const std::string_view textureGroup{ group };
+        if (textureGroup.starts_with("World")) {
+            if (on) mat.colorModulate(w.wallColor[0], w.wallColor[1], w.wallColor[2]);
+            else mat.colorModulate(1.0f, 1.0f, 1.0f);
+        } else if (textureGroup.starts_with("StaticProp")) {
+            if (on) mat.colorModulate(w.propColor[0], w.propColor[1], w.propColor[2]);
+            else mat.colorModulate(1.0f, 1.0f, 1.0f);
+            mat.alphaModulate(on ? w.propAlpha : 1.0f);
+        } else if (textureGroup.starts_with("SkyBox")) {
+            if (on && w.skyColorOn) mat.colorModulate(w.skyColor[0], w.skyColor[1], w.skyColor[2]);
+            else mat.colorModulate(1.0f, 1.0f, 1.0f);
+        }
+    }
+}
+
+void applyCvars(csgo::Cvar cvar, bool on) noexcept
+{
+    const auto& w = config.world;
+    const bool fog = on && w.fog;
+    setCvar(cvar, "fog_override", fog ? 1.0f : 0.0f);
+    if (fog) {
+        char color[48];
+        std::snprintf(color, sizeof(color), "%d %d %d", static_cast<int>(w.fogColor[0] * 255.0f),
+            static_cast<int>(w.fogColor[1] * 255.0f), static_cast<int>(w.fogColor[2] * 255.0f));
+        setCvar(cvar, "fog_enable", 1.0f);
+        setCvar(cvar, "fog_color", color);
+        setCvar(cvar, "fog_start", w.fogStart);
+        setCvar(cvar, "fog_end", std::max(w.fogEnd, w.fogStart + 10.0f));
+        setCvar(cvar, "fog_maxdensity", w.fogDensity);
+        // в 3D-скайбоксе тот же туман, иначе на горизонте виден шов
+        setCvar(cvar, "fog_enableskybox", 1.0f);
+        setCvar(cvar, "fog_colorskybox", color);
+        setCvar(cvar, "fog_startskybox", w.fogStart);
+        setCvar(cvar, "fog_endskybox", std::max(w.fogEnd, w.fogStart + 10.0f));
+        setCvar(cvar, "fog_maxdensityskybox", w.fogDensity);
+    }
+    const bool ambient = on && w.ambient;
+    setCvar(cvar, "mat_ambient_light_r", ambient ? w.ambientColor[0] : 0.0f);
+    setCvar(cvar, "mat_ambient_light_g", ambient ? w.ambientColor[1] : 0.0f);
+    setCvar(cvar, "mat_ambient_light_b", ambient ? w.ambientColor[2] : 0.0f);
+}
+
+}
+
+void apply(const OtherInterfaces& interfaces, bool inGame) noexcept
+{
+    const bool on = config.world.enabled && inGame;
+    const auto key = settingsKey(config.world);
+    const auto now = std::chrono::steady_clock::now();
+    const bool changed = key != lastKey;
+
+    if (on || cvarsTouched) {
+        if (changed || (on && !cvarsTouched)) {
+            applyCvars(interfaces.getCvar(), on);
+            cvarsTouched = on;
+        }
+    }
+
+    if (!inGame) {
+        // материалы карты выгружаются вместе с ней — на следующей карте начнём заново
+        materialsTouched = false;
+        lastKey = key;
+        return;
+    }
+
+    if (on) {
+        // новые материалы подгружаются по ходу игры — проходим раз в секунду и сразу при изменении
+        if (changed || !materialsTouched || now - lastPass > std::chrono::seconds{ 1 }) {
+            modulateMaterials(interfaces, true);
+            materialsTouched = true;
+            lastPass = now;
+        }
+    } else if (materialsTouched) {
+        modulateMaterials(interfaces, false);
+        materialsTouched = false;
+    }
+    lastKey = key;
+}
+
+bool fogActive() noexcept
+{
+    return config.world.enabled && config.world.fog;
 }
 
 }

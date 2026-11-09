@@ -23,6 +23,9 @@ bool run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
 [[nodiscard]] bool forceBodyActive() noexcept;
 [[nodiscard]] bool forceShotActive() noexcept;
 [[nodiscard]] int currentTarget() noexcept;
+// цель есть и оружие готово (или вот-вот) — дефенсив в это время не чокает и не рвёт тикбейс,
+// иначе выстрел ждёт в пачке и уходит на сервер с опозданием
+[[nodiscard]] bool aimingNow() noexcept;
 [[nodiscard]] const char* status() noexcept;
 // текущая поправка резольвера для игрока (0 — без поправки)
 [[nodiscard]] float resolverOffsetFor(int index) noexcept;
