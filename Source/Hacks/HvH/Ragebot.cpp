@@ -1280,6 +1280,7 @@ struct ShotRecord {
     int backtrackTicks = 0;
     int updatesAhead = 0;
     float aheadPhase = -1.0f;       // фаза выстрела внутри периода пакетов врага (прогноз)
+    float headScore = -1.0f, bodyScore = -1.0f;
     float predictedSimulationTime = 0.0f;
     csgo::Vector predictedOrigin{}; // где стояла модель, по которой стреляли
     bool jitter = false;            // враг джиттерил: сервер мог взять другую фазу позы
@@ -1364,6 +1365,9 @@ void scoreGuess(Brain& brain, float guess, float truth) noexcept
         else if (shot.backtrackTicks > 0)
             length += std::snprintf(text + length, sizeof(text) - length, " бт %dт", shot.backtrackTicks);
     }
+    // выстрел в тело, а голова тоже была — с какими оценками (чтобы видеть, почему не голова)
+    if (!shot.isHead && shot.headScore >= 0.0f && length > 0 && length < static_cast<int>(sizeof(text)))
+        length += std::snprintf(text + length, sizeof(text) - length, " [голова %.2f / тело %.2f]", shot.headScore, shot.bodyScore);
     if (length > 0 && length < static_cast<int>(sizeof(text)))
         std::snprintf(text + length, sizeof(text) - length, ", урон %d, хш %d%%", shot.damage, shot.hitchance);
     return text;
@@ -1545,6 +1549,7 @@ struct Target {
     int backtrackTicks = 0;
     int updatesAhead = 0;
     float aheadPhase = -1.0f;
+    float headScore = -1.0f, bodyScore = -1.0f;   // за что выбрали зону (для лога)
     int choke = 1;
     float side = 0.0f;
     SideSource source = SideSource::None;
@@ -2553,10 +2558,11 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 // прогноз по джиттерящему/перекидывающему десинк: 20 из 64 (31%)
                 if (predictedRecord && (jittering(brain) || desyncFlipping(brain)))
                     trust *= 0.75f;
-                if (isHead && headBanned)
-                    trust *= 0.35f;
-                else if (isHead && headUnlucky)
-                    trust *= 0.6f;
+                // Бан/невезение головы — про ошибку стороны десинка: штрафуют только небезопасные точки
+                // (ниже, по точке). Раньше штраф шёл на всю голову, и после двух промахов в начале раунда
+                // голову не били до конца раунда даже там, где она общая для всех сторон. Логи 04–09.11:
+                // безопасная голова по настоящим записям — 35/55 (64%), безопасное тело — 59%.
+                const float headSidePenalty = !isHead ? 1.0f : headBanned ? 0.35f : headUnlucky ? 0.6f : 1.0f;
                 if (!isHead && settings.preferBody)
                     trust *= 1.3f;
                 // голове раньше шёл квадрат доверия — при DT тело всегда выигрывало у головы
@@ -2713,8 +2719,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             reliability *= 0.8f;
                         // Логи 04–08.11 по настоящим записям: голова по догадке 42% против 82% у тела,
                         // небезопасная голова в воздухе 1 из 5, по джиттеру 0 из 3 — при сомнительной стороне тело
-                        if (isHead && source == SideSource::Guess)
+                        if (isHead && source == SideSource::Guess && !safe)
                             reliability *= 0.65f;
+                        if (!safe)
+                            reliability *= headSidePenalty;
                         if (isHead && !safe && (source == SideSource::Air || source == SideSource::Jitter))
                             reliability *= 0.55f;
                         if (headEdgeUnsafe)
@@ -2792,6 +2800,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.backtrackTicks = list.count && candidates[c].age > 0 ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
                 t.updatesAhead = candidates[c].updatesAhead;
                 t.aheadPhase = predictedRecord ? aheadPhase : -1.0f;
+                t.headScore = head.score;
+                t.bodyScore = body.score;
                 t.choke = record.choked;
                 t.side = side;
                 t.source = source;
@@ -3023,6 +3033,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.backtrackTicks = best.backtrackTicks;
     shot.updatesAhead = best.updatesAhead;
     shot.aheadPhase = best.aheadPhase;
+    shot.headScore = best.headScore;
+    shot.bodyScore = best.bodyScore;
     shot.predictedSimulationTime = best.simulationTime;
     shot.predictedOrigin = best.origin;
     shot.jitter = jittering(brains[best.index]) || desyncFlipping(brains[best.index]);
