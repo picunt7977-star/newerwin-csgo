@@ -90,6 +90,8 @@ int main()
         const auto h = mixture({ { player(distance, 0.0f, 8.0f), 0.5f }, { player(distance, 0.0f, -8.0f), 0.5f } });
         const auto odds = shotOdds(noSpread, eye, angleTo(eye, { distance + 0.5f, 8.0f, 64.0f }), h, damage, 80.0f, 100.0f, 101, false, 1, 1.0f);
         check(std::abs(odds.head - 0.5f) < 1e-3f, "две стороны 50/50, в одну голову: P(голова) = 0.5", odds.head);
+        check(odds.mainQualified > 0.999f, "по главной гипотезе (как старый хитшанс) — 100%", odds.mainQualified);
+        check(shootable(odds, 0.6f), "порог 60%: стрелять (смесь 50% ≥ половины порога)", odds.qualified);
         check(!odds.everyHypothesis || true, "(флаг общей точки считается только в прикидке)", 0.0);
         const auto rough = shotOdds(noSpread, eye, angleTo(eye, { distance + 0.5f, 8.0f, 64.0f }), h, damage, 80.0f, 100.0f, 101, false, 0, 1.0f);
         check(!rough.everyHypothesis, "прикидка: голова одной стороны — не общая точка", rough.everyHypothesis);

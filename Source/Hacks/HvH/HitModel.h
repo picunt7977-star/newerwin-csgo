@@ -327,13 +327,23 @@ struct SpreadState {
 
 // Что даст выстрел в точку по смеси гипотез
 struct ShotOdds {
-    float qualified = 0.0f;     // P(урон ≥ мин. урона) — это и есть хитшанс
+    float qualified = 0.0f;     // P(урон ≥ мин. урона) по всей смеси гипотез
+    float mainQualified = 0.0f; // то же только по главной гипотезе — хитшанс в прежнем смысле (один разброс)
     float kill = 0.0f;          // P(убить этой пулей)
     float value = 0.0f;         // ожидаемая польза: убийство 1, добивание второй пулей DT 0.55, урон — доля хп × 0.45
     float head = 0.0f;          // P(пуля в голову)
     bool everyHypothesis = false;   // центр точки попадает в каждую гипотезу весом ≥ 5% (бывший safe point)
     bool everyOnMainSide = false;   // ... в каждую гипотезу главной стороны
 };
+
+// Стрелять ли. Ползунок хитшанса — как раньше: разброс по главной модели должен его набрать.
+// Смесь гипотез выбирает точку и запрещает только монетку: с учётом сомнений резольвера шанс
+// нужного урона должен быть не ниже половины ползунка. Требовать от смеси весь порог оказалось
+// слишком строго — по десинкерам «по догадке» голову (≈50%) не били вовсе, рейдж молчал.
+[[nodiscard]] inline bool shootable(const ShotOdds& odds, float need) noexcept
+{
+    return odds.mainQualified + 1e-4f >= need && odds.qualified + 1e-4f >= need * 0.5f;
+}
 
 [[nodiscard]] inline float shotValue(float damage, float hp, bool doubleTap) noexcept
 {
@@ -417,8 +427,11 @@ inline ShotOdds shotOdds(const SpreadState& ws, const csgo::Vector& eye, const c
             }
             if (total <= 0.0f)
                 continue;
-            if (total >= static_cast<float>(minDamage))
+            if (total >= static_cast<float>(minDamage)) {
                 odds.qualified += w;
+                if (h == hyps.main)
+                    odds.mainQualified += 1.0f;
+            }
             if (total >= hp)
                 odds.kill += w;
             if (headHit)
@@ -428,6 +441,7 @@ inline ShotOdds shotOdds(const SpreadState& ws, const csgo::Vector& eye, const c
     }
     const float scale = penetration / static_cast<float>(std::max(samples, 1));
     odds.qualified *= scale;
+    odds.mainQualified *= scale;
     odds.kill *= scale;
     odds.head *= scale;
     odds.value *= scale;

@@ -2057,6 +2057,12 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const float cone = std::max(weapon.getInaccuracy(), 0.0f)
         + std::clamp(weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread, 0.0f, 0.2f);
     const auto ws = spreadState(weapon, weaponData);
+    // Цель и точку выбираем при точности, которая БУДЕТ к выстрелу: на бегу, в прыжке, без скопа разброс
+    // огромный, и шанс по нему отбрасывал все цели — а без цели не включались автостоп и скоп, которые этот
+    // разброс и убирают (рейдж «не стрелял»). Настоящий разброс проверяется последним шагом, перед выстрелом.
+    SpreadState aimSpread = ws;
+    if (localPlayer.get().velocity().length2D() > 5.0f || !(localPlayer.get().flags() & FL_ONGROUND) || needScope)
+        aimSpread.inaccuracy = 0.0f;
     // мультипоинт по всему телу — до ~70 точек на цель, каждая автоволл: бюджет на тик против фризов
     int pointBudget = 240;
     // и бюджет по времени: смесь гипотез дороже старого хитшанса. Скан дольше 5 мс (треть тика 64) —
@@ -2537,9 +2543,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                         break;
                     }
                     const auto angleTo = (pick.point.position - eye).toAngle();
-                    pick.odds = shotOdds(ws, eye, angleTo, hyps, pick.point.groupDamage, pick.point.baseDamage, hp, minDamage,
+                    pick.odds = shotOdds(aimSpread, eye, angleTo, hyps, pick.point.groupDamage, pick.point.baseDamage, hp, minDamage,
                                          doubleTapKill, 4, pick.point.penetration);
-                    if (pick.odds.qualified + 1e-4f >= needChance)
+                    if (shootable(pick.odds, needChance))
                         bestChecked = std::max(bestChecked, pick.odds.value);
                 }
                 float score = pick.odds.value * (!pick.point.isHead && settings.preferBody ? 1.15f : 1.0f);
@@ -2547,7 +2553,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     anyScore = score;
                     bestAny = k;
                 }
-                if (pick.odds.qualified + 1e-4f < needChance && !cheap)
+                if (!shootable(pick.odds, needChance) && !cheap)
                     continue;
                 if (pick.point.isHead && score > headScore) {
                     headScore = score;
@@ -2737,20 +2743,20 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         const float targetHp = static_cast<float>(std::max(entity.health(), 1));
         angle = (t.point.position - eye).toAngle();
         auto odds = shotOdds(ws, eye, angle, t.hyps, t.point.groupDamage, t.point.baseDamage, targetHp, t.minDamage, doubleTapKill, 1, t.point.penetration);
-        if (odds.qualified + 1e-4f < needChance && t.fallback.baseDamage > 0.0f) {
+        if (!shootable(odds, needChance) && t.fallback.baseDamage > 0.0f) {
             const auto fallbackAngle = (t.fallback.position - eye).toAngle();
             const auto fallbackOdds = shotOdds(ws, eye, fallbackAngle, t.hyps, t.fallback.groupDamage, t.fallback.baseDamage, targetHp, t.minDamage, doubleTapKill, 1, t.fallback.penetration);
-            if (fallbackOdds.qualified + 1e-4f >= needChance) {
+            if (shootable(fallbackOdds, needChance)) {
                 t.point = t.fallback;
                 angle = fallbackAngle;
                 odds = fallbackOdds;
             }
         }
-        chance = static_cast<int>(odds.qualified * 100.0f + 0.5f);
+        chance = static_cast<int>(odds.mainQualified * 100.0f + 0.5f);
         if (firstChance < 0)
             firstChance = chance;
         t.odds = odds;
-        if (odds.qualified + 1e-4f >= needChance)
+        if (shootable(odds, needChance))
             chosenSlot = k;
     }
     if (chosenSlot < 0) {
