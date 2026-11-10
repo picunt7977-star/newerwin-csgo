@@ -233,6 +233,8 @@ struct Brain {
     // Промахи по вине резольвера подряд (не разброс, не стена, не лаг). Тянут вероятность главной
     // стороны к 50/50 — смесь гипотез сама уводит выстрелы в точки, общие для обеих сторон.
     std::uint8_t sideMisses = 0;
+    // Сколько раз сторона по каждому источнику резольвера оказалась верной/неверной на этом игроке
+    std::array<float, 9> sideRight{}, sideWrong{};
 };
 std::array<Brain, 65> brains{};
 
@@ -1416,6 +1418,42 @@ float freestandSide(const csgo::EngineTrace& engineTrace, const csgo::Vector& ey
 enum class SideSource { None, Bot, NoDesync, Air, Layers, Evidence, Jitter, Guess, Brute };
 constexpr const char* sideSourceNames[]{ "без резольвера", "бот", "не десинкает", "в воздухе", "слои", "память", "джиттер", "догадка", "перебор" };
 
+// ---------- калибровка доверия к стороне ----------
+// Доверие к источнику стороны (слои, память, джиттер, догадка, перебор) раньше было числом из старых логов.
+// Теперь это оценка по исходам: априори — то самое число (как 6 выстрелов), дальше — общая статистика
+// сессии по всем врагам (с забыванием) и своя на этого игрока. Верность стороны берётся из геометрии
+// импакта, если она доказана; иначе попадание — слабое «за», промах резольвера — «против».
+std::array<float, 9> globalSideRight{}, globalSideWrong{};
+
+[[nodiscard]] bool sidedSource(SideSource source) noexcept
+{
+    return source == SideSource::Layers || source == SideSource::Evidence || source == SideSource::Jitter
+        || source == SideSource::Guess || source == SideSource::Brute;
+}
+
+void tallySide(Brain& brain, SideSource source, float right, float wrong) noexcept
+{
+    if (!sidedSource(source))
+        return;
+    const auto k = static_cast<std::size_t>(source);
+    constexpr float decay = 0.97f;   // общая статистика помнит ~30 последних выстрелов источника
+    globalSideRight[k] = globalSideRight[k] * decay + right;
+    globalSideWrong[k] = globalSideWrong[k] * decay + wrong;
+    brain.sideRight[k] += right;
+    brain.sideWrong[k] += wrong;
+}
+
+[[nodiscard]] float calibratedSide(const Brain& brain, SideSource source, float prior) noexcept
+{
+    if (!sidedSource(source))
+        return prior;
+    const auto k = static_cast<std::size_t>(source);
+    constexpr float priorShots = 6.0f;
+    const float right = prior * priorShots + globalSideRight[k] * 0.5f + brain.sideRight[k];
+    const float total = priorShots + (globalSideRight[k] + globalSideWrong[k]) * 0.5f + brain.sideRight[k] + brain.sideWrong[k];
+    return std::clamp(right / total, 0.5f, 0.95f);
+}
+
 struct ShotRecord {
     float time = 0.0f;              // realtime выстрела, 0 — ждать нечего
     csgo::Vector eye{};
@@ -1629,6 +1667,12 @@ void evaluateMiss(int index) noexcept
         if (shot.isHead)
             brain.headResolverMisses = static_cast<std::uint8_t>(std::min(brain.headResolverMisses + 1, 9));
         const float proven = provenSide(shot, false);
+        if (shot.side != 0.0f) {
+            if (proven != 0.0f)
+                tallySide(brain, shot.source, proven == shot.side ? 1.0f : 0.0f, proven == shot.side ? 0.0f : 1.0f);
+            else
+                tallySide(brain, shot.source, 0.0f, 0.7f);
+        }
         if (shot.side == 0.0f && shot.source == SideSource::NoDesync)
             brain.desyncProven = true;
         scoreGuess(brain, shot.guess, proven);
@@ -1833,6 +1877,13 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
     // попадание — свидетельство: геометрией (луч прошёл только сквозь один крайний скелет) или стороной выстрела
     const float proven = provenSide(shot, true);
     const float side = proven != 0.0f ? proven : shot.side;
+    // попадание по точке, общей для всех гипотез, о стороне ничего не говорит
+    if (shot.side != 0.0f) {
+        if (proven != 0.0f)
+            tallySide(brain, shot.source, proven == shot.side ? 1.0f : 0.0f, proven == shot.side ? 0.0f : 1.0f);
+        else if (!shot.safe)
+            tallySide(brain, shot.source, 0.6f, 0.0f);
+    }
     scoreGuess(brain, shot.guess, side);
     const float weight = proven != 0.0f ? 3.0f : 1.5f;
     if (shot.source == SideSource::Jitter)
@@ -2579,9 +2630,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             // Стороны. Вероятность главной стороны — доля попаданий при таком источнике (sideTrust, логи
             // 29.10–09.11); промахи по вине резольвера подряд тянут её к «50 на 50»: значит, сейчас
             // мы его не понимаем, и смесь сама уведёт выбор в точки, общие для обеих сторон.
-            float sideProbability = sideTrust;
+            float sideProbability = calibratedSide(brain, source, sideTrust);
             if (resolve && source != SideSource::NoDesync)
-                sideProbability = 0.5f + (sideProbability - 0.5f) * std::pow(0.7f, static_cast<float>(brain.sideMisses));
+                sideProbability = 0.5f + (sideProbability - 0.5f) * std::pow(0.8f, static_cast<float>(brain.sideMisses));
             const bool jitterPhaseUnknown = predictedRecord && (jittering(brain) || desyncFlipping(brain));
             if (jitterPhaseUnknown)
                 sideProbability = std::min(sideProbability, 0.6f);

@@ -215,6 +215,8 @@ constexpr float centerBand = 2.5f;     // |lateral| меньше — выстр�
     return (lateral > 0.0f) == (geometryVotes > 0.0f) ? 1 : -1;
 }
 
+void learnServerStyle(int guess, int previousGuess, int ourSide) noexcept;
+
 // Выстрел врага в нас: разобрать, в какую сторону он целился
 void observeShot(int shooterIndex, int userId, const csgo::Vector& shooterEye, const csgo::Vector& impact, float realtime, float latency) noexcept
 {
@@ -258,6 +260,7 @@ void observeShot(int shooterIndex, int userId, const csgo::Vector& shooterEye, c
     observation.time = realtime;
     observation.lateral = offset.x * right.x + offset.y * right.y;
     observation.ourSide = pose->desync > 1.0f ? 1 : pose->desync < -1.0f ? -1 : 0;
+    learnServerStyle(guessedSide(observation.lateral), model.last.time >= 0.0f ? guessedSide(model.last.lateral) : 2, observation.ourSide);
     model.observations[model.count % model.observations.size()] = observation;
     ++model.count;
     model.lastClassified = realtime;
@@ -296,50 +299,108 @@ CounterPlan counterPlan;
     return low ? 0.2f : 0.03f;
 }
 
-CounterPlan planAgainst(int enemyIndex, float realtime, int fallbackSide) noexcept
-{
-    CounterPlan plan;
-    if (enemyIndex <= 0 || enemyIndex >= 65)
-        return plan;
-    const auto& model = enemyModels[enemyIndex];
-    const int n = std::min<int>(model.count, static_cast<int>(model.observations.size()));
-    if (n == 0 || realtime - model.last.time > 60.0f)
-        return plan;
-
-    // от старых к новым; новые весят больше
+// Стиль резольвера врага: веса «следит / статика / перебор / центр» и его последний выбор
+struct EnemyStyle {
     float follow = 0.0f, same = 0.0f, flip = 0.0f, center = 0.0f;
-    int previous = 2;
     int lastGuess = 0;
+    [[nodiscard]] float mass() const noexcept { return follow + same + flip + center; }
+};
+
+// Общая память по серверу: на хвх-серверах у половины лобби один и тот же чит, и первый выстрел
+// незнакомого врага разумнее встречать тем, как нас резольвят остальные, а не наугад
+EnemyStyle serverStyle;
+
+void learnServerStyle(int guess, int previousGuess, int ourSide) noexcept
+{
+    constexpr float decay = 0.9f;
+    serverStyle.follow *= decay;
+    serverStyle.same *= decay;
+    serverStyle.flip *= decay;
+    serverStyle.center *= decay;
+    if (guess == 0)
+        serverStyle.center += 1.0f;
+    else if (ourSide != 0 && guess == ourSide)
+        serverStyle.follow += 1.0f;
+    if (guess != 0 && previousGuess != 0 && previousGuess != 2)
+        (guess == previousGuess ? serverStyle.same : serverStyle.flip) += 1.0f;
+}
+
+[[nodiscard]] EnemyStyle styleOf(const EnemyModel& model, float realtime) noexcept
+{
+    EnemyStyle style;
+    const int n = std::min<int>(model.count, static_cast<int>(model.observations.size()));
+    if (n == 0 || realtime - model.last.time > 90.0f)
+        return style;
+    int previous = 2;
     for (int k = 0; k < n; ++k) {
         const auto& o = model.observations[(model.count - n + k) % model.observations.size()];
         const float w = std::pow(0.8f, static_cast<float>(n - 1 - k));
         const int g = guessedSide(o.lateral);
         if (g == 0)
-            center += w;
+            style.center += w;
         else if (o.ourSide != 0 && g == o.ourSide)
-            follow += w;
+            style.follow += w;
         if (previous != 2 && g != 0 && previous != 0)
-            (g == previous ? same : flip) += w;
+            (g == previous ? style.same : style.flip) += w;
         previous = g;
-        lastGuess = g;
+        style.lastGuess = g;
     }
-    // априорная масса: пока выстрелов мало, ни одна гипотеза о враге не перевешивает
+    return style;
+}
+
+// Вероятность, что следующий выстрел врага с таким стилем попадёт в голову при стороне s
+[[nodiscard]] float riskFor(const EnemyStyle& own, int s, bool low) noexcept
+{
+    // своё весит полностью, серверное — как полвыстрела на каждый свой недостающий до трёх
+    EnemyStyle st = own;
+    const float borrow = std::max(0.0f, 3.0f - own.mass()) / 3.0f * 0.5f;
+    st.follow += serverStyle.follow * borrow;
+    st.same += serverStyle.same * borrow;
+    st.flip += serverStyle.flip * borrow;
+    st.center += serverStyle.center * borrow;
     const float prior = 0.8f;
-    const float total = follow + same + flip + center + prior;
+    const float total = st.mass() + prior;
+    float risk = st.follow / total * headRisk(s, s, low) + st.center / total * headRisk(0, s, low);
+    if (st.lastGuess != 0) {
+        risk += st.same / total * headRisk(st.lastGuess, s, low);
+        risk += st.flip / total * headRisk(-st.lastGuess, s, low);
+    } else {
+        // последнего выбора нет: «статика»/«перебор» — монетка
+        risk += (st.same + st.flip) / total * 0.5f * (headRisk(1, s, low) + headRisk(-1, s, low));
+    }
+    risk += prior / total * (headRisk(1, s, low) + headRisk(-1, s, low) + headRisk(0, s, low)) / 3.0f;
+    return risk;
+}
+
+struct Threat {
+    int index = 0;
+    float weight = 0.0f;
+};
+
+// План на цикл против всех, кто может стрелять: риск — взвешенная сумма по врагам
+// (на кого смотрим — вес 1, остальные живые рядом — 0.5)
+CounterPlan planAgainst(const Threat* threats, int threatCount, float realtime, int fallbackSide) noexcept
+{
+    CounterPlan plan;
+    std::array<EnemyStyle, 16> styles{};
+    float known = serverStyle.mass();
+    EnemyStyle dominant{};
+    for (int t = 0; t < threatCount && t < static_cast<int>(styles.size()); ++t) {
+        styles[t] = styleOf(enemyModels[threats[t].index], realtime);
+        known += styles[t].mass();
+        if (threats[t].weight >= 1.0f)
+            dominant = styles[t];
+    }
+    if (threatCount == 0 || known < 0.5f)
+        return plan;
 
     float bestRisk = 1e9f;
     for (const int s : { 1, -1 }) {
         for (const bool low : { false, true }) {
-            float risk = follow / total * headRisk(s, s, low)
-                + center / total * headRisk(0, s, low);
-            if (lastGuess != 0) {
-                risk += same / total * headRisk(lastGuess, s, low);
-                risk += flip / total * headRisk(-lastGuess, s, low);
-            } else {
-                risk += (same + flip) / total * 0.5f * (headRisk(1, s, low) + headRisk(-1, s, low));
-            }
-            risk += prior / total * (headRisk(1, s, low) + headRisk(-1, s, low) + headRisk(0, s, low)) / 3.0f;
-            // при равенстве — та сторона, что дал билдер: так рисунок AA остаётся его
+            float risk = 0.0f;
+            for (int t = 0; t < threatCount && t < static_cast<int>(styles.size()); ++t)
+                risk += threats[t].weight * riskFor(styles[t], s, low);
+            // при равенстве — сторона билдера: рисунок AA остаётся его
             if (s == fallbackSide)
                 risk -= 0.001f;
             if (risk < bestRisk) {
@@ -350,13 +411,15 @@ CounterPlan planAgainst(int enemyIndex, float realtime, int fallbackSide) noexce
         }
     }
     plan.active = true;
-    const float strongest = std::max({ follow, same, flip, center });
-    plan.style = strongest < 0.5f ? "мало данных" : strongest == follow ? "следит" : strongest == center ? "центр"
-        : strongest == same ? "статика" : "перебор";
+    // подпись — по тому, на кого смотрим (своё, иначе серверное)
+    const auto& shown = dominant.mass() >= 0.5f ? dominant : serverStyle;
+    const float strongest = std::max({ shown.follow, shown.same, shown.flip, shown.center });
+    plan.style = strongest < 0.5f ? "мало данных" : strongest == shown.follow ? "следит" : strongest == shown.center ? "центр"
+        : strongest == shown.same ? "статика" : "перебор";
     // «следит» — его резольвер видит нашу сторону: меняем её каждый цикл, чтобы запись,
     // по которой он целится, успевала устареть
-    if (strongest == follow && strongest >= 0.5f)
-        plan.side = (counterPlan.active ? -counterPlan.side : plan.side);
+    if (strongest >= 0.5f && strongest == shown.follow)
+        plan.side = counterPlan.active ? -counterPlan.side : plan.side;
     return plan;
 }
 
@@ -1685,8 +1748,26 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         cycleModifier = modifierYaw(st, static_cast<float>(st.degree) + switchRandom);
         cycleValid = true;
         // контр-резольвер решает раз на цикл — по врагу, на которого смотрим
-        counterPlan = aa.antiBrute && aa.antiBruteMode == static_cast<int>(AntiBruteMode::Counter) && f.haveThreat
-            ? planAgainst(threatIndex, f.realtime, f.inverterSide) : CounterPlan{};
+        if (aa.antiBrute && aa.antiBruteMode == static_cast<int>(AntiBruteMode::Counter) && f.haveThreat) {
+            // все живые враги в пределах досягаемости; на кого смотрим — главный
+            std::array<Threat, 16> threats{};
+            int threatCount = 0;
+            const auto origin = localPlayer.get().getAbsOrigin();
+            const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 64);
+            for (int i = 1; i <= maxClients && threatCount < static_cast<int>(threats.size()); ++i) {
+                const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+                if (!entity.getPOD() || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
+                    || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()))
+                    continue;
+                const bool main = i == threatIndex;
+                if (!main && (entity.getAbsOrigin() - origin).length() > 3000.0f)
+                    continue;
+                threats[threatCount++] = { i, main ? 1.0f : 0.5f };
+            }
+            counterPlan = planAgainst(threats.data(), threatCount, f.realtime, f.inverterSide);
+        } else {
+            counterPlan = CounterPlan{};
+        }
     }
     f.st = cycleState;
 
