@@ -289,14 +289,16 @@ struct CounterPlan {
 };
 CounterPlan counterPlan;
 
-// Шанс, что выстрел в сторону g попадёт в голову при нашей стороне s и величине m
-[[nodiscard]] float headRisk(int g, int s, bool low) noexcept
+// Шанс, что выстрел в сторону g попадёт в голову при нашей стороне s и доле десинка m (0.45…1):
+// полный десинк уводит голову от центра, но в неё попадает выстрел «в нашу сторону»; low delta — наоборот
+[[nodiscard]] float headRisk(int g, int s, float m) noexcept
 {
+    const float t = std::clamp((m - 0.45f) / 0.55f, 0.0f, 1.0f);
     if (g == s)
-        return low ? 0.45f : 0.85f;
+        return 0.45f + 0.4f * t;
     if (g == 0)
-        return low ? 0.55f : 0.1f;
-    return low ? 0.2f : 0.03f;
+        return 0.55f - 0.45f * t;
+    return 0.2f - 0.17f * t;
 }
 
 // Стиль резольвера врага: веса «следит / статика / перебор / центр» и его последний выбор
@@ -349,7 +351,7 @@ void learnServerStyle(int guess, int previousGuess, int ourSide) noexcept
 }
 
 // Вероятность, что следующий выстрел врага с таким стилем попадёт в голову при стороне s
-[[nodiscard]] float riskFor(const EnemyStyle& own, int s, bool low) noexcept
+[[nodiscard]] float riskFor(const EnemyStyle& own, int s, float low) noexcept
 {
     // своё весит полностью, серверное — как полвыстрела на каждый свой недостающий до трёх
     EnemyStyle st = own;
@@ -394,22 +396,44 @@ CounterPlan planAgainst(const Threat* threats, int threatCount, float realtime, 
     if (threatCount == 0 || known < 0.5f)
         return plan;
 
+    // Варианты: сторона × доля десинка. Из почти равных (риск в пределах 0.02 от лучшего) — случайный:
+    // иначе при равенстве мы каждый раз выбирали бы одно и то же, и это читалось бы так же, как статика.
+    struct Option {
+        int side;
+        float magnitude;
+        float risk;
+    };
+    std::array<Option, 6> options{};
+    int optionCount = 0;
     float bestRisk = 1e9f;
+    float weightSum = 0.0f;
+    for (int t = 0; t < threatCount && t < static_cast<int>(styles.size()); ++t)
+        weightSum += threats[t].weight;
     for (const int s : { 1, -1 }) {
-        for (const bool low : { false, true }) {
+        for (const float m : { 1.0f, 0.7f, 0.45f }) {
             float risk = 0.0f;
             for (int t = 0; t < threatCount && t < static_cast<int>(styles.size()); ++t)
-                risk += threats[t].weight * riskFor(styles[t], s, low);
-            // при равенстве — сторона билдера: рисунок AA остаётся его
-            if (s == fallbackSide)
-                risk -= 0.001f;
-            if (risk < bestRisk) {
-                bestRisk = risk;
-                plan.side = s;
-                plan.magnitude = low ? 0.45f : 1.0f;
-            }
+                risk += threats[t].weight * riskFor(styles[t], s, m);
+            risk /= std::max(weightSum, 1e-3f);
+            options[optionCount++] = { s, m, risk };
+            bestRisk = std::min(bestRisk, risk);
         }
     }
+    std::array<int, 6> near{};
+    int nearCount = 0;
+    for (int k = 0; k < optionCount; ++k) {
+        if (options[k].risk <= bestRisk + 0.02f)
+            near[nearCount++] = k;
+    }
+    // сторона билдера — небольшой приоритет: если она среди лучших, рисунок AA остаётся его
+    int pick = near[std::uniform_int_distribution<int>{ 0, std::max(nearCount - 1, 0) }(rng)];
+    for (int k = 0; k < nearCount; ++k) {
+        if (options[near[k]].side == fallbackSide && options[near[k]].risk <= bestRisk + 0.005f
+            && std::uniform_int_distribution<int>{ 0, 1 }(rng))
+            pick = near[k];
+    }
+    plan.side = options[pick].side;
+    plan.magnitude = options[pick].magnitude;
     plan.active = true;
     // подпись — по тому, на кого смотрим (своё, иначе серверное)
     const auto& shown = dominant.mass() >= 0.5f ? dominant : serverStyle;

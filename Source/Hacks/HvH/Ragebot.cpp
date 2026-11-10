@@ -1096,6 +1096,9 @@ struct Hypotheses {
     std::array<Capsules, MAX_HYPOTHESES> caps;
     std::array<float, MAX_HYPOTHESES> weight{};
     std::array<signed char, MAX_HYPOTHESES> side{};   // сторона десинка в этой гипотезе: +1 / −1 / 0
+    // описанная сфера каждой гипотезы: луч мимо неё — мимо модели, капсулы не перебираем
+    std::array<csgo::Vector, MAX_HYPOTHESES> sphereCenter{};
+    std::array<float, MAX_HYPOTHESES> sphereRadius{};
     int count = 0;
     int main = 0;                                      // самая вероятная — по ней рисуем и пишем лог
 
@@ -1154,6 +1157,20 @@ void buildHypotheses(Hypotheses& out, const csgo::StudioHitboxSet& set, const Si
         }
     }
     out.normalize();
+    for (int h = 0; h < out.count; ++h) {
+        const auto& caps = out.caps[h];
+        csgo::Vector center{};
+        for (int k = 0; k < caps.count; ++k)
+            center += (caps.items[k].a + caps.items[k].b) * 0.5f;
+        if (caps.count)
+            center = center / static_cast<float>(caps.count);
+        float radius = 0.0f;
+        for (int k = 0; k < caps.count; ++k)
+            radius = std::max({ radius, (caps.items[k].a - center).length() + caps.items[k].radius,
+                                (caps.items[k].b - center).length() + caps.items[k].radius });
+        out.sphereCenter[h] = center;
+        out.sphereRadius[h] = radius;
+    }
 }
 
 // Состояние оружия для разброса — одно на тик
@@ -1251,7 +1268,13 @@ ShotOdds shotOdds(const SpreadState& ws, const csgo::Vector& eye, const csgo::Ve
         for (int h = 0; h < hyps.count; ++h) {
             float total = 0.0f;
             bool headHit = false;
+            const auto toCenter = hyps.sphereCenter[h] - eye;
+            const float centerDistance = toCenter.squareLength();
+            const float sphere = hyps.sphereRadius[h] * hyps.sphereRadius[h];
             for (int pellet = 0; pellet < bullets; ++pellet) {
+                const float along = toCenter.dotProduct(directions[pellet]);
+                if (centerDistance > sphere && (along <= 0.0f || centerDistance - along * along > sphere))
+                    continue;
                 const int group = firstHitGroup(hyps.caps[h], eye, eye + directions[pellet] * ws.range);
                 if (group < 0)
                     continue;
@@ -2709,7 +2732,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
             // ---- точки ----
             // Кандидаты — по прикидке одним лучом через все гипотезы; лучшие потом проверяются
-            // разбросом по смеси (32 сида), выбранная — всеми 256 перед выстрелом.
+            // разбросом по смеси (64 сида), выбранная — всеми 256 перед выстрелом.
             struct Candidate {
                 AimPoint point;
                 ShotOdds odds;
@@ -2881,7 +2904,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             }
 
             // ---- выбор точки на этой записи ----
-            // Лучшие кандидаты прикидки — разброс по смеси гипотез (32 сида). Стрелять можно туда, где
+            // Лучшие кандидаты прикидки — разброс по смеси гипотез (64 сида: у 32 погрешность ±9% у порога). Стрелять можно туда, где
             // P(нужный урон) не ниже хитшанса; из таких берётся самая полезная. Голова и тело тут
             // на равных — решает вероятность: голову по сомнительной стороне смесь сама опустит.
             const float needChance = static_cast<float>(settings.hitchance) * 0.01f;
@@ -2898,7 +2921,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     }
                     const auto angleTo = (pick.point.position - eye).toAngle();
                     pick.odds = shotOdds(ws, eye, angleTo, hyps, pick.point.groupDamage, pick.point.baseDamage, hp, minDamage,
-                                         doubleTapKill, 8, pick.point.penetration);
+                                         doubleTapKill, 4, pick.point.penetration);
                     if (pick.odds.qualified + 1e-4f >= needChance)
                         bestChecked = std::max(bestChecked, pick.odds.value);
                 }
