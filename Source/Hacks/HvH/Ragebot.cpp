@@ -61,8 +61,11 @@
 //     > фристенд-догадка (с учётом, как часто она у этого игрока права);
 //  3. по каждой цели — записи-кандидаты (onshot, стоит, свежая, старая; вне окна отката — прогноз «вперёд»),
 //     каждая оценивается целиком, берётся лучшая;
-//  4. точки мультипоинта: урон автоволлом × надёжность (вероятность попасть, калибровка по логам 29+31.10);
-//  5. хитшанс по всем 256 сидам разброса, выстрел сразу, DT сдвигает тем же пакетом.
+//  4. на каждую запись — набор гипотез «каким сервер увидит врага» (стороны и величина десинка × тайминг
+//     прогноза × фаза джиттера) с вероятностями; точки мультипоинта + центр масс хитбокса по гипотезам;
+//  5. прикидка одним лучом по всем гипотезам → лучшие 5 точек — разброс по смеси (32 сида) → выбранная —
+//     все 256 сидов × все гипотезы. Хитшанс = P(нужный урон), выбор — по ожидаемой пользе (убийство/урон),
+//     выстрел сразу, DT сдвигает тем же пакетом.
 // После выстрела: попадание/промах с причиной (по импакту пули) — это и есть обучение резольвера и прогноза.
 
 namespace hvh::ragebot
@@ -227,6 +230,9 @@ struct Brain {
     // а пока голова выигрывает по пользе, их не бывает — и по одному врагу мажем в голову раз за разом
     // (лог 01.11: «густав», «Gargamel», «мерзостb» — по 2–3 промаха резольвера в голову подряд).
     std::uint8_t headResolverMisses = 0;
+    // Промахи по вине резольвера подряд (не разброс, не стена, не лаг). Тянут вероятность главной
+    // стороны к 50/50 — смесь гипотез сама уводит выстрелы в точки, общие для обеих сторон.
+    std::uint8_t sideMisses = 0;
 };
 std::array<Brain, 65> brains{};
 
@@ -1071,55 +1077,208 @@ const std::array<SpreadSeed, SPREAD_TABLE>& spreadSeeds() noexcept
     return table;
 }
 
-// Хитшанс: % сидов, при которых пуля по скелету цели даст не меньше minDamage
-// (первый хитбокс на луче решает, куда придёт пуля: целился в голову, попал в грудь — тоже засчитано).
-// У дробовика урон всех дробин этого сида складывается.
-int hitchance(const csgo::Entity& weapon, const csgo::WeaponInfo* weaponData, const csgo::Entity& entity, const csgo::Vector& eye, const csgo::Vector& angle,
-              const Capsules& capsules, float baseDamage, int minDamage) noexcept
+// ---------- модель гипотез ----------
+// Где враг окажется на сервере в момент выстрела, точно не знает никто: сторона десинка, его
+// величина, какое обновление сервер возьмёт под прогноз, фаза джиттера. Раньше каждую такую
+// неопределённость гасили своей скидкой «надёжности» (×0.85, ×0.6, ×0.55 …) и фильтрами
+// («строгий отбор», «ждём середину», «только safe»), и хитшанс по сидам о них не знал вовсе.
+// Теперь неопределённость описана явно: набор скелетов-гипотез с вероятностями. Хитшанс считается
+// сразу по смеси — доля пар (сид разброса × гипотеза), где пуля даёт нужный урон. Одно число
+// отвечает и за разброс, и за резольвер, и за прогноз: край головы, общая для всех сторон точка,
+// середина между фазами джиттера получают ровно ту вероятность, какую дают на самом деле.
+
+constexpr int MAX_HYPOTHESES = 9;
+constexpr int DAMAGE_GROUPS = 11;
+
+struct Hypotheses {
+    std::array<Capsules, MAX_HYPOTHESES> caps;
+    std::array<float, MAX_HYPOTHESES> weight{};
+    std::array<signed char, MAX_HYPOTHESES> side{};   // сторона десинка в этой гипотезе: +1 / −1 / 0
+    int count = 0;
+    int main = 0;                                      // самая вероятная — по ней рисуем и пишем лог
+
+    void clear() noexcept
+    {
+        count = 0;
+        main = 0;
+    }
+    Capsules* add(float w, int s) noexcept
+    {
+        if (count >= MAX_HYPOTHESES || w < 0.015f)
+            return nullptr;
+        weight[count] = w;
+        side[count] = static_cast<signed char>(s);
+        return &caps[count++];
+    }
+    void normalize() noexcept
+    {
+        float total = 0.0f;
+        for (int h = 0; h < count; ++h)
+            total += weight[h];
+        if (total <= 0.0f)
+            return;
+        main = 0;
+        for (int h = 0; h < count; ++h) {
+            weight[h] /= total;
+            if (weight[h] > weight[main])
+                main = h;
+        }
+    }
+};
+
+// Скелет одной стороны: кости, вес и сдвиг (джиттер-фазы переносятся на прогнозную позицию)
+struct SideModel {
+    const csgo::matrix3x4* bones = nullptr;
+    float weight = 0.0f;
+    int side = 0;
+    csgo::Vector offset{};
+};
+
+// стороны × тайминги → капсулы гипотез
+void buildHypotheses(Hypotheses& out, const csgo::StudioHitboxSet& set, const SideModel* sides, int sideCount,
+                     const csgo::Vector* shifts, const float* shiftWeights, int shiftCount) noexcept
 {
-    const float inaccuracy = weapon.getInaccuracy();
-    float spread = weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread;
-    if (!(spread >= 0.0f && spread < 0.2f))
-        spread = 0.0f;
-    const bool negev = weapon.itemDefinitionIndex() == WeaponId::Negev;
-    const int recoilIndex = weapon.recoilIndex();
+    out.clear();
+    static Capsules base;
+    for (int s = 0; s < sideCount; ++s) {
+        if (!sides[s].bones || sides[s].weight <= 0.0f)
+            continue;
+        buildCapsules(set, sides[s].bones, base);
+        for (int t = 0; t < shiftCount; ++t) {
+            if (auto* caps = out.add(sides[s].weight * shiftWeights[t], sides[s].side)) {
+                *caps = base;
+                shiftCapsules(*caps, sides[s].offset + shifts[t]);
+            }
+        }
+    }
+    out.normalize();
+}
+
+// Состояние оружия для разброса — одно на тик
+struct SpreadState {
+    float inaccuracy = 0.0f;
+    float spread = 0.0f;
+    bool negev = false;
+    int recoilIndex = 0;
+    float range = 8192.0f;
+    int bullets = 1;
+};
+
+SpreadState spreadState(const csgo::Entity& weapon, const csgo::WeaponInfo* weaponData) noexcept
+{
+    SpreadState s;
+    s.inaccuracy = std::max(weapon.getInaccuracy(), 0.0f);
+    s.spread = weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread;
+    if (!(s.spread >= 0.0f && s.spread < 0.2f))
+        s.spread = 0.0f;
+    s.negev = weapon.itemDefinitionIndex() == WeaponId::Negev;
+    s.recoilIndex = weapon.recoilIndex();
+    s.range = weaponData->range;
+    s.bullets = std::clamp(weaponData->bullets, 1, SPREAD_TABLE - HITCHANCE_SEEDS);
+    return s;
+}
+
+// Что даст выстрел в точку по смеси гипотез
+struct ShotOdds {
+    float qualified = 0.0f;     // P(урон ≥ мин. урона) — это и есть хитшанс
+    float kill = 0.0f;          // P(убить этой пулей)
+    float value = 0.0f;         // ожидаемая польза: убийство 1, добивание второй пулей DT 0.55, урон — доля хп × 0.45
+    float head = 0.0f;          // P(пуля в голову)
+    bool everyHypothesis = false;   // центр точки попадает в каждую гипотезу весом ≥ 5% (бывший safe point)
+    bool everyOnMainSide = false;   // ... в каждую гипотезу главной стороны
+};
+
+[[nodiscard]] float shotValue(float damage, float hp, bool doubleTap) noexcept
+{
+    if (damage >= hp)
+        return 1.0f;
+    if (doubleTap && damage * 2.0f >= hp)
+        return 0.55f;
+    return 0.45f * std::min(damage / hp, 1.0f);
+}
+
+// seedStep ≤ 0 — один луч ровно в точку (дёшево: прикидка для всех точек мультипоинта),
+// иначе каждый seedStep-й из 256 сидов разброса; penetration — вероятность, что пробитие
+// стены пройдёт, как насчитал автоволл (он его переоценивает)
+ShotOdds shotOdds(const SpreadState& ws, const csgo::Vector& eye, const csgo::Vector& angle, const Hypotheses& hyps,
+                  const std::array<float, DAMAGE_GROUPS>& groupDamage, float baseDamage, float hp, int minDamage,
+                  bool doubleTap, int seedStep, float penetration) noexcept
+{
+    ShotOdds odds;
+    if (hyps.count == 0)
+        return odds;
     const float sp = std::sin(Helpers::deg2rad(angle.x)), cp = std::cos(Helpers::deg2rad(angle.x));
     const float sy = std::sin(Helpers::deg2rad(angle.y)), cy = std::cos(Helpers::deg2rad(angle.y));
     const csgo::Vector forward{ cp * cy, cp * sy, -sp };
     const csgo::Vector right{ sy, -cy, 0.0f };
     const csgo::Vector up{ sp * cy, sp * sy, cp };
-    // урон одной пули/дробины по хитгруппе
-    std::array<float, 11> groupDamage{};
-    for (int group = 0; group < static_cast<int>(groupDamage.size()); ++group)
-        groupDamage[group] = autowall::scaleDamage(entity, group, weaponData, baseDamage);
-    const int bullets = std::clamp(weaponData->bullets, 1, SPREAD_TABLE - HITCHANCE_SEEDS);
     const auto& seeds = spreadSeeds();
+    const auto damageOf = [&](int group) {
+        return group >= 0 && group < DAMAGE_GROUPS ? groupDamage[group] : baseDamage;
+    };
 
-    int hits = 0;
-    for (int i = 0; i < HITCHANCE_SEEDS; ++i) {
-        float total = 0.0f;
+    const bool center = seedStep <= 0;
+    const int bullets = center ? 1 : ws.bullets;
+    int samples = 0;
+    std::array<csgo::Vector, 16> directions;
+    odds.everyHypothesis = center;
+    odds.everyOnMainSide = center;
+    const int mainSide = hyps.side[hyps.main];
+
+    for (int i = 0; i < (center ? 1 : HITCHANCE_SEEDS); i += center ? 1 : seedStep) {
         for (int pellet = 0; pellet < bullets; ++pellet) {
+            if (center) {
+                directions[pellet] = forward;
+                continue;
+            }
             const auto& seed = seeds[i + pellet];
             float a = seed.a, c = seed.c;
-            if (negev && recoilIndex < 3) {
-                for (int j = 3; j > recoilIndex; --j) {
+            if (ws.negev && ws.recoilIndex < 3) {
+                for (int j = 3; j > ws.recoilIndex; --j) {
                     a *= a;
                     c *= c;
                 }
                 a = 1.0f - a;
                 c = 1.0f - c;
             }
-            const float x = seed.cosB * a * inaccuracy + seed.cosD * c * spread;
-            const float y = seed.sinB * a * inaccuracy + seed.sinD * c * spread;
-            const auto direction = normalized(forward + right * x + up * y);
-            const int group = firstHitGroup(capsules, eye, eye + direction * weaponData->range);
-            if (group >= 0)
-                total += group < static_cast<int>(groupDamage.size()) ? groupDamage[group] : baseDamage;
+            const float x = seed.cosB * a * ws.inaccuracy + seed.cosD * c * ws.spread;
+            const float y = seed.sinB * a * ws.inaccuracy + seed.sinD * c * ws.spread;
+            directions[pellet] = normalized(forward + right * x + up * y);
         }
-        if (total >= static_cast<float>(minDamage))
-            ++hits;
+        ++samples;
+        for (int h = 0; h < hyps.count; ++h) {
+            float total = 0.0f;
+            bool headHit = false;
+            for (int pellet = 0; pellet < bullets; ++pellet) {
+                const int group = firstHitGroup(hyps.caps[h], eye, eye + directions[pellet] * ws.range);
+                if (group < 0)
+                    continue;
+                total += damageOf(group);
+                headHit = headHit || group == HITGROUP_HEAD;
+            }
+            const float w = hyps.weight[h];
+            if (center && hyps.weight[h] >= 0.05f && total <= 0.0f) {
+                odds.everyHypothesis = false;
+                if (hyps.side[h] == mainSide)
+                    odds.everyOnMainSide = false;
+            }
+            if (total <= 0.0f)
+                continue;
+            if (total >= static_cast<float>(minDamage))
+                odds.qualified += w;
+            if (total >= hp)
+                odds.kill += w;
+            if (headHit)
+                odds.head += w;
+            odds.value += w * shotValue(total, hp, doubleTap);
+        }
     }
-    return hits * 100 / HITCHANCE_SEEDS;
+    const float scale = penetration / static_cast<float>(std::max(samples, 1));
+    odds.qualified *= scale;
+    odds.kill *= scale;
+    odds.head *= scale;
+    odds.value *= scale;
+    return odds;
 }
 
 // ---------- автостоп ----------
@@ -1466,6 +1625,7 @@ void evaluateMiss(int index) noexcept
     if (!reason) {
         // пуля прошла сквозь нашу модель, а на сервере модели там не было — сторона десинка
         reason = positionRight ? "резольвер (прогноз позиции верный)" : "резольвер";
+        brain.sideMisses = static_cast<std::uint8_t>(std::min(brain.sideMisses + 1, 6));
         if (shot.isHead)
             brain.headResolverMisses = static_cast<std::uint8_t>(std::min(brain.headResolverMisses + 1, 9));
         const float proven = provenSide(shot, false);
@@ -1532,7 +1692,9 @@ struct AimPoint {
     bool edge = false;
     int group = 0;
     bool sideSafe = false;      // общая для найденного угла и максимума той же стороны
-    bool safe = false;          // общая для всех трёх скелетов
+    bool safe = false;          // попадает в каждую заметную гипотезу
+    std::array<float, DAMAGE_GROUPS> groupDamage{};   // урон одной пули по хитгруппам (броня учтена)
+    float penetration = 1.0f;   // вероятность, что пробитие стены пройдёт (1 — стены нет)
 };
 
 struct Target {
@@ -1540,7 +1702,8 @@ struct Target {
     AimPoint point;
     AimPoint fallback;          // вторая группа (тело вместо головы и наоборот) — если по первой нет хитшанса
     float score = -1.0f;
-    float reliability = 1.0f;   // оценка шанса, что модель верна (без хитшанса разброса)
+    ShotOdds odds;              // по смеси гипотез: шанс нужного урона, убийства, польза
+    Hypotheses hyps;            // гипотезы этой записи — финальный хитшанс считается по ним же
     float fov = 0.0f;
     int minDamage = 0;
     RecordKind kind = RecordKind::Live;
@@ -1649,6 +1812,8 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
             hvh::antiaim::isFreestanding() ? ", фристенд" : "", sent ? pitch : 0.0f, onGround ? "земля" : "воздух", speed,
             defensive::windowLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет");
         fileLog(text);
+        if (memoryPtr)
+            hvh::antiaim::onHurtByEnemy(attackerIndex, hitgroup, memoryPtr->globalVars->realtime);
         return;
     }
     if (attackerIndex != localIndex || victimIndex <= 0 || victimIndex >= 65 || !memoryPtr)
@@ -1677,6 +1842,7 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
     if (shot.source == SideSource::Layers)
         hvh::resolver::onHit(victimIndex);
     brain.bruteSide = 0.0f;
+    brain.sideMisses = 0;
     if (hitgroup == 1)
         brain.headResolverMisses = 0;
     std::uint8_t& hits = shot.isHead ? brain.headHits : brain.bodyHits;
@@ -1768,6 +1934,7 @@ void onRoundStart() noexcept
         brain.misses = 0;
         brain.bruteSide = 0.0f;
         brain.headResolverMisses = 0;    // новый раунд — голова снова в деле (иначе голову не били полкарты)
+        brain.sideMisses = 0;
     }
     hvh::resolver::onRoundStart();
 }
@@ -2209,6 +2376,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const float cone = std::max(weapon.getInaccuracy(), 0.0f)
         + std::clamp(weapon.weaponMode() == 1 ? weaponData->spreadAlt : weaponData->spread, 0.0f, 0.2f);
     // мультипоинт по всему телу — до ~70 точек на цель, каждая автоволл: бюджет на тик против фризов
+    const auto ws = spreadState(weapon, weaponData);
     int pointBudget = 240;
 
     static std::array<Target, 3> top;
@@ -2216,7 +2384,6 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     static LagRecord predicted;
     static LagRecord live;
     static csgo::matrix3x4 bones[RECORD_BONES];
-    static Capsules aimCaps, plusCaps, minusCaps, earlierCaps, laterCaps;
 
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
@@ -2329,15 +2496,6 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         // больше 100 — «HP+N»: убить с запасом; иначе хп меньше мин. урона — достаточно добить
         const int minDamage = minDamageSetting > 100 ? health + (minDamageSetting - 100) : std::min(minDamageSetting, health);
         const bool safeRequired = rage.safePoint == 2 || (rage.safePoint == 1 && brain.misses > 0);
-        // своя статистика: по голове мажем, а по телу попадаем — голове меньше доверия
-        const float headRate = (brain.headHits + 0.5f) / (brain.headShots + 1.0f);
-        const float bodyRate = (brain.bodyHits + 0.5f) / (brain.bodyShots + 1.0f);
-        // статистика головы — только если в голову правда стреляли (раньше 4 попадания в тело без единого выстрела
-        // в голову уже давали ей штраф)
-        const bool headUnlucky = (brain.bodyShots >= 4 && brain.headShots >= 3 && bodyRate > headRate + 0.1f) || brain.headResolverMisses == 1;
-        // два промаха резольвера в голову подряд — до попадания в голову бьём тело, голову только если
-        // тело недоступно (наповал по голове 1.5×0.35 ≈ 0.5 — меньше любого убийства телом)
-        const bool headBanned = brain.headResolverMisses >= 2;
 
         std::array<std::pair<csgo::Vector, std::uint8_t>, 64> viewPoints, shownPoints;
         int viewPointCount = 0, shownPointCount = 0;
@@ -2417,125 +2575,112 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             }
             resolverText = sideLabel(source, side);
 
-            // ---- точки ----
-            // Каждая точка: урон (автоволл до точки записи, реальная хитгруппа на луче) и надёжность —
-            // оценка вероятности попасть при том, чего мы точно не знаем (калибровка по логам 29+31.10):
-            //  * сторона: точка, общая для всех трёх скелетов, от неё не зависит; иначе × доверие к стороне
-            //    (тело), × его квадрат (голова: догадкой 31% против 52% у тела, перебором 15% против 42%);
-            //  * прогноз «вперёд»: тело ×0.7, голова ×0.4 (логи: тело 47% против 81% на свежей, голова 27% против 80%);
-            //    точка, не попадающая и в модель N−1, и в N, — ещё ×0.6;
-            //  * край капсулы ×0.9, сквозь стену ×0.85.
-            // Выбор — по пользе: убить сейчас (1.5) > убить двумя пулями DT (1.1) > урон (урон/хп), всё × надёжность.
-            const bool checkSafe = !cheap && resolve;
-            // Строгий отбор (логи 04–09.11, 412 выстрелов по живым): прогноз в воздухе 21%, прогноз по
-            // джиттеру/флипам 32–41%, небезопасные точки 20–43%, голова в прыжке/на джиттере ~30%.
-            // Отброшенное попадало в 36%, оставшееся — в 65%. Лучше подождать тик-другой настоящую запись.
-            // Перебор и «не десинкает» не трогаем — там сторона известна (7/7, 3/6).
-            const bool strict = rage.strictShots && checkSafe && source != SideSource::NoDesync && source != SideSource::Brute;
-            if (strict && predictedRecord && (airborne || jittering(brain) || desyncFlipping(brain))) {
-                statusText = "строгий: ждём настоящую запись";
-                continue;
-            }
-            // Выстрел придёт к серверу на границе пакета врага — сервер возьмёт N−1 или N наугад. Если за
-            // обновление враг сдвигается заметно (> 4 ед.), ждём середину периода: это не дольше полупериода
-            // (при чоке 14 — до ~100 мс), а попадание перестаёт быть монеткой.
-            if (predictedRecord && aheadRisk && !cheap && aheadStep.length() * 2.0f > 4.0f) {
-                statusText = "прогноз: ждём середину обновления";
-                continue;
-            }
-            static Capsules centerCaps;
-            if (checkSafe) {
-                buildCapsules(*set, record.bones, centerCaps);
-                buildCapsules(*set, record.plus, plusCaps);
-                buildCapsules(*set, record.minus, minusCaps);
-            }
-            // Точка головы безопасна, только если луч в каждой модели первым входит именно в голову.
-            // Раньше хватало любой капсулы: луч в голову одной модели и в плечо другой считался безопасным,
-            // и по логам 31.10 так вышло 16 выстрелов «в голову», попавших в тело.
-            const auto hitsAs = [&](const Capsules& caps, const csgo::Vector& end, bool head) {
-                return head ? firstHitGroup(caps, eye, end) == HITGROUP_HEAD : rayHits(eye, end, caps);
+            // ---- гипотезы: каким сервер увидит врага в момент выстрела ----
+            // Стороны. Вероятность главной стороны — доля попаданий при таком источнике (sideTrust, логи
+            // 29.10–09.11); промахи по вине резольвера подряд тянут её к «50 на 50»: значит, сейчас
+            // мы его не понимаем, и смесь сама уведёт выбор в точки, общие для обеих сторон.
+            float sideProbability = sideTrust;
+            if (resolve && source != SideSource::NoDesync)
+                sideProbability = 0.5f + (sideProbability - 0.5f) * std::pow(0.7f, static_cast<float>(brain.sideMisses));
+            const bool jitterPhaseUnknown = predictedRecord && (jittering(brain) || desyncFlipping(brain));
+            if (jitterPhaseUnknown)
+                sideProbability = std::min(sideProbability, 0.6f);
+
+            std::array<SideModel, 4> sideModels{};
+            int sideCount = 0;
+            const auto addSide = [&](const csgo::matrix3x4* skeleton, float weight, int s, csgo::Vector offset = {}) {
+                if (sideCount < static_cast<int>(sideModels.size()) && weight > 0.0f)
+                    sideModels[sideCount++] = { skeleton, weight, s, offset };
             };
-            const auto isSafe = [&](const csgo::Vector& point, bool head) {
-                if (!checkSafe)
-                    return true;
-                const auto end = eye + normalized(point - eye) * weaponData->range;
-                return hitsAs(centerCaps, end, head) && hitsAs(plusCaps, end, head) && hitsAs(minusCaps, end, head);
-            };
-            // Слои: сторону находят надёжнее, чем величину (4 из 5 доказанных промахов в голову — сторона
-            // верна, ноги дальше). Точка, общая для найденного угла и полного десинка той же стороны,
-            // от величины не зависит — ей доверяем как стороне, а не как стороне и углу сразу.
-            const bool layerSide = checkSafe && source == SideSource::Layers && side != 0.0f;
-            const bool flipping = desyncFlipping(brain);
-            const bool headNeedsSafe = (source == SideSource::Layers && (record.resolvedConfidence < 0.6f || flipping))
-                || source == SideSource::Air || source == SideSource::Jitter;
+            const int mainSign = side > 0.0f ? 1 : side < 0.0f ? -1 : 0;
             const csgo::matrix3x4* sideExtreme = side > 0.0f ? record.plus : record.minus;
-            static Capsules sideCaps;
-            if (layerSide)
-                buildCapsules(*set, sideExtreme, sideCaps);
-            const auto isSideSafe = [&](const csgo::Vector& point, bool head) {
-                if (!layerSide)
-                    return false;
-                const auto end = eye + normalized(point - eye) * weaponData->range;
-                return hitsAs(aimCaps, end, head) && hitsAs(sideCaps, end, head);
-            };
-            buildCapsules(*set, bones, aimCaps);
-
-            const bool checkSteps = predictedRecord && !cheap && aheadStep.squareLength() > 1.0f;
-            if (checkSteps) {
-                earlierCaps = aimCaps;
-                laterCaps = aimCaps;
-                for (int k = 0; k < aimCaps.count; ++k) {
-                    earlierCaps.items[k].a -= aheadStep;
-                    earlierCaps.items[k].b -= aheadStep;
-                    laterCaps.items[k].a += aheadStep;
-                    laterCaps.items[k].b += aheadStep;
+            const csgo::matrix3x4* otherExtreme = side > 0.0f ? record.minus : record.plus;
+            if (!resolve) {
+                addSide(bones, 1.0f, 0);
+            } else if (jitterPhaseUnknown && list.count >= 2 && jittering(brain)) {
+                // джиттер взгляда на прогнозе: в какой фазе рывка враг будет на сервере — монетка.
+                // Обе фазы (своими скелетами) переносим на прогнозную позицию
+                for (int k = 0; k < 2; ++k)
+                    addSide(list.at(k).bones, 0.5f, 0, record.origin - list.at(k).origin);
+            } else {
+                switch (source) {
+                case SideSource::NoDesync:
+                    addSide(record.bones, 0.9f, 0);
+                    addSide(record.plus, 0.05f, 1);
+                    addSide(record.minus, 0.05f, -1);
+                    break;
+                case SideSource::Air:
+                    addSide(record.bones, 0.5f, 0);
+                    addSide(record.plus, 0.25f, 1);
+                    addSide(record.minus, 0.25f, -1);
+                    break;
+                case SideSource::Layers:
+                    // слои сторону находят надёжнее величины: часть веса — максимуму той же стороны
+                    if (hvh::resolver::extremeActive(i)) {
+                        addSide(sideExtreme, sideProbability, mainSign);
+                    } else {
+                        addSide(record.bones, sideProbability * 0.65f, mainSign);
+                        addSide(sideExtreme, sideProbability * 0.35f, mainSign);
+                    }
+                    addSide(otherExtreme, 1.0f - sideProbability, -mainSign);
+                    break;
+                default:
+                    if (mainSign == 0) {
+                        addSide(record.bones, 0.4f, 0);
+                        addSide(record.plus, 0.3f, 1);
+                        addSide(record.minus, 0.3f, -1);
+                    } else {
+                        // статика/перебор/память/догадка: ноги на крайнем угле, но бывает и low delta
+                        addSide(sideExtreme, sideProbability * 0.85f, mainSign);
+                        addSide(record.bones, 0.15f, 0);
+                        addSide(otherExtreme, (1.0f - sideProbability) * 0.85f, -mainSign);
+                    }
+                    break;
                 }
             }
-            const auto stepSafe = [&](const csgo::Vector& point) {
-                const auto end = eye + normalized(point - eye) * weaponData->range;
-                return rayHits(eye, end, earlierCaps) && rayHits(eye, end, laterCaps);
-            };
-            // Джиттер на прогнозе: позицию мы угадываем, а в какой фазе рывка враг будет на сервере — нет.
-            // Поза двух свежих записей (обе фазы), перенесённая на прогнозную позицию: точка должна попадать в обе.
-            const bool checkPhases = predictedRecord && !cheap && list.count >= 2 && (jittering(brain) || desyncFlipping(brain));
-            static Capsules phaseCaps[2];
-            csgo::Vector phaseShift[2]{};
-            if (checkPhases) {
-                for (int k = 0; k < 2; ++k) {
-                    phaseShift[k] = record.origin - list.at(k).origin;
-                    buildCapsules(*set, list.at(k).bones, phaseCaps[k]);
-                    shiftCapsules(phaseCaps[k], phaseShift[k]);
-                }
+
+            // Тайминг прогноза: сервер возьмёт обновление N, а может N−1 или N+1. Фаза у границы
+            // пакета (aheadRisk) — почти поровну; в воздухе курс гуляет сильнее.
+            std::array<csgo::Vector, 3> shifts{};
+            std::array<float, 3> shiftWeights{ 1.0f, 0.0f, 0.0f };
+            int shiftCount = 1;
+            if (predictedRecord && aheadStep.squareLength() > 1.0f) {
+                const float edge = aheadRisk ? 0.25f : airborne ? 0.2f : 0.12f;
+                shifts = { csgo::Vector{}, csgo::Vector{} - aheadStep, aheadStep };
+                shiftWeights = { 1.0f - 2.0f * edge, edge, edge };
+                shiftCount = 3;
             }
-            const auto phaseSafe = [&](const csgo::Vector& point, bool head) {
-                const auto end = eye + normalized(point - eye) * weaponData->range;
-                return hitsAs(phaseCaps[0], end, head) && hitsAs(phaseCaps[1], end, head);
-            };
+            static Hypotheses hyps;
+            buildHypotheses(hyps, *set, sideModels.data(), sideCount, shifts.data(), shiftWeights.data(), shiftCount);
+            if (hyps.count == 0)
+                continue;
+            resolverText = sideLabel(source, side);
 
-            // край капсулы прощает только при известной стороне: иначе «край» — промах по чужой стороне
-            float sideScale = 1.0f;
-            if (source == SideSource::Layers)
-                sideScale = std::clamp(record.resolvedConfidence * 1.4f, 0.35f, 1.0f);
-            else if (resolve && !sideCertain)
-                sideScale = side == 0.0f ? 0.35f : 0.45f;
-
-            struct Scored {
+            // ---- точки ----
+            // Кандидаты — по прикидке одним лучом через все гипотезы; лучшие потом проверяются
+            // разбросом по смеси (32 сида), выбранная — всеми 256 перед выстрелом.
+            struct Candidate {
                 AimPoint point;
-                float score = -1.0f;
-                bool safe = false;
-                float reliability = 1.0f;
+                ShotOdds odds;
             };
-            Scored head, body, any;
-            const auto offer = [](Scored& slot, const AimPoint& point, float score, bool safe, float reliability) {
-                if (score > slot.score)
-                    slot = { point, score, safe, reliability };
+            constexpr int CANDIDATES = 5;
+            std::array<Candidate, CANDIDATES> picks{};
+            int pickCount = 0;
+            const auto keep = [&](const Candidate& candidate) {
+                int slot = pickCount;
+                while (slot > 0 && candidate.odds.value > picks[slot - 1].odds.value)
+                    --slot;
+                if (slot >= CANDIDATES)
+                    return;
+                for (int k = std::min(pickCount, CANDIDATES - 1); k > slot; --k)
+                    picks[k] = picks[k - 1];
+                picks[slot] = candidate;
+                pickCount = std::min(pickCount + 1, CANDIDATES);
             };
             viewPointCount = 0;
+            const bool sideSplit = hyps.count > 1;
 
             for (const auto& [flag, hitboxes] : hitboxGroups) {
-                // тело наповал по надёжной точке — лучше уже не будет (голова может только сравняться)
-                if (!viewOnly && body.score >= 1.5f * 0.99f)
-                    break;
                 if (!(settings.hitboxes & flag))
                     continue;
                 const bool isHead = flag == HB_Head;
@@ -2545,28 +2690,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 if (isLimb && cheap)
                     continue;
                 const bool multipoint = (settings.multipoint & flag) && (!cheap || viewOnly);
-                // каждый промах прижимает точки к центру; прогноз — тоже
-                const float shrink = (brain.misses >= 2 ? 0.4f : brain.misses == 1 ? 0.7f : 1.0f) * (predictedRecord ? 0.75f : 1.0f);
-                const float maxScale = (isHead ? settings.headScale : settings.bodyScale) * sideScale;
-                float trust = 1.0f;
-                // логи 04–08.11 по «вперёд»: голова 30%, тело 43% (на настоящих записях 65–90%)
-                if (predictedRecord)
-                    trust *= isHead ? 0.5f : 0.7f;
-                // прогноз в воздухе: стрейф меняет курс между обновлениями — 12 из 55 (22%)
-                if (predictedRecord && airborne)
-                    trust *= 0.5f;
-                // прогноз по джиттерящему/перекидывающему десинк: 20 из 64 (31%)
-                if (predictedRecord && (jittering(brain) || desyncFlipping(brain)))
-                    trust *= 0.75f;
-                // Бан/невезение головы — про ошибку стороны десинка: штрафуют только небезопасные точки
-                // (ниже, по точке). Раньше штраф шёл на всю голову, и после двух промахов в начале раунда
-                // голову не били до конца раунда даже там, где она общая для всех сторон. Логи 04–09.11:
-                // безопасная голова по настоящим записям — 35/55 (64%), безопасное тело — 59%.
-                const float headSidePenalty = !isHead ? 1.0f : headBanned ? 0.35f : headUnlucky ? 0.6f : 1.0f;
-                if (!isHead && settings.preferBody)
-                    trust *= 1.3f;
-                // голове раньше шёл квадрат доверия — при DT тело всегда выигрывало у головы
-                const float sideFactor = sideTrust;
+                const float maxScale = isHead ? settings.headScale : settings.bodyScale;
 
                 for (const auto hitboxId : hitboxes) {
                     if (hitboxId == Hitbox::Max)
@@ -2574,15 +2698,33 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     const auto hitbox = set->getHitbox(hitboxId);
                     if (!hitbox || hitbox->bone < 0 || hitbox->bone >= RECORD_BONES)
                         continue;
-                    const auto min = transform(hitbox->bbMin, bones[hitbox->bone]);
-                    const auto max = transform(hitbox->bbMax, bones[hitbox->bone]);
-                    const auto center = (min + max) * 0.5f;
+                    const auto centerOf = [&](const csgo::matrix3x4* skeleton) {
+                        return (transform(hitbox->bbMin, skeleton[hitbox->bone]) + transform(hitbox->bbMax, skeleton[hitbox->bone])) * 0.5f;
+                    };
+                    const csgo::matrix3x4* mainBones = sideModels[0].bones;
+                    float bestWeight = -1.0f;
+                    for (int s = 0; s < sideCount; ++s) {
+                        if (sideModels[s].weight > bestWeight) {
+                            bestWeight = sideModels[s].weight;
+                            mainBones = sideModels[s].bones;
+                        }
+                    }
+                    const auto min = transform(hitbox->bbMin, mainBones[hitbox->bone]);
+                    const auto max = transform(hitbox->bbMax, mainBones[hitbox->bone]);
+                    csgo::Vector mainOffset{};
+                    for (int s = 0; s < sideCount; ++s) {
+                        if (sideModels[s].bones == mainBones)
+                            mainOffset = sideModels[s].offset;
+                    }
+                    const auto center = (min + max) * 0.5f + mainOffset;
 
-                    // мультипоинт: центр, края поперёк взгляда, верх головы, точки по оси вытянутых хитбоксов;
-                    // размер — ползунок или авто: пятно разброса + погрешность анимации бегущего внутри капсулы
+                    // мультипоинт: центр, края поперёк взгляда, верх головы, точки по оси вытянутых хитбоксов
                     std::array<csgo::Vector, 14> points{ center };
                     std::size_t count = 1;
                     const float radius = hitbox->capsuleRadius;
+                    const auto view = normalized(center - eye);
+                    csgo::Vector across{ view.y, -view.x, 0.0f };
+                    across = across.squareLength() > 0.0001f ? normalized(across) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
                     if (multipoint && radius > 0.0f) {
                         float scale = maxScale;
                         if (settings.autoScale) {
@@ -2590,21 +2732,15 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             const float animError = 0.5f + std::min(record.velocity.length2D(), 300.0f) * 0.006f;
                             scale = std::min(scale, (radius * 0.95f - blur - animError) / radius);
                         }
-                        scale *= shrink;
                         if (scale >= 0.2f) {
-                            const auto view = normalized(center - eye);
-                            csgo::Vector across{ view.y, -view.x, 0.0f };
-                            across = across.squareLength() > 0.0001f ? normalized(across) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
                             const float offset = radius * scale;
                             points[count++] = center + across * offset;
                             points[count++] = center - across * offset;
                             if (isHead) {
-                                // макушка и две диагонали сверху: голова из-за угла часто видна только верхом
                                 points[count++] = center + worldUp * offset;
                                 points[count++] = center + (worldUp + across) * (offset * 0.7f);
                                 points[count++] = center + (worldUp - across) * (offset * 0.7f);
                             } else {
-                                // низ капсулы поперёк взгляда (видно из-под укрытия)
                                 points[count++] = center - worldUp * (offset * 0.8f);
                             }
                         }
@@ -2613,160 +2749,136 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             const float along = 0.5f * std::min(scale + 0.3f, 0.9f);
                             points[count++] = center + axis * along;
                             points[count++] = center - axis * along;
-                            // углы капсулы: край по оси + край поперёк
                             if (scale >= 0.2f) {
-                                const auto view = normalized(center - eye);
-                                csgo::Vector across{ view.y, -view.x, 0.0f };
-                                across = across.squareLength() > 0.0001f ? normalized(across) : csgo::Vector{ 1.0f, 0.0f, 0.0f };
-                                const float side = radius * scale * 0.7f;
-                                points[count++] = center + axis * along + across * side;
-                                points[count++] = center - axis * along - across * side;
+                                const float sideOffset = radius * scale * 0.7f;
+                                points[count++] = center + axis * along + across * sideOffset;
+                                points[count++] = center - axis * along - across * sideOffset;
                             }
                         }
                     }
-                    // конечности без мультипоинта: хотя бы концы кости — из-за укрытия чаще торчит кисть/локоть
                     if (isLimb && !multipoint) {
                         const auto axis = max - min;
                         points[count++] = center + axis * 0.4f;
                         points[count++] = center - axis * 0.4f;
                     }
-                    // сторона не доказана: середина между тем же хитбоксом в крайних скелетах — если капсулы
-                    // перекрываются, точка попадает при любой стороне (проверка безопасности её подтвердит)
-                    const auto centerOf = [&](const csgo::matrix3x4* skeleton) {
-                        return (transform(hitbox->bbMin, skeleton[hitbox->bone]) + transform(hitbox->bbMax, skeleton[hitbox->bone])) * 0.5f;
-                    };
-                    if (checkSafe && !sideCertain && (isHead || flag == HB_Chest) && count < points.size()) {
-                        const auto middle = (centerOf(record.plus) + centerOf(record.minus)) * 0.5f;
-                        if ((middle - center).squareLength() > 1.0f)
-                            points[count++] = middle;
-                    }
-                    // голова по слоям: середина между найденным углом и максимумом той же стороны —
-                    // самая вероятная точка, общая для обеих моделей
-                    if (layerSide && isHead && count < points.size()) {
-                        const auto middle = (center + centerOf(sideExtreme)) * 0.5f;
-                        if ((middle - center).squareLength() > 1.0f)
-                            points[count++] = middle;
-                    }
-                    // джиттер: середина головы между двумя фазами — туда, где она будет в любой из них
-                    if (checkPhases && isHead && count < points.size()) {
-                        const auto middle = (centerOf(list.at(0).bones) + phaseShift[0] + centerOf(list.at(1).bones) + phaseShift[1]) * 0.5f;
-                        if ((middle - center).squareLength() > 1.0f)
-                            points[count++] = middle;
+                    // Центр масс хитбокса по всем гипотезам (с весами): точка, которая в среднем ближе
+                    // всего к настоящему хитбоксу. Заменяет три частных «середины» (между сторонами,
+                    // между найденным углом и максимумом, между фазами джиттера) — смесь их уже содержит.
+                    if (sideSplit && (isHead || flag == HB_Chest || flag == HB_Stomach) && count < points.size()) {
+                        csgo::Vector mean{};
+                        float total = 0.0f;
+                        for (int s = 0; s < sideCount; ++s) {
+                            mean += (centerOf(sideModels[s].bones) + sideModels[s].offset) * sideModels[s].weight;
+                            total += sideModels[s].weight;
+                        }
+                        if (total > 0.0f) {
+                            mean = mean / total;
+                            if ((mean - center).squareLength() > 1.0f)
+                                points[count++] = mean;
+                        }
                     }
 
                     for (std::size_t p = 0; p < count; ++p) {
                         if (p > 0 && pointBudget-- <= 0)
                             break;
-                        const bool safe = isSafe(points[p], isHead);
-                        if ((safeRequired || strict) && checkSafe && !safe)
-                            continue;
-                        // голова у прыгающего/джиттерящего — мимо даже по общей точке (31% и 29%)
-                        if (strict && isHead && (source == SideSource::Air || source == SideSource::Jitter))
-                            continue;
-                        const bool sideSafe = !safe && isSideSafe(points[p], isHead);
-                        // Край головы — только если он общий для всех трёх скелетов. Логи 31.10–01.11: край головы
-                        // 53% попаданий и 32% промахов резольвера против 62% и 16% у центра; сессия 01.11 01:00 —
-                        // край 1 из 8, центр 8 из 12. Край попадает лишь в одну модель, и любая ошибка угла ног
-                        // уводит голову из-под него; центр прощает её гораздо лучше.
-                        // Раньше небезопасный край головы выкидывался: голова торчит краем из-за укрытия, центр за стеной —
-                        // и стрелять «некуда». Теперь край берётся со скидкой (центр при равных всё равно лучше).
-                        const bool headEdgeUnsafe = isHead && p > 0 && checkSafe && !safe;
-                        // Голова при сомнительной стороне — только в точки, общие для всех трёх скелетов.
-                        // Сессия 01.11 01:09–01:21: 4 промаха в «общую точку» головы по слоям с уверенностью 28–58%,
-                        // и импакт доказал другую сторону; ещё 2 доказанных — голова в воздухе. Тело по тем же
-                        // слоям попадает ~85%, поэтому лучше тело, чем голова наугад. Якорь LBY (100%) и
-                        // уверенные слои (≥60%) по-прежнему бьют голову по найденному углу.
-                        // Раньше центр головы тут выкидывался — рейдж «фоткал» по зелёной голове. Теперь только штраф ниже.
-                        const bool headUnsafe = isHead && headNeedsSafe && checkSafe && !safe;
                         // дальность оружия автоволл не проверяет (у зевса ~183 ед.)
                         if ((points[p] - eye).squareLength() > weaponData->range * weaponData->range)
                             continue;
                         const float baseDamage = autowall::getDamageToPoint(engineInterfaces, interfaces, points[p], weaponData, rage.autowall);
                         if (baseDamage < 1.0f)
                             continue;
-                        int group = firstHitGroup(aimCaps, eye, points[p] + normalized(points[p] - eye) * 2.0f);
+                        AimPoint point;
+                        point.position = points[p];
+                        point.baseDamage = baseDamage;
+                        point.isHead = isHead;
+                        point.edge = p > 0;
+                        for (int g = 0; g < DAMAGE_GROUPS; ++g)
+                            point.groupDamage[g] = autowall::scaleDamage(entity, g, weaponData, baseDamage);
+                        // дробовик: урон по сидам складывается из дробин — в хитшансе; тут — оценка для порога
+                        int group = firstHitGroup(hyps.caps[hyps.main], eye, points[p] + normalized(points[p] - eye) * 2.0f);
                         if (group < 0)
                             group = hitbox->group;
-                        float damage = autowall::scaleDamage(entity, group, weaponData, baseDamage);
-                        // дробовик: дробины × доля, что ляжет в тело (пятно ~d·cone против ~8 ед. корпуса);
-                        // точный ответ потом даст хитшанс с суммой по дробинам
+                        point.group = group;
+                        point.damage = point.groupDamage[std::clamp(group, 0, DAMAGE_GROUPS - 1)];
                         if (weaponData->bullets > 1) {
                             const float blur = (points[p] - eye).length() * cone + 0.001f;
-                            damage *= static_cast<float>(weaponData->bullets) * std::clamp(8.0f * 8.0f / (blur * blur), 0.1f, 1.0f);
+                            point.damage *= static_cast<float>(weaponData->bullets) * std::clamp(8.0f * 8.0f / (blur * blur), 0.1f, 1.0f);
                         }
-                        // Сквозь стену автоволл переоценивает пробитие («пуля застряла» — 23 промаха с уроном
-                        // от 8 до 191). В строгом режиме урон через стену засчитываем с запасом 20%.
-                        const float openDamageHere = static_cast<float>(weaponData->damage) * std::pow(weaponData->rangeModifier, (points[p] - eye).length() / 500.0f);
-                        const bool throughWall = baseDamage < openDamageHere * 0.97f;
-                        const float countedDamage = strict && throughWall ? damage * 0.8f : damage;
-                        const bool lethal = countedDamage >= hp;
-                        const bool qualified = countedDamage >= static_cast<float>(minDamage);
-                        // конечность — если набирает мин. урон (раньше только наповал: торчащую руку игнорили)
-                        if (isLimb && !lethal && !qualified)
-                            continue;
-
-                        // край тела, не общий для всех скелетов: по логам 58% против 74% у центра
-                        float reliability = trust * (p > 0 ? (safe ? 0.9f : 0.75f) : 1.0f);
-                        if (sideSafe)
-                            reliability *= sideTrust;
-                        else if (!safe)
-                            reliability *= sideFactor * (isHead && layerSide && !hvh::resolver::extremeActive(i) ? 0.85f : 1.0f);
-                        // по игроку идёт перебор вариантов резольвера — угол под вопросом,
-                        // голова по нему ненадёжна (тело прощает ошибку в стороне, голова нет)
-                        if (isHead && !safe && hvh::resolver::bruteforcing(i))
-                            reliability *= 0.7f;
-                        if (headUnsafe)
-                            reliability *= 0.8f;
-                        // Логи 04–08.11 по настоящим записям: голова по догадке 42% против 82% у тела,
-                        // небезопасная голова в воздухе 1 из 5, по джиттеру 0 из 3 — при сомнительной стороне тело
-                        if (isHead && source == SideSource::Guess && !safe)
-                            reliability *= 0.65f;
-                        if (!safe)
-                            reliability *= headSidePenalty;
-                        if (isHead && !safe && (source == SideSource::Air || source == SideSource::Jitter))
-                            reliability *= 0.55f;
-                        if (headEdgeUnsafe)
-                            reliability *= 0.8f;
-                        // Прогноз: точка, не попадающая в обе соседние модели (N−1 и N) — скидка. Раньше голову
-                        // и врага в воздухе по таким точкам не били вовсе: голова горела зелёным, выстрела не было.
-                        if (checkSteps && !stepSafe(points[p]))
-                            reliability *= isHead || airborne ? 0.6f : 0.45f;
-                        // не попадает в одну из фаз джиттера — промах в половине случаев
-                        if (checkPhases && !phaseSafe(points[p], isHead))
-                            reliability *= isHead ? 0.4f : 0.6f;
-                        // зелёным рисуем только то, что реально пошло в выбор цели
-                        if ((lethal || qualified) && viewPointCount < static_cast<int>(viewPoints.size()))
-                            viewPoints[viewPointCount++] = { points[p], static_cast<std::uint8_t>(lethal ? 2 : 1) };
-                        // сквозь стену: автоволл иногда переоценивает пробитие (логи: 51 «пуля застряла»)
+                        // Сквозь стену автоволл переоценивает пробитие («пуля застряла» — 23–51 промах в логах):
+                        // это вероятность, что пуля вообще дойдёт, а не скидка «на всякий случай»
                         const float openDamage = static_cast<float>(weaponData->damage) * std::pow(weaponData->rangeModifier, (points[p] - eye).length() / 500.0f);
-                        if (baseDamage < openDamage * 0.97f)
-                            reliability *= 0.85f;
-                        // польза: убить сейчас 1.5; при заряженном DT пол-хп — убийство двумя пулями 1.1; иначе доля хп
-                        const float value = lethal ? 1.5f : doubleTapKill && damage * 2.0f >= hp ? 1.1f : damage / hp;
-                        const float score = value * reliability;
-                        const AimPoint point{ points[p], damage, baseDamage, isHead, p > 0, group, sideSafe, safe && checkSafe };
-                        offer(any, point, score, safe, reliability);
-                        if (qualified)
-                            offer(isHead ? head : body, point, score, safe, reliability);
-                        // центр уже убивает надёжно — края хуже по хитшансу, автоволл на них не тратим
-                        if (p == 0 && lethal && reliability >= trust * 0.99f && !viewOnly)
-                            break;
+                        point.penetration = baseDamage < openDamage * 0.97f ? 0.85f : 1.0f;
+
+                        const auto angleTo = (points[p] - eye).toAngle();
+                        const ShotOdds rough = shotOdds(ws, eye, angleTo, hyps, point.groupDamage, baseDamage, hp, minDamage,
+                                                        doubleTapKill, 0, point.penetration);
+                        if (rough.value <= 0.0f)
+                            continue;
+                        point.safe = resolve && rough.everyHypothesis;
+                        point.sideSafe = resolve && !rough.everyHypothesis && rough.everyOnMainSide;
+                        // safe point из настроек: точка обязана попадать в каждую заметную гипотезу
+                        if (safeRequired && resolve && !rough.everyHypothesis)
+                            continue;
+                        // конечность — если набирает мин. урон хоть в какой-то гипотезе
+                        if (isLimb && rough.qualified <= 0.0f && rough.kill <= 0.0f)
+                            continue;
+                        if (viewPointCount < static_cast<int>(viewPoints.size()) && (rough.qualified > 0.5f || rough.kill > 0.5f))
+                            viewPoints[viewPointCount++] = { points[p], static_cast<std::uint8_t>(rough.kill > 0.5f ? 2 : 1) };
+                        keep({ point, rough });
                     }
                 }
             }
 
             // ---- выбор точки на этой записи ----
-            // при равной пользе — тело: отдача та же, а хитбокс больше и хитшанс выше
-            const bool headFirst = head.score > body.score && !(settings.bodyIfLethal && body.score >= 0.0f && body.point.damage >= hp);
-            Scored chosen = headFirst ? head : body;
-            Scored other = headFirst ? body : head;
+            // Лучшие кандидаты прикидки — разброс по смеси гипотез (32 сида). Стрелять можно туда, где
+            // P(нужный урон) не ниже хитшанса; из таких берётся самая полезная. Голова и тело тут
+            // на равных — решает вероятность: голову по сомнительной стороне смесь сама опустит.
+            const float needChance = static_cast<float>(settings.hitchance) * 0.01f;
+            int bestPick = -1, bestHead = -1, bestBody = -1, bestAny = -1;
+            float bestScore = -1.0f, headScore = -1.0f, bodyScore = -1.0f, anyScore = -1.0f;
+            float bestChecked = -1.0f;
+            for (int k = 0; k < pickCount; ++k) {
+                auto& pick = picks[k];
+                if (!cheap) {
+                    // разброс пользу только отнимает: прикидка хуже уже найденного — дальше не считаем
+                    if (pick.odds.value < bestChecked) {
+                        pickCount = k;
+                        break;
+                    }
+                    const auto angleTo = (pick.point.position - eye).toAngle();
+                    pick.odds = shotOdds(ws, eye, angleTo, hyps, pick.point.groupDamage, pick.point.baseDamage, hp, minDamage,
+                                         doubleTapKill, 8, pick.point.penetration);
+                    if (pick.odds.qualified + 1e-4f >= needChance)
+                        bestChecked = std::max(bestChecked, pick.odds.value);
+                }
+                float score = pick.odds.value * (!pick.point.isHead && settings.preferBody ? 1.15f : 1.0f);
+                if (score > anyScore) {
+                    anyScore = score;
+                    bestAny = k;
+                }
+                if (pick.odds.qualified + 1e-4f < needChance && !cheap)
+                    continue;
+                if (pick.point.isHead && score > headScore) {
+                    headScore = score;
+                    bestHead = k;
+                } else if (!pick.point.isHead && score > bodyScore) {
+                    bodyScore = score;
+                    bestBody = k;
+                }
+            }
+            // тело наповал с нужным шансом — голова не нужна
+            const bool bodyKills = settings.bodyIfLethal && bestBody >= 0 && picks[bestBody].odds.kill + 1e-4f >= needChance;
+            bestPick = bodyKills ? bestBody : headScore > bodyScore ? bestHead : bestBody;
+            const int otherPick = bestPick == bestHead ? bestBody : bestHead;
+            bestScore = bestPick >= 0 ? std::max(headScore, bodyScore) : -1.0f;
+            if (bodyKills)
+                bestScore = bodyScore;
             int effectiveMinDamage = minDamage;
-            if (chosen.score < 0.0f) {
-                // мин. урон не набран — стреляем только с форсшутом (в лучшую точку). Раньше при пороге
-                // «убить» (HP+N) бил в тело от пол-хп в расчёте на вторую пулю DT: со скаутом второй пули
-                // нет, и МД 100 на деле не работал — рейдж бил в тело без форсшута.
-                if (any.score < 0.0f || !forceShot) {
-                    statusText = safeRequired ? "нет безопасных точек" : "мало урона";
+            if (bestPick < 0) {
+                // Мин. урон не набирается с нужным шансом. Форсшут — в самую полезную точку, порог урона
+                // опускается до того, что она даёт; без него ждём (рейдж «держит», выстрел не тратим).
+                if (bestAny < 0 || !forceShot || picks[bestAny].odds.qualified > 0.0f) {
+                    statusText = bestAny < 0 ? (safeRequired ? "нет безопасных точек" : "мало урона") : "мало шанса";
                     if (c == 0) {
                         shownPoints = viewPoints;
                         shownPointCount = viewPointCount;
@@ -2774,24 +2886,25 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     }
                     continue;
                 }
-                chosen = any;
-                other = {};
-                effectiveMinDamage = std::max(1, static_cast<int>(std::floor(any.point.damage)));
+                bestPick = bestAny;
+                effectiveMinDamage = std::max(1, static_cast<int>(std::floor(picks[bestAny].point.damage)));
+                bestScore = anyScore * 0.5f;
             }
+            const auto& chosen = picks[bestPick];
 
-            if (c == 0 || chosen.score > playerBest.score) {
+            if (c == 0 || bestScore > playerBest.score) {
                 shownPoints = viewPoints;
                 shownPointCount = viewPointCount;
                 shownResolver = resolverText;
             }
             // при равной пользе — запись раньше по приоритету (onshot, стоит, свежая, старая)
-            if (chosen.score > playerBest.score) {
+            if (bestScore > playerBest.score) {
                 auto& t = playerBest;
                 t.index = i;
                 t.point = chosen.point;
-                t.fallback = other.score >= 0.0f ? other.point : AimPoint{};
-                t.score = chosen.score;
-                t.reliability = chosen.reliability;
+                t.fallback = otherPick >= 0 ? picks[otherPick].point : AimPoint{};
+                t.score = bestScore;
+                t.odds = chosen.odds;
                 t.fov = fov;
                 t.minDamage = effectiveMinDamage;
                 t.kind = candidates[c].kind;
@@ -2800,8 +2913,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.backtrackTicks = list.count && candidates[c].age > 0 ? timeToTicks(list.at(0).simulationTime - record.simulationTime, interval) : 0;
                 t.updatesAhead = candidates[c].updatesAhead;
                 t.aheadPhase = predictedRecord ? aheadPhase : -1.0f;
-                t.headScore = head.score;
-                t.bodyScore = body.score;
+                t.headScore = headScore;
+                t.bodyScore = bodyScore;
                 t.choke = record.choked;
                 t.side = side;
                 t.source = source;
@@ -2811,9 +2924,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 t.layerMax = record.maxDesync;
                 t.layerConfidence = record.resolvedConfidence;
                 t.animFixed = record.resolvedByAnimation || record.animFixed;
-                t.flipping = flipping;
+                t.flipping = desyncFlipping(brain);
                 t.set = set;
                 t.studio = studio;
+                t.hyps = hyps;
                 std::copy(bones, bones + RECORD_BONES, t.bones);
                 t.haveVariants = record.variants;
                 if (record.variants) {
@@ -2821,8 +2935,8 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     std::copy(record.minus, record.minus + RECORD_BONES, t.minus);
                 }
             }
-            // надёжное убийство — лучше не найти, остальные записи не сканируем
-            if (playerBest.score >= 1.5f * 0.99f)
+            // почти верное убийство — лучше не найти, остальные записи не сканируем
+            if (playerBest.odds.kill >= 0.9f)
                 break;
         }
 
@@ -2920,49 +3034,32 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         return false;
     }
 
-    // ---- хитшанс: цель, её вторая группа, следующая цель — первая, где набрался ----
-    static Capsules capsules;
+    // ---- хитшанс по смеси гипотез, все 256 сидов: цель, её вторая группа, следующая цель ----
+    // Это тот же расчёт, что выбирал точку, только точнее. Отдельные планки для прогноза
+    // (+25% хитшанса, порог «надёжности») больше не нужны: неуверенность прогноза уже внутри смеси.
     csgo::Vector angle{};
     int chance = 0, firstChance = -1, chosenSlot = -1;
+    const float needChance = static_cast<float>(settings.hitchance) * 0.01f;
     for (int k = 0; k < topCount && chosenSlot < 0; ++k) {
         auto& t = top[k];
-        buildCapsules(*t.set, t.bones, capsules);
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(t.index));
+        const float targetHp = static_cast<float>(std::max(entity.health(), 1));
         angle = (t.point.position - eye).toAngle();
-        chance = hitchance(weapon, weaponData, entity, eye, angle, capsules, t.point.baseDamage, t.minDamage);
-        if (firstChance < 0)
-            firstChance = chance;
-        // Прогнозная запись («вперёд», экстраполяция) — отдельный разговор. Хитшанс считает только
-        // разброс по сидам и ничего не знает о том, что сама запись может быть выдумана неверно, а
-        // статистика по ней плохая: за 07.11 по прогнозу 18 попаданий на 47 промахов (28%), по
-        // реальным записям — 216 на 59 (79%). Это почти половина всех промахов сессии.
-        // Поэтому планку для прогноза поднимаем: пусть лучше рейдж промолчит и дождётся записи.
-        const bool predictedShot = t.kind == RecordKind::Ahead || t.kind == RecordKind::Extrapolated;
-        const int needChance = predictedShot ? std::min(settings.hitchance + 25, 95) : settings.hitchance;
-        // Хитшанс по прогнозу почти всегда 100% — мажет сама модель. Порог надёжности: медленному оружию
-        // (скаут, AWP, дигл/R8 — промах стоит секунду, за которую убивают нас) по плохому прогнозу не
-        // стрелять, ждать настоящую запись; автоматам промах дешевле — порог ниже. Наповал по надёжной
-        // точке проходит всегда (тело на земле без джиттера ≈ 0.7).
-        if (predictedShot) {
-            const auto group = groupOf(weapon);
-            const bool slowWeapon = group == WeaponGroup::Scout || group == WeaponGroup::Awp || group == WeaponGroup::Heavy;
-            const float needReliability = slowWeapon ? 0.42f : 0.28f;
-            if (t.reliability < needReliability) {
-                if (firstChance < 0)
-                    firstChance = 0;
-                continue;
-            }
-        }
-        if (chance < needChance && t.fallback.damage > 0.0f) {
+        auto odds = shotOdds(ws, eye, angle, t.hyps, t.point.groupDamage, t.point.baseDamage, targetHp, t.minDamage, doubleTapKill, 1, t.point.penetration);
+        if (odds.qualified + 1e-4f < needChance && t.fallback.baseDamage > 0.0f) {
             const auto fallbackAngle = (t.fallback.position - eye).toAngle();
-            if (const int fallbackChance = hitchance(weapon, weaponData, entity, eye, fallbackAngle, capsules, t.fallback.baseDamage, t.minDamage);
-                fallbackChance >= needChance) {
+            const auto fallbackOdds = shotOdds(ws, eye, fallbackAngle, t.hyps, t.fallback.groupDamage, t.fallback.baseDamage, targetHp, t.minDamage, doubleTapKill, 1, t.fallback.penetration);
+            if (fallbackOdds.qualified + 1e-4f >= needChance) {
                 t.point = t.fallback;
                 angle = fallbackAngle;
-                chance = fallbackChance;
+                odds = fallbackOdds;
             }
         }
-        if (chance >= needChance)
+        chance = static_cast<int>(odds.qualified * 100.0f + 0.5f);
+        if (firstChance < 0)
+            firstChance = chance;
+        t.odds = odds;
+        if (odds.qualified + 1e-4f >= needChance)
             chosenSlot = k;
     }
     if (chosenSlot < 0) {
@@ -2974,10 +3071,11 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     }
     if (chosenSlot != 0) {
         std::swap(top[0], top[chosenSlot]);
-        buildCapsules(*top[0].set, top[0].bones, capsules);
+        angle = (top[0].point.position - eye).toAngle();
     }
     const auto& best = top[0];
     target = best.index;
+    const auto& capsules = best.hyps.caps[best.hyps.main];
 
     // Хайдшоты: выстрел только в команде, которая уйдёт в чоке — следующая (с углами AA) её закроет.
     // Этот тик отправляется — стреляем следующим, его заранее держим в чоке

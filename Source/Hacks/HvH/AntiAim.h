@@ -27,6 +27,11 @@ enum class Manual { None, Left, Right, Back, Forward };
 // после fixMovement: поправить forward/side под наклон, иначе с roll персонаж идёт вбок
 void fixRollMovement(csgo::UserCmd* cmd) noexcept;
 
+// контр-резольвер: по нам попали (hitgroup 1 — голова уточняет геометрию разбора выстрелов)
+void onHurtByEnemy(int attackerIndex, int hitgroup, float realtime) noexcept;
+// как, по мнению контр-резольвера, резольвит нас текущий враг («следит», «перебор» …), "" — нет данных
+[[nodiscard]] const char* counterStyle() noexcept;
+
 // угол последней отправленной команды — его видит сервер и другие игроки
 void storeSentAngles(float pitch, float yaw) noexcept;
 

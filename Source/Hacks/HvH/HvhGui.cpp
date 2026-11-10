@@ -758,14 +758,9 @@ void drawRageTab() noexcept
             static constexpr const char* safeModes[]{ "Выкл", "После промаха", "Всегда" };
             combo("Безопасные точки", &rage.safePoint, safeModes, IM_ARRAYSIZE(safeModes));
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Выкл — точки, общие для всех сторон десинка, просто в приоритете\n"
-                                  "(остальные оцениваются по доверию к стороне, голова — строже).\n"
-                                  "После промаха / Всегда — стрелять ТОЛЬКО в такие точки.");
-            ImGui::Checkbox("Строгий отбор выстрелов", &rage.strictShots);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("По десинкерам — только точки, общие для всех сторон; без прогноза по прыгающим\n"
-                                  "и джиттерящим; голова в прыжке/на джиттере не бьётся; сквозь стену — с запасом урона.\n"
-                                  "Логи 04–09.11: такие выстрелы попадали в 65%%, отброшенные — в 36%%.");
+                ImGui::SetTooltip("Выкл — смесь гипотез сама решает: точка, общая для всех сторон десинка,\n"
+                                  "и так получает больший шанс, чем точка одной стороны.\n"
+                                  "После промаха / Всегда — стрелять ТОЛЬКО в точки, общие для всех гипотез.");
         }
         sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
         keybind("Мин. урон (override)", rage.minDamageOverrideKey);
@@ -873,6 +868,10 @@ void drawRageTab() noexcept
             sliderFloat(weapon.autoScale ? "Макс. размер: тело" : "Размер: тело", &weapon.bodyScale, 0.0f, 1.0f, "%.2f");
         }
         sliderInt("Хитшанс", &weapon.hitchance, 0, 100, "%d%%");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Шанс нанести мин. урон с учётом ВСЕГО, чего мы не знаем: разброс по 256 сидам\n"
+                              "× гипотезы о модели врага (сторона и величина десинка, тайминг прогноза, фаза джиттера).\n"
+                              "Это строже старого хитшанса по одному скелету — ставь на 5–10%% ниже прежнего.");
         // выше 100 — «HP+N»: подпись без %d, число уже вписано
         char minDamageFormat[16];
         std::snprintf(minDamageFormat, sizeof(minDamageFormat), "HP+%d", weapon.minDamage - 100);
@@ -1560,11 +1559,19 @@ static void drawAaAntiBrute(float width, float height) noexcept
         if (aa.antiBrute) {
             static constexpr const char* triggers[]{ "Враг выстрелил", "Мы выстрелили" };
             multiCombo("Когда", &aa.antiBruteTriggers, triggers, IM_ARRAYSIZE(triggers));
-            static constexpr const char* modes[]{ "Смена стороны", "Подстройка", "Стойка пресетов" };
+            static constexpr const char* modes[]{ "Смена стороны", "Подстройка", "Стойка пресетов", "Контр-резольвер" };
             combo("Что делать", &aa.antiBruteMode, modes, IM_ARRAYSIZE(modes));
             tooltip("Смена стороны — десинк на другую сторону.\n"
                     "Подстройка — углы билдера сдвигаются на случайную долю (до «Силы»).\n"
-                    "Стойка пресетов — загружается следующий пресет из стойки справа.");
+                    "Стойка пресетов — загружается следующий пресет из стойки справа.\n"
+                    "Контр-резольвер — по импакту каждой пули врага видно, в какую сторону десинка он\n"
+                    "целился; по истории выстрелов учится его резольвер (статика / перебор / следит / центр)\n"
+                    "и на каждый цикл выбирает сторону и величину десинка, куда он вероятнее НЕ выстрелит.\n"
+                    "Пока по врагу нет данных — работает билдер.");
+            if (aa.antiBruteMode == static_cast<int>(AntiBruteMode::Counter)) {
+                if (const char* style = antiaim::counterStyle(); style && *style)
+                    ImGui::TextDisabled("Текущий враг: %s", style);
+            }
             if (aa.antiBruteMode == static_cast<int>(AntiBruteMode::Adjust))
                 sliderInt("Сила", &aa.antiBrutePower, 1, 100, "%d%%");
             if (aa.antiBruteMode == static_cast<int>(AntiBruteMode::PresetRack)) {

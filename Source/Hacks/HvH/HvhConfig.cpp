@@ -438,7 +438,7 @@ void fromJson(const json& j) noexcept
         read(a, "Defensive AA", aa.defensiveAa);
         read(a, "Anti bruteforce triggers", aa.antiBruteTriggers);
         read(a, "Anti bruteforce mode", aa.antiBruteMode);
-        aa.antiBruteMode = std::clamp(aa.antiBruteMode, 0, 2);
+        aa.antiBruteMode = std::clamp(aa.antiBruteMode, 0, 3);
         read(a, "Anti bruteforce power", aa.antiBrutePower);
         read(a, "Anti bruteforce order", aa.antiBruteOrder);
         read(a, "Freestand static", aa.freestandStatic);

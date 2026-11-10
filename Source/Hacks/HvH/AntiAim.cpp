@@ -144,6 +144,222 @@ void toggleManual(const KeyBind& key, Manual direction) noexcept
     return (point - (a + ab * t)).length();
 }
 
+// ---- контр-резольвер ----
+// Анти-брут раньше реагировал вслепую: враг выстрелил — перевернуть сторону (или сдвинуть настройки).
+// Но куда он целился, видно по самой пуле: импакт задаёт луч, луч проходит у нашей головы слева,
+// справа или по центру от оси взгляда — это и есть сторона, которую выбрал его резольвер. По истории
+// таких выстрелов на каждого врага видно, как он резольвит:
+//   * «следит» — бьёт ровно в нашу настоящую сторону (слои/LBY): сторону менять бесполезно, спасает
+//     только величина (low delta) и смена на каждом цикле;
+//   * «статика» — бьёт туда же, куда в прошлый раз; «перебор» — в обратную от прошлого выстрела;
+//   * «центр» — в середину (low delta / без десинка).
+// Перед каждым циклом чока выбираем сторону и величину десинка, при которых его СЛЕДУЮЩИЙ выстрел
+// вероятнее всего пройдёт мимо головы. Нет данных по врагу — работает билдер как раньше.
+
+struct PoseSample {
+    float time = -1.0f;         // realtime отправки
+    float eyeYaw = 0.0f;        // отправленный взгляд
+    float desync = 0.0f;        // увод тела: сторона × градусы (0 — без десинка)
+    csgo::Vector origin{};
+    float eyeZ = 0.0f;
+};
+std::array<PoseSample, 128> poseHistory{};
+int poseNext = 0;
+
+void pushPose(const PoseSample& sample) noexcept
+{
+    poseHistory[poseNext] = sample;
+    poseNext = (poseNext + 1) % static_cast<int>(poseHistory.size());
+}
+
+[[nodiscard]] const PoseSample* poseAt(float time) noexcept
+{
+    const PoseSample* best = nullptr;
+    float bestError = 0.25f;    // дальше четверти секунды — история не про этот выстрел
+    for (const auto& sample : poseHistory) {
+        if (sample.time < 0.0f)
+            continue;
+        const float error = std::abs(sample.time - time);
+        if (error < bestError) {
+            bestError = error;
+            best = &sample;
+        }
+    }
+    return best;
+}
+
+struct AimObservation {
+    float time = -1.0f;
+    float lateral = 0.0f;       // куда прошёл луч у головы: + вправо от оси взгляда, − влево (ед.)
+    int ourSide = 0;            // наша настоящая сторона в тот момент
+};
+
+struct EnemyModel {
+    int userId = -1;
+    std::array<AimObservation, 12> observations{};
+    int count = 0;              // всего записано (кольцо по 12)
+    float lastClassified = -1.0f;
+    AimObservation last{};
+};
+std::array<EnemyModel, 65> enemyModels{};
+
+// Знак геометрии: при стороне +1 (ноги левее взгляда) голова смещается влево от оси взгляда, луч в неё
+// даёт lateral < 0. Знак уточняется попаданиями в голову: тогда враг целился точно в нашу сторону.
+float geometryVotes = -1.0f;
+constexpr float centerBand = 2.5f;     // |lateral| меньше — выстрел «по центру»
+
+[[nodiscard]] int guessedSide(float lateral) noexcept
+{
+    if (std::abs(lateral) < centerBand)
+        return 0;
+    return (lateral > 0.0f) == (geometryVotes > 0.0f) ? 1 : -1;
+}
+
+// Выстрел врага в нас: разобрать, в какую сторону он целился
+void observeShot(int shooterIndex, int userId, const csgo::Vector& shooterEye, const csgo::Vector& impact, float realtime, float latency) noexcept
+{
+    if (shooterIndex <= 0 || shooterIndex >= 65)
+        return;
+    auto& model = enemyModels[shooterIndex];
+    if (model.userId != userId) {
+        model = {};
+        model.userId = userId;
+    }
+    // одна пуля — несколько импактов (пробитие): берём первый
+    if (model.lastClassified >= 0.0f && realtime - model.lastClassified < 0.2f && realtime >= model.lastClassified)
+        return;
+    // Сервер считал выстрел по нашей позе, которую враг видел: ушла от нас ~RTT + его интерп назад
+    const auto* pose = poseAt(realtime - latency - 0.08f);
+    if (!pose)
+        return;
+    auto direction = impact - shooterEye;
+    const float length = direction.length();
+    if (length < 1.0f)
+        return;
+    direction = direction / length;
+    // ближайшая к нашей вертикальной оси точка луча (по горизонтали)
+    const csgo::Vector toAxis{ pose->origin.x - shooterEye.x, pose->origin.y - shooterEye.y, 0.0f };
+    const float horizontal = direction.x * direction.x + direction.y * direction.y;
+    if (horizontal < 1e-4f)
+        return;
+    const float t = (toAxis.x * direction.x + toAxis.y * direction.y) / horizontal;
+    if (t <= 0.0f)
+        return;
+    const auto point = shooterEye + direction * t;
+    // только выстрелы в голову: в тело целятся в центр, стороны там не видно
+    if (point.z < pose->eyeZ - 12.0f || point.z > pose->eyeZ + 8.0f)
+        return;
+    const float radians = Helpers::deg2rad(pose->eyeYaw);
+    const csgo::Vector right{ std::sin(radians), -std::cos(radians), 0.0f };
+    const csgo::Vector offset{ point.x - pose->origin.x, point.y - pose->origin.y, 0.0f };
+    if (offset.length() > 20.0f)
+        return;
+    AimObservation observation;
+    observation.time = realtime;
+    observation.lateral = offset.x * right.x + offset.y * right.y;
+    observation.ourSide = pose->desync > 1.0f ? 1 : pose->desync < -1.0f ? -1 : 0;
+    model.observations[model.count % model.observations.size()] = observation;
+    ++model.count;
+    model.lastClassified = realtime;
+    model.last = observation;
+}
+
+// Враг попал нам в голову: он целился ровно в нашу сторону — уточняем знак геометрии
+void observeHeadHit(int shooterIndex, float realtime) noexcept
+{
+    if (shooterIndex <= 0 || shooterIndex >= 65)
+        return;
+    const auto& last = enemyModels[shooterIndex].last;
+    if (last.time < 0.0f || realtime - last.time > 0.5f || last.ourSide == 0 || std::abs(last.lateral) < centerBand)
+        return;
+    const float vote = (last.lateral > 0.0f) == (last.ourSide > 0) ? 1.0f : -1.0f;
+    geometryVotes = std::clamp(geometryVotes + vote, -6.0f, 6.0f);
+    if (geometryVotes == 0.0f)
+        geometryVotes = vote;
+}
+
+struct CounterPlan {
+    bool active = false;
+    int side = 1;
+    float magnitude = 1.0f;     // доля десинка из билдера: 1 — полный, 0.45 — low delta
+    const char* style = "";
+};
+CounterPlan counterPlan;
+
+// Шанс, что выстрел в сторону g попадёт в голову при нашей стороне s и величине m
+[[nodiscard]] float headRisk(int g, int s, bool low) noexcept
+{
+    if (g == s)
+        return low ? 0.45f : 0.85f;
+    if (g == 0)
+        return low ? 0.55f : 0.1f;
+    return low ? 0.2f : 0.03f;
+}
+
+CounterPlan planAgainst(int enemyIndex, float realtime, int fallbackSide) noexcept
+{
+    CounterPlan plan;
+    if (enemyIndex <= 0 || enemyIndex >= 65)
+        return plan;
+    const auto& model = enemyModels[enemyIndex];
+    const int n = std::min<int>(model.count, static_cast<int>(model.observations.size()));
+    if (n == 0 || realtime - model.last.time > 60.0f)
+        return plan;
+
+    // от старых к новым; новые весят больше
+    float follow = 0.0f, same = 0.0f, flip = 0.0f, center = 0.0f;
+    int previous = 2;
+    int lastGuess = 0;
+    for (int k = 0; k < n; ++k) {
+        const auto& o = model.observations[(model.count - n + k) % model.observations.size()];
+        const float w = std::pow(0.8f, static_cast<float>(n - 1 - k));
+        const int g = guessedSide(o.lateral);
+        if (g == 0)
+            center += w;
+        else if (o.ourSide != 0 && g == o.ourSide)
+            follow += w;
+        if (previous != 2 && g != 0 && previous != 0)
+            (g == previous ? same : flip) += w;
+        previous = g;
+        lastGuess = g;
+    }
+    // априорная масса: пока выстрелов мало, ни одна гипотеза о враге не перевешивает
+    const float prior = 0.8f;
+    const float total = follow + same + flip + center + prior;
+
+    float bestRisk = 1e9f;
+    for (const int s : { 1, -1 }) {
+        for (const bool low : { false, true }) {
+            float risk = follow / total * headRisk(s, s, low)
+                + center / total * headRisk(0, s, low);
+            if (lastGuess != 0) {
+                risk += same / total * headRisk(lastGuess, s, low);
+                risk += flip / total * headRisk(-lastGuess, s, low);
+            } else {
+                risk += (same + flip) / total * 0.5f * (headRisk(1, s, low) + headRisk(-1, s, low));
+            }
+            risk += prior / total * (headRisk(1, s, low) + headRisk(-1, s, low) + headRisk(0, s, low)) / 3.0f;
+            // при равенстве — та сторона, что дал билдер: так рисунок AA остаётся его
+            if (s == fallbackSide)
+                risk -= 0.001f;
+            if (risk < bestRisk) {
+                bestRisk = risk;
+                plan.side = s;
+                plan.magnitude = low ? 0.45f : 1.0f;
+            }
+        }
+    }
+    plan.active = true;
+    const float strongest = std::max({ follow, same, flip, center });
+    plan.style = strongest < 0.5f ? "мало данных" : strongest == follow ? "следит" : strongest == center ? "центр"
+        : strongest == same ? "статика" : "перебор";
+    // «следит» — его резольвер видит нашу сторону: меняем её каждый цикл, чтобы запись,
+    // по которой он целится, успевала устареть
+    if (strongest == follow && strongest >= 0.5f)
+        plan.side = (counterPlan.active ? -counterPlan.side : plan.side);
+    return plan;
+}
+
 void storePreset(AntiAimPreset& out) noexcept
 {
     out.states = config.antiAim.states;
@@ -177,6 +393,9 @@ void triggerAntiBrute(float realtime) noexcept
         return;
     lastAntiBrute = realtime;
     switch (static_cast<AntiBruteMode>(aa.antiBruteMode)) {
+    case AntiBruteMode::Counter:
+        // сторону выберет модель врага в начале следующего цикла — по тому, куда он сейчас целился
+        return;
     case AntiBruteMode::Adjust: {
         const float power = std::clamp(aa.antiBrutePower, 1, 100) * 0.01f;
         antiBruteWeight = std::uniform_real_distribution<float>{ -power, power }(rng);
@@ -232,6 +451,11 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
     body.z += 36.0f;
     const auto head = localPlayer.get().getEyePosition();
     const int maxClients = engineInterfaces.getEngine().getMaxClients();
+    float latency = 0.0f;
+    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel()) {
+        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
+        latency = net.getLatency(0) + net.getLatency(1);
+    }
     for (const auto& impact : pendingImpacts) {
         const int shooterIndex = engineInterfaces.getEngine().getPlayerForUserID(impact.userId);
         if (shooterIndex <= 0 || shooterIndex == localIndex)
@@ -257,6 +481,7 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
             closerTeammate = distanceToSegment(center, shooterEye, impact.position) < ours;
         }
         if (!closerTeammate) {
+            observeShot(shooterIndex, impact.userId, shooterEye, impact.position, memory.globalVars->realtime, latency);
             triggerAntiBrute(memory.globalVars->realtime);
             // в файл: выстрелы в нас (одна пуля — несколько импактов, не чаще раза в 0.3 с на стрелка).
             // Вместе с «[по нам]» это даёт процент, с которым по нам попадают
@@ -267,8 +492,13 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
                 csgo::PlayerInfo info;
                 const bool named = engineInterfaces.getEngine().getPlayerInfo(shooterIndex, info);
                 char text[256];
-                std::snprintf(text, sizeof(text), "[в нас стреляли] %s, пуля в %.0f ед. | AA: %s, сторона %+d%s", named ? info.name : "?", ours,
-                    stateName(), side, snap.active ? ", скрытые углы" : "");
+                const auto& seen = enemyModels[shooterIndex].last;
+                const bool fresh = seen.time >= 0.0f && now - seen.time < 0.05f;
+                const int aimed = fresh ? guessedSide(seen.lateral) : 2;
+                std::snprintf(text, sizeof(text), "[в нас стреляли] %s, пуля в %.0f ед. | AA: %s, сторона %+d%s, целился: %s, контр: %s", named ? info.name : "?", ours,
+                    stateName(), side, snap.active ? ", скрытые углы" : "",
+                    aimed == 2 ? "не в голову" : aimed == 0 ? "центр" : aimed > 0 ? "+" : "−",
+                    counterPlan.active ? counterPlan.style : "нет");
                 ragebot::logToFile(text);
             }
         }
@@ -398,7 +628,7 @@ float freestandSide = 0.0f;     // +1 — голова спрятана влев
 int freestandFlipTicks = 0;     // сколько тиков подряд фристенд просит другую сторону
 int freestandHoldTicks = 0;     // сколько ещё держать прошлую сторону, если фристенду не от чего прятать
 
-float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, csgo::Vector* targetEye = nullptr, bool* found = nullptr, bool includeDormant = false) noexcept
+float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, csgo::Vector* targetEye = nullptr, bool* found = nullptr, bool includeDormant = false, int* foundIndex = nullptr) noexcept
 {
     const auto eye = localPlayer.get().getEyePosition();
     float bestFov = std::numeric_limits<float>::max();
@@ -421,6 +651,8 @@ float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInter
                 *targetEye = entity.getEyePosition();
             if (found)
                 *found = true;
+            if (foundIndex)
+                *foundIndex = i;
         }
     }
     return bestYaw;
@@ -1076,6 +1308,9 @@ constexpr float desyncMargin = 12.0f;
             result *= randomSide;
         }
     }
+    // контр-резольвер: сторона, куда следующий выстрел этого врага скорее всего не придёт
+    if (counterPlan.active && !plan.forcedDesync && !plan.staticAngles)
+        result = counterPlan.side;
     // при фристенде тело уводим туда же, куда голову: от врага за укрытие
     if (freestandActive)
         result = freestandSide > 0.0f ? 1 : -1;
@@ -1147,7 +1382,10 @@ void buildDesync(const Frame& f, const Plan& plan, Pose& pose, bool flick) noexc
     // Величина: ползунок стороны, обрезанный по максимуму стойки. Статика (ручной, стена, наклон,
     // extended yaw) уводит тело на полный максимум.
     const int limit = forcedOn ? 60 : (pose.side > 0 ? st.desyncLeft : st.desyncRight);
-    const float target = std::min(static_cast<float>(std::clamp(limit, 0, 60)), f.maxDesync);
+    float target = std::min(static_cast<float>(std::clamp(limit, 0, 60)), f.maxDesync);
+    // контр-резольвер против «центра»/«следит» может выбрать low delta
+    if (counterPlan.active && !forcedOn && !plan.staticAngles)
+        target *= counterPlan.magnitude;
     pose.desync = static_cast<float>(pose.side) * target;
 
     // добавка к yaw по стороне: голова идёт за десинком, а не стоит посередине
@@ -1334,7 +1572,7 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
     f.curtime = memory.globalVars->currenttime;
 
     // ---- анти-брутфорс: триггеры и таймер ----
-    if (aa.antiBrute && (aa.antiBruteTriggers & AbEnemyShot))
+    if (aa.antiBrute && ((aa.antiBruteTriggers & AbEnemyShot) || aa.antiBruteMode == static_cast<int>(AntiBruteMode::Counter)))
         processImpacts(engineInterfaces, clientInterfaces, memory);
     else
         pendingImpacts.clear();
@@ -1405,7 +1643,8 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
 
     // ---- угроза: ближайший по прицелу враг ----
     csgo::Vector threatEye{};
-    f.toTarget = atTargetsYaw(cmd, engineInterfaces, clientInterfaces, memory, &threatEye, &f.haveThreat);
+    int threatIndex = 0;
+    f.toTarget = atTargetsYaw(cmd, engineInterfaces, clientInterfaces, memory, &threatEye, &f.haveThreat, false, &threatIndex);
     f.threatOrigin = threatEye;
     f.threatOrigin.z -= 64.0f;
     f.eye = localPlayer.get().getEyePosition();
@@ -1445,6 +1684,9 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         // тик нельзя — чокнутая команда уехала бы от отправленной на шаг спина
         cycleModifier = modifierYaw(st, static_cast<float>(st.degree) + switchRandom);
         cycleValid = true;
+        // контр-резольвер решает раз на цикл — по врагу, на которого смотрим
+        counterPlan = aa.antiBrute && aa.antiBruteMode == static_cast<int>(AntiBruteMode::Counter) && f.haveThreat
+            ? planAgainst(threatIndex, f.realtime, f.inverterSide) : CounterPlan{};
     }
     f.st = cycleState;
 
@@ -1478,7 +1720,20 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
         side = pose.side;           // индикаторы: без десинка сторону не меняем
         applyBodyMovement(f, plan.owner == Owner::Extended);
     }
+    if (f.sendPacket)
+        pushPose({ f.realtime, pose.fakeYaw, pose.desync, localPlayer.get().getAbsOrigin(), f.eye.z });
     // слайдвок — в movement::fixMovement, после того как кнопки выставлены под реальный ввод
+}
+
+void onHurtByEnemy(int attackerIndex, int hitgroup, float realtime) noexcept
+{
+    if (hitgroup == 1)
+        observeHeadHit(attackerIndex, realtime);
+}
+
+const char* counterStyle() noexcept
+{
+    return counterPlan.active ? counterPlan.style : "";
 }
 
 ExtendedView extendedView() noexcept

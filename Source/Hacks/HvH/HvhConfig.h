@@ -136,7 +136,8 @@ struct DefensiveSnap {
 };
 
 enum class SafeHead { Off, Basic, Smart };
-enum class AntiBruteMode { Flip, Adjust, PresetRack };
+// Контр-резольвер: по импактам пуль врага учит, как он нас резольвит, и выбирает сторону/величину десинка
+enum class AntiBruteMode { Flip, Adjust, PresetRack, Counter };
 enum AntiBruteTrigger { AbEnemyShot = 1 << 0, AbLocalShot = 1 << 1 };
 
 struct AntiAimState {
