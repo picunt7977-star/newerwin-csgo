@@ -94,6 +94,10 @@ AntiAimState lastBlended{};
 float blendStart = -1.0f;
 AaState blendState = AaState::Default;
 
+// ---- угрозы: кто стрелял в нас (для выбора цели AA) ----
+std::array<float, 65> shotAtUsTime{};   // realtime последней пули врага рядом с нами / попадания
+int stickyThreat = 0;
+
 // ---- анти-брутфорс ----
 struct Impact {
     int userId;
@@ -268,6 +272,8 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
             closerTeammate = distanceToSegment(center, shooterEye, impact.position) < ours;
         }
         if (!closerTeammate) {
+            if (shooterIndex < 65)
+                shotAtUsTime[shooterIndex] = memory.globalVars->realtime;
             observeShot(shooterIndex, impact.userId, shooterEye, impact.position, memory.globalVars->realtime, latency);
             triggerAntiBrute(memory.globalVars->realtime);
             // в файл: выстрелы в нас (одна пуля — несколько импактов, не чаще раза в 0.3 с на стрелка).
@@ -415,25 +421,50 @@ float freestandSide = 0.0f;     // +1 — голова спрятана влев
 int freestandFlipTicks = 0;     // сколько тиков подряд фристенд просит другую сторону
 int freestandHoldTicks = 0;     // сколько ещё держать прошлую сторону, если фристенду не от чего прятать
 
+// Кто сейчас опасен. Раньше «цель» AA была врагом ближе всех к прицелу — то есть тем, на кого
+// смотрим мы, а не тем, кто стреляет в нас. По логам 03–11.11: 61% попаданий по нам пришлись на
+// тики, когда этот враг нас не видел, — били другие (прострел, пик сбоку), а голова и тело
+// прятались от того, на кого наведена камера.
+// Теперь очки угрозы: стрелял в нас недавно > видит нас > ближе > ближе к прицелу. Текущая цель
+// держится с запасом, чтобы yaw не прыгал между двумя врагами каждый тик.
+
+[[nodiscard]] float threatScore(const csgo::Entity& entity, int index, const csgo::Vector& eye, float viewYaw,
+                                const EngineInterfaces& engineInterfaces, const Memory& memory, bool dormant) noexcept
+{
+    const auto delta = entity.getAbsOrigin() - eye;
+    const float fov = std::abs(std::remainder(delta.toAngle().y - viewYaw, 360.0f));
+    float score = fov / 180.0f + std::min(delta.length() / 3000.0f, 1.0f) * 0.6f;
+    const float now = memory.globalVars->realtime;
+    if (index < 65 && shotAtUsTime[index] > 0.0f && now - shotAtUsTime[index] < 3.0f && now >= shotAtUsTime[index])
+        score -= 3.0f;
+    if (!dormant && localPlayer.get().visibleTo(engineInterfaces, memory, entity))
+        score -= 1.5f;
+    if (index == stickyThreat)
+        score -= 0.35f;
+    return score;
+}
+
 float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory, csgo::Vector* targetEye = nullptr, bool* found = nullptr, bool includeDormant = false, int* foundIndex = nullptr) noexcept
 {
     const auto eye = localPlayer.get().getEyePosition();
-    float bestFov = std::numeric_limits<float>::max();
+    float bestScore = std::numeric_limits<float>::max();
     float bestYaw = cmd->viewangles.y;
+    int bestIndex = 0;
     if (found)
         *found = false;
 
     for (int i = 1; i <= engineInterfaces.getEngine().getMaxClients(); ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
-        if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || (!includeDormant && entity.getNetworkable().isDormant())
+        const bool dormant = entity.getPOD() && entity.getNetworkable().isDormant();
+        if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || (!includeDormant && dormant)
             || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()))
             continue;
 
-        const float yaw = (entity.getAbsOrigin() - eye).toAngle().y;
-        const float fov = std::abs(std::remainder(yaw - cmd->viewangles.y, 360.0f));
-        if (fov < bestFov) {
-            bestFov = fov;
-            bestYaw = yaw;
+        const float score = threatScore(entity, i, eye, cmd->viewangles.y, engineInterfaces, memory, dormant);
+        if (score < bestScore) {
+            bestScore = score;
+            bestIndex = i;
+            bestYaw = (entity.getAbsOrigin() - eye).toAngle().y;
             if (targetEye)
                 *targetEye = entity.getEyePosition();
             if (found)
@@ -442,6 +473,9 @@ float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInter
                 *foundIndex = i;
         }
     }
+    // запоминаем только по живым (не дормант) вызовам — иначе дормант-проход фристенда перебивал бы цель
+    if (!includeDormant)
+        stickyThreat = bestIndex;
     return bestYaw;
 }
 
@@ -453,7 +487,86 @@ float atTargetsYaw(const csgo::UserCmd* cmd, const EngineInterfaces& engineInter
 // 3) укрытие с обеих сторон одинаковое (стоим за стеной, край ещё не дошёл) — смотрим, куда едем:
 //    сторона движения — та, что выглянет первой, голова уходит в противоположную;
 // 4) иначе — какую сторону враг видит хуже (лучи от его глаз).
-float freestandYaw(const csgo::EngineTrace& engineTrace, const csgo::Vector& enemyEye, float yawToEnemy) noexcept
+float freestandFallback(const csgo::EngineTrace& engineTrace, const csgo::Vector& enemyEye, float yawToEnemy) noexcept;
+
+// Главное — откуда враг может нас увидеть ЧЕРЕЗ МГНОВЕНИЕ. Логи 09–11.11: хедшоты по нам на фристенде
+// почти все «нас видят: нет» — враг выпикивал из-за угла, а старый фристенд мерил укрытие только от
+// его текущих глаз: за стеной обе стороны закрыты одинаково, и голова вставала наугад, часто — как раз
+// к углу, из-за которого он вышел. Теперь:
+//   * точки, куда враг может выглянуть: его глаза, ±40 и ±80 ед. вбок (если туда можно пройти), и куда он едет;
+//   * наши головы: сейчас и там, где будем через ~0.2 с (мы пикаем — ведущая сторона выглянет первой);
+//   * из каждой точки врага проверяем, видна ли голова слева и справа; прячем туда, где видна реже.
+// Ничья (обе видны или обе закрыты отовсюду) — старая логика: стена сбоку, лучи к врагу, движение.
+float freestandYaw(const csgo::EngineTrace& engineTrace, const csgo::Vector& enemyEye, float yawToEnemy, const csgo::Vector& enemyVelocity) noexcept
+{
+    const auto eye = localPlayer.get().getEyePosition();
+    const auto traceWalls = [&](const csgo::Vector& from, const csgo::Vector& to) {
+        csgo::Trace trace;
+        engineTrace.traceRay({ from, to }, 0x1400B, { localPlayer.get().getPOD() }, trace);
+        return trace.startSolid ? 0.0f : trace.fraction;
+    };
+    const auto along = [](const csgo::Vector& from, const csgo::Vector& to, float fraction) {
+        return from + (to - from) * fraction;
+    };
+
+    // точки врага: глаза, выглядывание вбок (перпендикулярно линии на нас), его движение
+    const float toEnemyRadians = Helpers::deg2rad(yawToEnemy);
+    const csgo::Vector across{ -std::sin(toEnemyRadians), std::cos(toEnemyRadians), 0.0f };   // влево от линии «мы → враг»
+    std::array<std::pair<csgo::Vector, float>, 7> enemyPoints{};
+    int enemyCount = 0;
+    enemyPoints[enemyCount++] = { enemyEye, 1.0f };
+    for (const float shift : { 40.0f, -40.0f, 80.0f, -80.0f }) {
+        const auto wanted = enemyEye + across * shift;
+        const float reach = traceWalls(enemyEye, wanted);
+        // дальше стены враг не выйдет; сдвиг меньше 16 ед. — эта точка уже есть
+        if (reach * std::abs(shift) < 16.0f)
+            continue;
+        enemyPoints[enemyCount++] = { along(enemyEye, wanted, reach * 0.95f), std::abs(shift) < 50.0f ? 0.8f : 0.6f };
+    }
+    if (enemyVelocity.length2D() > 30.0f) {
+        const auto wanted = enemyEye + csgo::Vector{ enemyVelocity.x, enemyVelocity.y, 0.0f } * 0.3f;
+        enemyPoints[enemyCount++] = { along(enemyEye, wanted, traceWalls(enemyEye, wanted) * 0.95f), 1.0f };
+    }
+
+    // наши глаза: сейчас и через ~0.2 с (чок + пинг врага) — при пике важнее второе
+    std::array<std::pair<csgo::Vector, float>, 2> ourPoints{};
+    int ourCount = 0;
+    ourPoints[ourCount++] = { eye, 1.0f };
+    const auto velocity = localPlayer.get().velocity();
+    if (velocity.length2D() > 30.0f) {
+        const auto wanted = eye + csgo::Vector{ velocity.x, velocity.y, 0.0f } * 0.2f;
+        ourPoints[ourCount++] = { along(eye, wanted, traceWalls(eye, wanted) * 0.9f), 1.3f };
+    }
+
+    // голова при yaw «на врага ± 90» уходит вбок примерно на 10–20 ед. (с уводом тела — дальше)
+    float exposure[2]{};   // [0] — голова слева, [1] — справа
+    float total = 0.0f;
+    for (int o = 0; o < ourCount; ++o) {
+        for (int e = 0; e < enemyCount; ++e) {
+            const float weight = ourPoints[o].second * enemyPoints[e].second;
+            total += weight;
+            for (int side = 0; side < 2; ++side) {
+                const float sign = side == 0 ? 1.0f : -1.0f;
+                int seen = 0;
+                for (const float distance : { 10.0f, 20.0f }) {
+                    const auto head = ourPoints[o].first + across * (sign * distance);
+                    // точка головы уже в стене — с этой стороны укрытие вплотную
+                    if (traceWalls(ourPoints[o].first, head) < 0.99f)
+                        continue;
+                    if (traceWalls(enemyPoints[e].first, head) > 0.97f)
+                        ++seen;
+                }
+                exposure[side] += weight * static_cast<float>(seen) * 0.5f;
+            }
+        }
+    }
+    // разница заметная (хотя бы одна точка врага видит только одну сторону) — решено
+    if (total > 0.0f && std::abs(exposure[0] - exposure[1]) >= 0.3f)
+        return exposure[0] < exposure[1] ? 90.0f : -90.0f;
+    return freestandFallback(engineTrace, enemyEye, yawToEnemy);
+}
+
+float freestandFallback(const csgo::EngineTrace& engineTrace, const csgo::Vector& enemyEye, float yawToEnemy) noexcept
 {
     const auto eye = localPlayer.get().getEyePosition();
     const auto sidePoint = [&](float offset, float distance) {
@@ -853,23 +966,31 @@ constexpr float desyncMargin = 12.0f;
     if (wantFreestand || wantEdgeBait) {
         csgo::Vector enemyEye;
         bool found = false;
-        float toEnemy = atTargetsYaw(f.cmd, *f.engine, *f.clients, *f.memory, &enemyEye, &found, true);
+        int enemyIndex = 0;
+        float toEnemy = atTargetsYaw(f.cmd, *f.engine, *f.clients, *f.memory, &enemyEye, &found, true, &enemyIndex);
+        csgo::Vector enemyVelocity{};
+        if (found && enemyIndex > 0) {
+            const auto enemy = csgo::Entity::from(retSpoofGadgets->client, f.clients->getEntityList().getEntity(enemyIndex));
+            if (enemy.getPOD() && !enemy.getNetworkable().isDormant())
+                enemyVelocity = enemy.velocity();
+        }
         // врагов не видно — считаем, что они там, куда смотрит камера (стену сбоку это не меняет)
         if (!found) {
             toEnemy = f.camera.y;
             const float radians = Helpers::deg2rad(toEnemy);
             enemyEye = { f.eye.x + std::cos(radians) * 2000.0f, f.eye.y + std::sin(radians) * 2000.0f, f.eye.z };
         }
-        float offset = freestandYaw(f.engine->engineTrace(), enemyEye, toEnemy);
+        float offset = freestandYaw(f.engine->engineTrace(), enemyEye, toEnemy, enemyVelocity);
         if (offset != 0.0f)
             plan.freestandRaw = offset;
         if (wantFreestand) {
             if (offset != 0.0f)
                 freestandHoldTicks = 8;
-            // Гистерезис: новую сторону берём, только если она держится 3 тика подряд;
-            // пропало, от чего прятать, — ещё 8 тиков держим прошлую
+            // Гистерезис: новую сторону берём, только если она держится 2 тика подряд (было 3 —
+            // на пике это лишние 16 мс с головой в открытую сторону); пропало, от чего прятать, —
+            // ещё 8 тиков держим прошлую
             if (offset != 0.0f && freestandSide != 0.0f && (offset > 0.0f) != (freestandSide > 0.0f)) {
-                if (++freestandFlipTicks < 3)
+                if (++freestandFlipTicks < 2)
                     offset = freestandSide * 90.0f;
                 else
                     freestandFlipTicks = 0;
@@ -1069,6 +1190,13 @@ constexpr float desyncMargin = 12.0f;
 // нажатие инвертера или переворот фристенда посреди цикла ломали десинк на тик.
 [[nodiscard]] int pickSide(const Frame& f, const Plan& plan) noexcept
 {
+    // Фристенд перевернул голову посреди цикла — тело переводим сразу. Иначе до конца цикла чока
+    // (до 14 тиков) yaw смотрит в новую сторону, а тело уведено по старой — то есть К врагу, и голова
+    // вылезает из-за угла ровно на его пике. Один тик сломанной пары углов дешевле.
+    if (freestandActive && pinnedValid && pinnedSide != (freestandSide > 0.0f ? 1 : -1)) {
+        pinnedSide = freestandSide > 0.0f ? 1 : -1;
+        return pinnedSide;
+    }
     if (!f.cycleStart && pinnedValid)
         return pinnedSide;
 
@@ -1236,6 +1364,11 @@ void updateInput() noexcept
     toggleManual(aa.manualForward, Manual::Forward);
 }
 
+int threatIndex() noexcept
+{
+    return stickyThreat;
+}
+
 bool isFreestanding() noexcept
 {
     return freestandActive;
@@ -1306,6 +1439,36 @@ void storeSentAngles(float pitch, float yaw) noexcept
     sentDesync = tickDesync;
     sentRoll = currentRoll;
     hasSent = true;
+}
+
+// Где мы стоим для сервера: позиция после последней отправленной команды (с чоком сервер
+// не знает о шагах после неё). Пишется из CreateMove, читается из рендера — без блокировок:
+// раз в кадр мелкое рассогласование координат не заметно.
+namespace
+{
+float sentPos[3]{};
+bool sentDucked = false;
+bool hasSentPos = false;
+}
+
+void storeSentOrigin(float x, float y, float z, bool ducked) noexcept
+{
+    sentPos[0] = x;
+    sentPos[1] = y;
+    sentPos[2] = z;
+    sentDucked = ducked;
+    hasSentPos = true;
+}
+
+bool sentOrigin(float* out, bool& ducked) noexcept
+{
+    if (!hasSentPos)
+        return false;
+    out[0] = sentPos[0];
+    out[1] = sentPos[1];
+    out[2] = sentPos[2];
+    ducked = sentDucked;
+    return true;
 }
 
 bool sentServerPose(float& pitch, float& yaw, float& desync, float& roll) noexcept
@@ -1532,6 +1695,8 @@ void run(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const Cli
 
 void onHurtByEnemy(int attackerIndex, int hitgroup, float realtime) noexcept
 {
+    if (attackerIndex > 0 && attackerIndex < 65)
+        shotAtUsTime[attackerIndex] = realtime;
     if (hitgroup == 1)
         observeHeadHit(attackerIndex, realtime);
 }
@@ -1564,6 +1729,8 @@ void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory&
 
 void onRoundStart() noexcept
 {
+    shotAtUsTime.fill(0.0f);
+    stickyThreat = 0;
     resetAntiBrute();
 }
 

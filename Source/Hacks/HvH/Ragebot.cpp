@@ -18,6 +18,7 @@
 
 #include "HitModel.h"
 #include "Autowall.h"
+#include "Binds.h"
 #include "HvhConfig.h"
 #include "Extras.h"
 #include "Ragebot.h"
@@ -717,6 +718,17 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
     }
 }
 
+// Хитшанс для записи-прогноза. Смесь гипотез (стороны × ±1 обновление) обещала по прогнозу 85–100%,
+// а логи 29.10–11.11 дали 477 попаданий на 795 промахов (37%) против 70% у свежих записей:
+// поворот/смена курса врага за время полёта выстрела в смеси не сидит. Половина оставшегося
+// до 100% сверху: 85 → 92.5, 90 → 95; потолок 97 — выше разброс по сидам уже шумит.
+[[nodiscard]] float predictedNeed(float need, bool predicted) noexcept
+{
+    if (!predicted)
+        return need;
+    return std::max(need, std::min(need + (1.0f - need) * 0.5f, 0.97f));
+}
+
 // Окно отката сервера: цель не дальше 0.2 с от «правильного» времени и не старше sv_maxunlag
 // (serverTime — наш тикбейс, то есть время выполнения команды на сервере)
 // margin — запас у края sv_maxunlag: логи 04–09.11, бектрек 12+ тиков — 4/13 (30%) против 84–100% у 9–11:
@@ -1090,6 +1102,7 @@ struct ShotRecord {
     csgo::Vector aimPoint{};
     bool isHead = false;
     bool edge = false;
+    bool taser = false;             // выстрел зевсом
     int damage = 0;
     int hitchance = 0;
     float side = 0.0f;              // +1/−1 — по какой стороне стреляли, 0 — без резольвера
@@ -1173,7 +1186,8 @@ void scoreGuess(Brain& brain, float guess, float truth) noexcept
 [[nodiscard]] std::string shotText(const ShotRecord& shot) noexcept
 {
     char text[256];
-    int length = std::snprintf(text, sizeof(text), "%s%s, сторона %s (%s), запись %s", shot.isHead ? "голова" : "тело", shot.edge ? " (край)" : "",
+    int length = shot.taser ? std::snprintf(text, sizeof(text), "[зевс, %.0f ед.] ", (shot.aimPoint - shot.eye).length()) : 0;
+    length += std::snprintf(text + length, sizeof(text) - length, "%s%s, сторона %s (%s), запись %s", shot.isHead ? "голова" : "тело", shot.edge ? " (край)" : "",
         shot.side > 0.0f ? "+" : shot.side < 0.0f ? "−" : "0", sideSourceNames[static_cast<int>(shot.source)], kindNames[static_cast<int>(shot.kind)]);
     if (shot.source == SideSource::Layers && length > 0 && length < static_cast<int>(sizeof(text)))
         length += std::snprintf(text + length, sizeof(text) - length, " [ноги %+.0f°/%.0f°, %.0f%%%s]", shot.layerDelta, shot.layerMax,
@@ -1480,11 +1494,12 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
             onGround = (localPlayer.get().flags() & 1) != 0;
         }
         char text[384];
-        std::snprintf(text, sizeof(text), "[по нам] %s: %s −%d (осталось %d) | AA: %s, сторона %+d%s%s, pitch %.0f, %s, скорость %.0f, окно LC %d, заряд %d, нас видят: %s",
+        std::snprintf(text, sizeof(text), "[по нам] %s: %s −%d (осталось %d) | AA: %s, сторона %+d%s%s, pitch %.0f, %s, скорость %.0f, окно LC %d, заряд %d, нас видят: %s, цель AA: %s",
             playerName(attackerIndex).c_str(), hitgroup >= 0 && hitgroup < 9 ? groups[hitgroup] : "?", damage, healthLeft,
             hvh::antiaim::stateName(), hvh::antiaim::desyncSide(), hvh::antiaim::defensiveActive() ? ", скрытые углы" : "",
             hvh::antiaim::isFreestanding() ? ", фристенд" : "", sent ? pitch : 0.0f, onGround ? "земля" : "воздух", speed,
-            defensive::windowLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет");
+            defensive::windowLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет",
+            hvh::antiaim::threatIndex() == attackerIndex ? "он" : hvh::antiaim::threatIndex() == 0 ? "нет" : "другой");
         fileLog(text);
         if (memoryPtr)
             hvh::antiaim::onHurtByEnemy(attackerIndex, hitgroup, memoryPtr->globalVars->realtime);
@@ -1816,7 +1831,7 @@ bool dormantShot(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, c
     const auto& rage = config.rage;
     // свежесть позиции -> «точность»: 100% — только что, 0% — 1.5 с назад
     const float maxAge = 1.5f * (1.0f - static_cast<float>(std::clamp(rage.dormantAccuracy, 25, 95)) / 100.0f);
-    const int minDamageSetting = minDamageOverride ? settings.minDamageOverride : settings.minDamage;
+    const int minDamageSetting = settings.minDamage;
 
     int bestIndex = 0;
     float bestDamage = 0.0f;
@@ -1887,9 +1902,17 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const auto& rage = config.rage;
     memoryPtr = &memory;
     engine.emplace(engineInterfaces.getEngine());
-    minDamageOverride = rage.minDamageOverrideKey.isSet() && rage.minDamageOverrideKey.isDown();
-    forceBody = rage.forceBodyKey.isSet() && rage.forceBodyKey.isDown();
-    forceShot = rage.forceShot && (!rage.forceShotKey.isSet() || rage.forceShotKey.isToggled());
+    // Оверрайдов больше нет — всё через бинды на строки меню. «МД оверрайд» для индикатора —
+    // держится бинд на «Мин. урон» (он сам пишет значение в настройку оружия)
+    minDamageOverride = false;
+    for (const auto& bind : binds::all()) {
+        if (bind.active && bind.label == "Мин. урон") {
+            minDamageOverride = true;
+            break;
+        }
+    }
+    forceBody = rage.forceBody;
+    forceShot = rage.forceShot;
     target = 0;
     statusText = "";
     const float realtime = memory.globalVars->realtime;
@@ -1970,15 +1993,17 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     if (taser) {
         zeusSettings = {};
         zeusSettings.hitboxes = zeusSettings.multipoint = HB_Chest | HB_Stomach | HB_Pelvis;
-        zeusSettings.bodyScale = 0.5f;
-        zeusSettings.minDamage = 100;               // не больше хп — значит, только наповал
+        zeusSettings.bodyScale = 0.4f;              // ближе к центру: разброс зевса на бегу большой
+        // «HP+N» (выше 100 — хп цели плюс N): с запасом, а не впритык — урон зевса резко падает
+        // с дистанцией, и выстрел «ровно в хп» на краю дальности часто оставляет врага живым
+        zeusSettings.minDamage = 100 + std::clamp(rage.zeusMargin, 0, 20);
         zeusSettings.hitchance = std::clamp(rage.zeusHitchance, 1, 100);
         zeusSettings.autoStop = static_cast<int>(AutoStop::Accuracy);
         zeusSettings.autoScope = false;
         zeusSettings.bodyIfLethal = true;
     }
     const auto& settings = taser ? zeusSettings : weaponSettings(groupOf(weapon));
-    extras::setMinDamage(minDamageOverride ? settings.minDamageOverride : settings.minDamage, minDamageOverride);
+    extras::setMinDamage(settings.minDamage, minDamageOverride);
     const float serverTime = memory.globalVars->serverTime();
     // во время сдвига DT команды идут пачкой без предсказания между ними: nextPrimaryAttack ещё старый
     static float firedAt = -1.0f;
@@ -2187,7 +2212,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
         const int health = entity.health();
         const float hp = static_cast<float>(health);
-        const int minDamageSetting = minDamageOverride ? settings.minDamageOverride : settings.minDamage;
+        const int minDamageSetting = settings.minDamage;
         // больше 100 — «HP+N»: убить с запасом; иначе хп меньше мин. урона — достаточно добить
         const int minDamage = minDamageSetting > 100 ? health + (minDamageSetting - 100) : std::min(minDamageSetting, health);
         const bool safeRequired = rage.safePoint == 2 || (rage.safePoint == 1 && brain.misses > 0);
@@ -2342,7 +2367,9 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             std::array<float, 3> shiftWeights{ 1.0f, 0.0f, 0.0f };
             int shiftCount = 1;
             if (predictedRecord && aheadStep.squareLength() > 1.0f) {
-                const float edge = aheadRisk ? 0.25f : airborne ? 0.2f : 0.12f;
+                // логи 29.10–11.11: «сервер взял другое обновление / был между обновлениями» — 126 промахов
+                // из 795 по прогнозу; соседние обновления весят больше, чем казалось
+                const float edge = aheadRisk ? 0.3f : airborne ? 0.25f : 0.18f;
                 shifts = { csgo::Vector{}, csgo::Vector{} - aheadStep, aheadStep };
                 shiftWeights = { 1.0f - 2.0f * edge, edge, edge };
                 shiftCount = 3;
@@ -2428,6 +2455,13 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                             const float blur = (center - eye).length() * cone * 0.5f;
                             const float animError = 0.5f + std::min(record.velocity.length2D(), 300.0f) * 0.006f;
                             scale = std::min(scale, (radius * 0.95f - blur - animError) / radius);
+                        }
+                        // Прогноз: модель стоит там, где враг БУДЕТ, ошибка ~ полшага обновления (в прыжке больше).
+                        // Логи 29.10–11.11: края на прогнозе — 100 попаданий на 298 промахов (25%), центр — 43%.
+                        // Край, который дальше от центра, чем ошибка прогноза, — мимо почти всегда.
+                        if (predictedRecord) {
+                            const float predictError = 1.0f + aheadStep.length() * (airborne ? 1.5f : 1.0f);
+                            scale = std::min(scale, (radius * 0.9f - predictError) / radius);
                         }
                         if (scale >= 0.2f) {
                             const float offset = radius * scale;
@@ -2530,7 +2564,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
             // Лучшие кандидаты прикидки — разброс по смеси гипотез (64 сида: у 32 погрешность ±9% у порога). Стрелять можно туда, где
             // P(нужный урон) не ниже хитшанса; из таких берётся самая полезная. Голова и тело тут
             // на равных — решает вероятность: голову по сомнительной стороне смесь сама опустит.
-            const float needChance = static_cast<float>(settings.hitchance) * 0.01f;
+            const float needChance = predictedNeed(static_cast<float>(settings.hitchance) * 0.01f, predictedRecord);
             int bestPick = -1, bestHead = -1, bestBody = -1, bestAny = -1;
             float bestScore = -1.0f, headScore = -1.0f, bodyScore = -1.0f, anyScore = -1.0f;
             float bestChecked = -1.0f;
@@ -2687,6 +2721,99 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     if (topCount == 0 || visualOnly) {
         hesitateSince = -1.0f;
         hesitateLogged = false;
+        // ---- стоп перед пиком ----
+        // Целей ещё нет, но там, где мы будем через время торможения, враг уже простреливается с мин.
+        // уроном. Тормозим и скопимся СЕЙЧАС. Иначе выходим на полной скорости и ещё 5–7 тиков гасим её
+        // уже под прицелом: холдер, который стоит в скопе, стреляет первым (09.11: 55 из 83 смертей —
+        // без единого нашего выстрела). Так делает «ранний» автостоп в NL/gamesense.
+        static float peekStopUntil = -1.0f;
+        if (realtime < peekStopUntil - 1.0f)
+            peekStopUntil = -1.0f;      // карта/реконнект: realtime ушёл назад
+        const bool groundNow = (localPlayer.get().flags() & FL_ONGROUND) && !(cmd->buttons & csgo::UserCmd::IN_JUMP);
+        csgo::Vector flat = localPlayer.get().velocity();
+        flat.z = 0.0f;
+        const float speedNow = flat.length();
+        // Заранее — только до точной скорости (~⅓ максимума), даже при «Полном» автостопе: встань мы
+        // намертво, стоп продлевался бы тик за тиком и из-за угла было бы не выйти. Полный стоп сделает
+        // обычный автостоп, когда враг станет целью.
+        const AutoStop peekMode = AutoStop::Accuracy;
+        const float stopTarget = autoStopTarget(peekMode, stopMaxSpeed);
+        // Куда несёт: уже бежим — по скорости; уже притормозили — туда, куда жмём WASD, на полной
+        // скорости. Иначе после торможения горизонт сжимался до пары юнитов, стоп отпускал, персонаж
+        // разгонялся и тормозил снова — качался 77↔97 и выходил неточным.
+        if (speedNow <= stopTarget + 5.0f) {
+            const float yaw = Helpers::deg2rad(cmd->viewangles.y);
+            const float forward = std::clamp(cmd->forwardmove / 450.0f, -1.0f, 1.0f);
+            const float side = std::clamp(cmd->sidemove / 450.0f, -1.0f, 1.0f);
+            const csgo::Vector wish{ std::cos(yaw) * forward + std::sin(yaw) * side, std::sin(yaw) * forward - std::cos(yaw) * side, 0.0f };
+            const float length = wish.length();
+            flat = length > 0.01f ? wish * (stopMaxSpeed / length) : csgo::Vector{};
+        }
+        // горизонт — сколько тиков гасить полную скорость, + тик на скоп и отправку
+        const int peekTicks = std::clamp(ticksToStop(std::max(flat.length(), speedNow), stopTarget, stopMaxSpeed, moveVars, interval) + 2, 3, 12);
+        bool peekStop = false;
+        const bool peekAllowed = !visualOnly && settings.peekStop && stopMode != AutoStop::Off && !taser && groundNow
+            && localPlayer.get().moveType() != MoveType::LADDER
+            && readyIn <= interval * static_cast<float>(peekTicks);
+        if (!peekAllowed || flat.squareLength() < 1.0f) {
+            peekStopUntil = -1.0f;
+        } else {
+            if (realtime < peekStopUntil) {
+                peekStop = true;
+            } else {
+                // куда донесёт за это время (без торможения — с запасом); в стену — до стены
+                const auto ahead = eye + flat * (interval * static_cast<float>(peekTicks));
+                csgo::Trace wall;
+                engineInterfaces.engineTrace().traceRay({ eye, ahead }, 0x201400B, { localPlayer.get().getPOD() }, wall);
+                const auto reach = wall.fraction < 1.0f ? eye + (ahead - eye) * std::max(wall.fraction - 0.05f, 0.0f) : ahead;
+                const std::array<csgo::Vector, 2> eyes{ eye + (reach - eye) * 0.5f, reach };
+                int checked = 0;
+                for (int i = 1; i <= maxClients && !peekStop && checked < 6; ++i) {
+                    const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+                    if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
+                        || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get()) || entity.gunGameImmunity())
+                        continue;
+                    const auto& list = records[i];
+                    if (list.count == 0)
+                        continue;
+                    const auto& record = list.at(0);
+                    const auto toTarget = (record.origin - eye).toAngle();
+                    const float fov = std::hypot(std::remainder(toTarget.x - cmd->viewangles.x, 360.0f), std::remainder(toTarget.y - cmd->viewangles.y, 360.0f));
+                    if (fov > rage.fov)
+                        continue;
+                    ++checked;
+                    const int health = std::max(entity.health(), 1);
+                    const int setting = settings.minDamage;
+                    const float need = forceShot ? 1.0f
+                        : static_cast<float>(setting > 100 ? health + (setting - 100) : std::min(setting, health));
+                    // голова и грудь (кость 6, как у AI peek): по ним решается почти любой пик
+                    const std::array<std::pair<csgo::Vector, int>, 2> spots{ std::pair{ record.bones[HEAD_BONE].origin(), static_cast<int>(HitGroup::Head) },
+                                                                             std::pair{ record.bones[6].origin(), static_cast<int>(HitGroup::Chest) } };
+                    for (const auto& from : eyes) {
+                        for (const auto& [spot, group] : spots) {
+                            if ((spot - from).squareLength() > weaponData->range * weaponData->range)
+                                continue;
+                            const float raw = autowall::getDamageBetween(engineInterfaces, interfaces, from, spot, weaponData, rage.autowall);
+                            if (raw > 0.0f && autowall::scaleDamage(entity, group, weaponData, raw) >= need) {
+                                peekStop = true;
+                                break;
+                            }
+                        }
+                        if (peekStop)
+                            break;
+                    }
+                }
+                // держим решение до конца горизонта: проверка по краю укрытия мигает тик в тик
+                if (peekStop)
+                    peekStopUntil = realtime + interval * static_cast<float>(peekTicks);
+            }
+        }
+        if (peekStop) {
+            if (needScope && scopeAllowed)
+                cmd->buttons |= csgo::UserCmd::IN_ATTACK2;
+            autoStop(cmd, peekMode, stopMaxSpeed, interval, moveVars);
+            statusText = "стоп перед пиком";
+        }
         return false;
     }
     if (hesitateSince < 0.0f || realtime < hesitateSince)
@@ -2732,13 +2859,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     }
 
     // ---- хитшанс по смеси гипотез, все 256 сидов: цель, её вторая группа, следующая цель ----
-    // Это тот же расчёт, что выбирал точку, только точнее. Отдельные планки для прогноза
-    // (+25% хитшанса, порог «надёжности») больше не нужны: неуверенность прогноза уже внутри смеси.
+    // Это тот же расчёт, что выбирал точку, только точнее. Для прогноза — запас (predictedNeed):
+    // смесь гипотез неуверенность прогноза занижает, логи это показали.
     csgo::Vector angle{};
     int chance = 0, firstChance = -1, chosenSlot = -1;
-    const float needChance = static_cast<float>(settings.hitchance) * 0.01f;
+    const float baseNeedChance = static_cast<float>(settings.hitchance) * 0.01f;
     for (int k = 0; k < topCount && chosenSlot < 0; ++k) {
         auto& t = top[k];
+        const float needChance = predictedNeed(baseNeedChance, t.kind == RecordKind::Ahead || t.kind == RecordKind::Extrapolated);
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(t.index));
         const float targetHp = static_cast<float>(std::max(entity.health(), 1));
         angle = (t.point.position - eye).toAngle();
@@ -2790,6 +2918,15 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         return false;
     }
 
+    // Лаг-пик: выстрел — только в короткой пачке. Логи 11.11 (боты): из пачки 2–6 — 24 попадания из 30,
+    // 7–8 — 2 из 10, 9+ — 1 из 19 («пуля застряла», «разброс»). Чок за стеной при этом длинный —
+    // перед выстрелом сначала отпускаем накопленное, выстрел уходит следом (2 тика задержки).
+    if (defensive::lagPeekHolding() && tickbase::chokedCommands() >= 5) {
+        tickbase::sendNextPacket();
+        statusText = "лаг-пик: сливаем пачку перед выстрелом";
+        return false;
+    }
+
     // ---- выстрел ----
     auto aimAngle = angle - localPlayer.get().aimPunchAngle() * 2.0f;
     aimAngle.normalize();
@@ -2811,6 +2948,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     shot.aimPoint = best.point.position;
     shot.isHead = best.point.isHead;
     shot.edge = best.point.edge;
+    shot.taser = taser;
     shot.damage = static_cast<int>(best.point.damage);
     shot.hitchance = chance;
     shot.side = best.side;

@@ -15,6 +15,7 @@
 #include "../Helpers.h"
 #include "../Memory.h"
 #include "../imguiCustom.h"
+#include "HvH/HvhGui.h"
 #include "Visuals.h"
 
 #include <CSGO/PODs/ConVar.h>
@@ -612,6 +613,91 @@ void Visuals::tabItem() noexcept
         drawGUI(true);
         ImGui::EndTabItem();
     }
+}
+
+// Вкладка «Мир → Визуалы» нового меню: те же поля, карточками в две колонки.
+// Скайбокс и цвета мира — на странице «Мир» (drawWorldLookTab), здесь их нет.
+void Visuals::drawMenuPage() noexcept
+{
+    using namespace hvh::ui;
+    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    constexpr float gap = 10.0f;
+    static constexpr const char* effects[]{ "Нет", "Дрон", "Дрон с шумом", "Под водой", "Хилшот", "Опасная зона" };
+
+    ImGui::BeginGroup();
+    if (beginGroup("Камера", { width, 0.0f })) {
+        sliderInt("FOV", &visualsConfig.fov, -60, 60, "%+d");
+        sliderInt("FOV рук", &visualsConfig.viewmodelFov, -60, 60, "%+d");
+        toggle("Зум", &zoom);
+        keybind("Клавиша зума", visualsConfig.zoomKey);
+        toggle("Третье лицо", &visualsConfig.thirdperson);
+        keybind("Клавиша третьего лица", visualsConfig.thirdpersonKey);
+        sliderInt("Дистанция 3-го лица", &visualsConfig.thirdpersonDistance, 0, 1000);
+        toggle("Без отдачи камеры (aim punch)", &noAimPunch);
+        toggle("Без тряски (view punch)", &noViewPunch);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Убрать", { width, 0.0f })) {
+        toggle("Дым", &noSmoke);
+        toggle("Дым каркасом", &wireframeSmoke);
+        toggle("Оверлей прицела", &scopeOverlayRemover.enabled);
+        toggle("Размытие", &noBlur);
+        toggle("Постобработку", &postProcessingDisabler.enabled);
+        toggle("Туман", &noFog);
+        toggle("3D-небо", &no3dSky);
+        toggle("Тени", &noShadows);
+        toggle("Траву", &noGrass);
+        toggle("Руки", &noHands);
+        toggle("Рукава", &noSleeves);
+        toggle("Оружие в руках", &noWeapons);
+    }
+    endGroup();
+    ImGui::EndGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    ImGui::BeginGroup();
+    if (beginGroup("Попадания", { width, 0.0f })) {
+        static constexpr const char* markers[]{ "Нет", "Крестик" };
+        combo("Хитмаркер", &visualsConfig.hitMarker, markers, IM_ARRAYSIZE(markers));
+        if (visualsConfig.hitMarker)
+            sliderFloat("Время хитмаркера", &visualsConfig.hitMarkerTime, 0.1f, 1.5f, "%.2f с");
+        combo("Эффект при попадании", &visualsConfig.hitEffect, effects, IM_ARRAYSIZE(effects));
+        if (visualsConfig.hitEffect)
+            sliderFloat("Время эффекта", &visualsConfig.hitEffectTime, 0.1f, 1.5f, "%.2f с");
+        colorToggle("Трассеры пуль", &bulletTracers.enabled, bulletTracers.color.color.data());
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Экран", { width, 0.0f })) {
+        sliderInt("Меньше ослепления", &visualsConfig.flashReduction, 0, 100, "%d%%");
+        sliderFloat("Яркость", &visualsConfig.brightness, 0.0f, 1.0f, "%.2f");
+        sliderInt("Дальность прорисовки", &visualsConfig.farZ, 0, 2000, visualsConfig.farZ ? "%d" : "как в игре");
+        combo("Эффект экрана", &visualsConfig.screenEffect, effects, IM_ARRAYSIZE(effects));
+        colorToggle("Зона молотова", &visualsConfig.molotovHull.enabled, visualsConfig.molotovHull.asColor4().color.data());
+        toggle("Цветокоррекция", &colorCorrection.enabled);
+        if (colorCorrection.enabled) {
+            sliderFloat("Синий", &colorCorrection.blue, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Красный", &colorCorrection.red, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Зелёный", &colorCorrection.green, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Жёлтый", &colorCorrection.yellow, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Насыщенность", &colorCorrection.saturation, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Ч/б", &colorCorrection.mono, 0.0f, 1.0f, "%.2f");
+            sliderFloat("Призрак", &colorCorrection.ghost, 0.0f, 1.0f, "%.2f");
+        }
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Приколы", { width, 0.0f })) {
+        toggle("Крутить дигл", &visualsConfig.deagleSpinner);
+        toggle("Трупы улетают вверх", &inverseRagdollGravity_);
+    }
+    endGroup();
+    ImGui::EndGroup();
 }
 
 void Visuals::drawGUI(bool contentOnly) noexcept

@@ -43,6 +43,12 @@ public:
         GlowItem all, visible, occluded;
     };
 
+    // для страницы «Глоу» в новом меню
+    PlayerGlow& playerGlow(const char* name) noexcept { return playerGlowConfig[name]; }
+    GlowItem& glowItem(const char* name) noexcept { return glowConfig[name]; }
+    KeyBindToggle& toggleKey() noexcept { return glowToggleKey; }
+    KeyBind& holdKey() noexcept { return glowHoldKey; }
+
 private:
     csgo::GlowObjectManager* glowObjectManager;
 #if IS_WIN32() || IS_WIN64()

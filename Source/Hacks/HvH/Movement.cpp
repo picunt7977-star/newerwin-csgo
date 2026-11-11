@@ -640,9 +640,17 @@ void autoHideShots(const csgo::UserCmd* cmd) noexcept
                 const auto type = weapon.getWeaponType();
                 const auto data = weapon.getWeaponData();
                 const bool deagle = id == WeaponId::Deagle;
+                // Скаут/AWP: второй пули DT у них нет вовсе — хайдшоты ничего не отнимают.
+                // Автоснайперки (SCAR/G3SG1) раньше попадали сюда же как «не автоматические», и стоя
+                // или сидя DT у них молча выключался: держишь угол — враг выходит, мы бьём одну пулю
+                // на ~60–90, а он добивает нас своим DT (логи 08–10.11: 13 из 29 таких ранений).
+                // Теперь у автоснайперок — своя галка, по умолчанию DT остаётся.
+                const bool autoSniper = id == WeaponId::Scar20 || id == WeaponId::G3SG1;
                 bool allowed = data && !data->fullAuto && type != WeaponType::Pistol;     // снайперки, бёрст
                 if (deagle)
                     allowed = ex.autoHsDeagle;
+                else if (autoSniper)
+                    allowed = ex.autoHsAuto;
                 else if (type == WeaponType::Pistol || type == WeaponType::SubMachinegun || type == WeaponType::Rifle)
                     allowed = ex.autoHsRifles;
                 if (id == WeaponId::Revolver || id == WeaponId::Taser || type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4)

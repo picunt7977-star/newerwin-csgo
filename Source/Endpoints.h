@@ -285,8 +285,11 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
             const auto data = weapon.getWeaponData();
             const auto type = weapon.getWeaponType();
             hvh::tickbase::setSlowWeapon(!data || type == WeaponType::Knife || type == WeaponType::Grenade || type == WeaponType::C4 || data->cycletime > 0.4f);
+            hvh::tickbase::setKnife(type == WeaponType::Knife);
         }
     }
+    if (const auto channel = globalContext->getEngineInterfaces().getEngine().getNetworkChannel())
+        hvh::tickbase::setServerLocal(csgo::NetworkChannel::from(retSpoofGadgets->client, channel).isLoopback());
     hvh::movement::exploitTuning(globalContext->getOtherInterfaces().getCvar());
     hvh::movement::autoHideShots(cmd);
     hvh::movement::autoBuy(globalContext->getEngineInterfaces().getEngine());
@@ -350,8 +353,13 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     cmd->sidemove = std::clamp(cmd->sidemove, -450.0f, 450.0f);
 
     previousViewAngles = cmd->viewangles;
-    if (hvh::tickbase::sendPacket())
+    if (hvh::tickbase::sendPacket()) {
         hvh::antiaim::storeSentAngles(cmd->viewangles.x, cmd->viewangles.y);
+        if (localPlayer && localPlayer.get().isAlive()) {
+            const auto& origin = localPlayer.get().getAbsOrigin();
+            hvh::antiaim::storeSentOrigin(origin.x, origin.y, origin.z, (localPlayer.get().flags() & 2) != 0);   // 2 — FL_DUCKING
+        }
+    }
 
     cmd->viewanglesBackup = cmd->viewangles;
     cmd->buttonsBackup = cmd->buttons;
@@ -441,6 +449,16 @@ csgo::matrix3x4* serverModelBones(const csgo::ModelRenderInfo& info, const csgo:
     if (!bones || !info.model || !hvh::antiaim::sentServerPose(pitch, sentYaw, desync, roll))
         return nullptr;
     const auto& local = localPlayer.get();
+    // чок (лаг-пик, фейклаг): сервер держит модель там, где была последняя отправленная команда
+    csgo::Vector shift{};
+    {
+        float sent[3];
+        bool ducked;
+        if (hvh::antiaim::sentOrigin(sent, ducked) && hvh::tickbase::chokedCommands() > 0)
+            shift = csgo::Vector{ sent[0], sent[1], sent[2] } - info.origin;
+        if (shift.length() > 64.0f * 4.0f)  // телепорт, респаун — старая точка уже ничего не значит
+            shift = {};
+    }
     float maxDesync = local.getMaxDesyncAngle();
     if (maxDesync <= 1.0f)
         maxDesync = 58.0f;
@@ -450,7 +468,7 @@ csgo::matrix3x4* serverModelBones(const csgo::ModelRenderInfo& info, const csgo:
     const float clientFeet = animstate ? animstate->footYaw : info.angles.y;
     const float feetDelta = std::remainder(serverFeet - clientFeet, 360.0f);
     const float eyeDelta = std::remainder(sentYaw - local.renderAngles().y, 360.0f);
-    if (std::abs(feetDelta) < 1.0f && std::abs(eyeDelta) < 1.0f && std::abs(roll) < 1.0f)
+    if (std::abs(feetDelta) < 1.0f && std::abs(eyeDelta) < 1.0f && std::abs(roll) < 1.0f && shift.length() < 1.0f)
         return nullptr;
 
     const auto studio = globalContext->getEngineInterfaces().getModelInfo().getStudioModel(info.model);
@@ -479,6 +497,7 @@ csgo::matrix3x4* serverModelBones(const csgo::ModelRenderInfo& info, const csgo:
         ghost[i].rotateYaw(pivot, std::cos(angle), std::sin(angle));
         if (rollRad != 0.0f)
             ghost[i].rotateAxis(pivot, forward, std::cos(rollRad), std::sin(rollRad));
+        ghost[i].translate(shift);
     }
     return ghost;
 }
@@ -486,7 +505,7 @@ csgo::matrix3x4* serverModelBones(const csgo::ModelRenderInfo& info, const csgo:
 // Призрак рисуется до самой модели: он полупрозрачный, а модель сверху перекроет его там, где они совпадают
 inline void drawServerModel(void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones) noexcept
 {
-    if (!hvh::config.view.serverModel || !hvh::config.antiAim.enabled || !localPlayer || !localPlayer.get().isAlive()
+    if (!hvh::config.view.serverModel || !(hvh::config.antiAim.enabled || hvh::defensive::lagPeekHolding()) || !localPlayer || !localPlayer.get().isAlive()
         || info.entityIndex != localPlayer.get().getNetworkable().index()
         || !globalContext->memory->input || !globalContext->memory->input->isCameraInThirdPerson
         || globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())

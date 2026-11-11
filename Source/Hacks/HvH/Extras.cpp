@@ -161,62 +161,6 @@ void drawMarkers(ImDrawList* d) noexcept
     }
 }
 
-void drawKeybinds(ImDrawList* d) noexcept
-{
-    struct Row { const char* name; const char* state; };
-    std::array<Row, 12> rows{};
-    int count = 0;
-    const auto add = [&](const char* name, const char* state) {
-        if (count < static_cast<int>(rows.size()))
-            rows[count++] = { name, state };
-    };
-    const auto& ex = config.exploits;
-    const auto& rage = config.rage;
-    const auto& aa = config.antiAim;
-    if (ex.doubleTap && (!ex.doubleTapKey.isSet() || ex.doubleTapKey.isToggled()))
-        add("Double tap", ex.doubleTapKey.isSet() ? "toggled" : "always");
-    if (ragebot::minDamageOverrideActive())
-        add("Мин. урон", "holding");
-    if (ragebot::forceBodyActive())
-        add("Только тело", "holding");
-    if (ragebot::forceShotActive())
-        add("Форсшут", "toggled");
-    if (antiaim::isFreestanding())
-        add("Фристенд", aa.freestandKey.isSet() ? "holding" : "always");
-    if (aa.edgeYaw && aa.edgeKey.isSet() && aa.edgeKey.isDown())
-        add("Edge yaw", "holding");
-    if (aa.inverter.isSet() && aa.inverter.isToggled())
-        add("Инвертер", "toggled");
-    switch (antiaim::manualDirection()) {
-    case antiaim::Manual::Left: add("Ручной AA", "влево"); break;
-    case antiaim::Manual::Right: add("Ручной AA", "вправо"); break;
-    case antiaim::Manual::Back: add("Ручной AA", "назад"); break;
-    case antiaim::Manual::Forward: add("Ручной AA", "вперёд"); break;
-    default: break;
-    }
-    if (movement::isFakeDucking())
-        add("Фейкдак", "holding");
-    if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
-        add("Автопик", "holding");
-    if (ex.teleportKey.isSet() && ex.teleportKey.isDown())
-        add("Телепорт", "holding");
-
-    const float line = ImGui::GetFontSize() + 3.0f;
-    const float width = 190.0f;
-    const ImVec2 pos{ 10.0f, ImGui::GetIO().DisplaySize.y * 0.42f };
-    box(d, pos, { width, 10.0f + line * static_cast<float>(count + 1) });
-    const auto title = "keybinds";
-    const float titleWidth = ImGui::CalcTextSize(title).x;
-    shadowText(d, { pos.x + (width - titleWidth) * 0.5f, pos.y + 5.0f }, IM_COL32(255, 255, 255, 255), title);
-    for (int i = 0; i < count; ++i) {
-        const float y = pos.y + 5.0f + line * static_cast<float>(i + 1);
-        shadowText(d, { pos.x + 7.0f, y }, ui::color::text, rows[i].name);
-        char state[24];
-        std::snprintf(state, sizeof(state), "[%s]", rows[i].state);
-        shadowText(d, { pos.x + width - 7.0f - ImGui::CalcTextSize(state).x, y }, ui::color::textDim, state);
-    }
-}
-
 void sanitize(std::string& text) noexcept
 {
     // кавычки и ; ломают консольную команду say
@@ -359,8 +303,6 @@ void draw(ImDrawList* d) noexcept
     const auto& v = config.view;
     if (v.shotMarkers)
         drawMarkers(d);
-    if (v.keybindList)
-        drawKeybinds(d);
 
     if (!localPlayer || !localPlayer.get().isAlive())
         return;

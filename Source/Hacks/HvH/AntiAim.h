@@ -20,6 +20,8 @@ enum class Manual { None, Left, Right, Back, Forward };
 [[nodiscard]] Manual manualDirection() noexcept;
 [[nodiscard]] int desyncSide() noexcept;
 [[nodiscard]] bool isFreestanding() noexcept;
+// индекс врага, от которого сейчас строится AA (0 — нет)
+[[nodiscard]] int threatIndex() noexcept;
 [[nodiscard]] const char* stateName() noexcept;   // состояние билдера, по которому сейчас AA
 [[nodiscard]] bool defensiveActive() noexcept;    // сейчас скрытые углы дефенсива
 // roll (наклон) этого тика: ставится в cmd->viewangles.z в самом конце CreateMove
@@ -43,6 +45,9 @@ void onRoundStart() noexcept;
 void cameraAngles(float& pitch, float& yaw) noexcept;
 // Поза, которую видит сервер, по последнему отправленному пакету: взгляд, увод тела десинком
 // (сторона × величина из билдера, 0 — без десинка) и roll
+// позиция после последней отправленной команды (где модель стоит на сервере) и присед на ней
+void storeSentOrigin(float x, float y, float z, bool ducked) noexcept;
+bool sentOrigin(float* out, bool& ducked) noexcept;
 [[nodiscard]] bool sentServerPose(float& pitch, float& yaw, float& desync, float& roll) noexcept;
 
 // extended yaw: для линий у ног — настоящий LBY с сервера и отправленный взгляд (рисуется в HvhVisuals)

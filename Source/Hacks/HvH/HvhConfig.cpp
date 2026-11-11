@@ -3,6 +3,7 @@
 #include <string>
 
 #include "HvhConfig.h"
+#include "Binds.h"
 
 #include <ConfigStructs.h>
 #include <JsonForward.h>
@@ -120,6 +121,7 @@ static void readSnaps(const json& j, std::array<DefensiveSnap, static_cast<int>(
 
 json toJson() noexcept
 {
+    binds::suspend();
     json j;
 
     auto& r = j["Rage"];
@@ -139,12 +141,11 @@ json toJson() noexcept
     r["Knife bot mode"] = rage.knifeBotMode;
     r["Zeus bot"] = rage.zeusBot;
     r["Zeus hitchance"] = rage.zeusHitchance;
+    r["Zeus margin"] = rage.zeusMargin;
     r["FOV"] = rage.fov;
     r["Dormant aimbot"] = rage.dormantAim;
     r["Dormant accuracy"] = rage.dormantAccuracy;
-    writeKey(r, "Min damage override key", rage.minDamageOverrideKey);
-    writeKey(r, "Force body key", rage.forceBodyKey);
-    writeKey(r, "Force shot key", rage.forceShotKey);
+    r["Force body"] = rage.forceBody;
     for (std::size_t i = 0; i < rage.weapons.size(); ++i) {
         const auto& w = rage.weapons[i];
         auto& jw = r["Weapons"][i];
@@ -155,10 +156,10 @@ json toJson() noexcept
         jw["Auto scale"] = w.autoScale;
         jw["Body scale"] = w.bodyScale;
         jw["Min damage"] = w.minDamage;
-        jw["Min damage override"] = w.minDamageOverride;
         jw["Hitchance"] = w.hitchance;
         jw["Auto stop mode"] = w.autoStop;
         jw["Auto stop early"] = w.autoStopEarly;
+        jw["Peek stop"] = w.peekStop;
         jw["Auto scope"] = w.autoScope;
         jw["Prefer body"] = w.preferBody;
         jw["Body if lethal"] = w.bodyIfLethal;
@@ -225,11 +226,16 @@ json toJson() noexcept
     j["View"]["Show fake angles"] = config.view.showFakeAngles;
     j["View"]["Server model"] = config.view.serverModel;
     j["View"]["Server model color"] = { config.view.serverModelColor[0], config.view.serverModelColor[1], config.view.serverModelColor[2], config.view.serverModelColor[3] };
+    j["View"]["Server box"] = config.view.serverBox;
+    j["View"]["Server box color"] = { config.view.serverBoxColor[0], config.view.serverBoxColor[1], config.view.serverBoxColor[2], config.view.serverBoxColor[3] };
     j["View"]["Grenade prediction"] = config.view.grenadePrediction;
     j["View"]["Dormant time"] = config.view.dormantTime;
     j["View"]["Sync render"] = config.view.syncRender;
     j["View"]["Screen logs"] = config.view.screenLogs;
     j["View"]["Watermark"] = config.view.watermark;
+    j["View"]["Hotkeys"] = config.view.hotkeys;
+    j["View"]["Hotkeys x"] = config.view.hotkeysX;
+    j["View"]["Hotkeys y"] = config.view.hotkeysY;
     j["View"]["Aspect ratio"] = config.view.aspectRatio;
     j["View"]["Aspect ratio value"] = config.view.aspectRatioValue;
     j["View"]["Viewmodel"] = config.view.viewmodel;
@@ -309,11 +315,14 @@ json toJson() noexcept
     e["Double tap"] = ex.doubleTap;
     writeKey(e, "Double tap key", ex.doubleTapKey);
     e["Shift ticks"] = ex.shiftTicks;
+    e["Server pack limit"] = ex.serverPackLimit;
+    e["Knife air no lag"] = ex.knifeAirNoLag;
 
     auto& d = j["Defensive"];
     const auto& df = config.defensive;
     d["Enabled"] = df.enabled;
     d["Triggers"] = df.triggers;
+    d["In air"] = df.inAir;
     writeKey(d, "Key", df.key);
     d["Peek ticks"] = df.peekTicks;
     d["Charge style"] = df.chargeStyle;
@@ -324,9 +333,14 @@ json toJson() noexcept
     writeKey(e, "Teleport key", ex.teleportKey);
     e["Hide shots"] = ex.hideShots;
     writeKey(e, "Hide shots key", ex.hideShotsKey);
+    e["Lag peek"] = ex.lagPeek;
+    writeKey(e, "Lag peek key", ex.lagPeekKey);
+    e["Lag peek ticks"] = ex.lagPeekTicks;
+    e["Lag peek predict"] = ex.lagPeekPredict;
     e["Auto hide shots"] = ex.autoHideShots;
     e["Auto hide shots rifles"] = ex.autoHsRifles;
     e["Auto hide shots deagle"] = ex.autoHsDeagle;
+    e["Auto hide shots autosnipers"] = ex.autoHsAuto;
 
     auto& s = j["Skins"];
     const auto& skins = config.skins;
@@ -342,6 +356,8 @@ json toJson() noexcept
         w["StatTrak"] = skin.statTrak;
     }
 
+    j["Binds"] = binds::toJson();
+    binds::resume();
     return j;
 }
 
@@ -349,6 +365,12 @@ void fromJson(const json& j) noexcept
 {
     if (!j.is_object())
         return;
+    // Загрузка = чистый лист. Пустые бинды и отключённые поля в файл не пишутся, и без сброса
+    // оставались от прошлого загруженного конфига (фристенд на X из eclipse-x2 жил бы и в новом)
+    config = Config{};
+    binds::reset();
+    if (j.contains("Binds"))
+        binds::fromJson(j["Binds"]);
 
     if (j.contains("Rage") && j["Rage"].is_object()) {
         const auto& r = j["Rage"];
@@ -368,13 +390,21 @@ void fromJson(const json& j) noexcept
         read(r, "Knife bot mode", rage.knifeBotMode);
         read(r, "Zeus bot", rage.zeusBot);
         read(r, "Zeus hitchance", rage.zeusHitchance);
+        read(r, "Zeus margin", rage.zeusMargin);
         read(r, "FOV", rage.fov);
         read(r, "Dormant aimbot", rage.dormantAim);
         read(r, "Dormant accuracy", rage.dormantAccuracy);
         rage.dormantAccuracy = std::clamp(rage.dormantAccuracy, 25, 95);
-        read(r, "Min damage override key", rage.minDamageOverrideKey);
-        read(r, "Force body key", rage.forceBodyKey);
-        read(r, "Force shot key", rage.forceShotKey);
+        read(r, "Force body", rage.forceBody);
+        // Старые оверрайды (клавиша МД, «только в тело», форсшут) — теперь бинды на строки
+        KeyBind oldMinDamageKey, oldForceBodyKey, oldForceShotKey;
+        read(r, "Min damage override key", oldMinDamageKey);
+        read(r, "Force body key", oldForceBodyKey);
+        read(r, "Force shot key", oldForceShotKey);
+        binds::migrate(&rage.forceBody, binds::Type::Bool, oldForceBodyKey, binds::Mode::Hold, 1.0f, "Только в тело");
+        // форсшут был «включён, клавиша выключает» — бинд-переключатель в 0
+        if (rage.forceShot)
+            binds::migrate(&rage.forceShot, binds::Type::Bool, oldForceShotKey, binds::Mode::Toggle, 0.0f, "Форсшут");
         if (r.contains("Weapons") && r["Weapons"].is_array()) {
             for (std::size_t i = 0; i < rage.weapons.size() && i < r["Weapons"].size(); ++i) {
                 const auto& jw = r["Weapons"][i];
@@ -388,10 +418,14 @@ void fromJson(const json& j) noexcept
                 read(jw, "Auto scale", w.autoScale);
                 read(jw, "Body scale", w.bodyScale);
                 read(jw, "Min damage", w.minDamage);
-                read(jw, "Min damage override", w.minDamageOverride);
+                int oldOverride = -1;
+                read(jw, "Min damage override", oldOverride);
+                if (oldOverride > 0)
+                    binds::migrate(&w.minDamage, binds::Type::Int, oldMinDamageKey, binds::Mode::Hold, static_cast<float>(oldOverride), "Мин. урон");
                 read(jw, "Hitchance", w.hitchance);
                 read(jw, "Auto stop mode", w.autoStop);
                 read(jw, "Auto stop early", w.autoStopEarly);
+                read(jw, "Peek stop", w.peekStop);
                 read(jw, "Auto scope", w.autoScope);
                 read(jw, "Prefer body", w.preferBody);
                 read(jw, "Body if lethal", w.bodyIfLethal);
@@ -503,6 +537,13 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Second zoom factor", config.view.secondZoomFactor);
         read(j["View"], "Show fake angles", config.view.showFakeAngles);
         read(j["View"], "Server model", config.view.serverModel);
+        read(j["View"], "Server box", config.view.serverBox);
+        if (const auto& color = j["View"]["Server box color"]; color.is_array() && color.size() == 4) {
+            for (std::size_t i = 0; i < 4; ++i) {
+                if (color[i].is_number())
+                    config.view.serverBoxColor[i] = std::clamp(color[i].get<float>(), 0.0f, 1.0f);
+            }
+        }
         if (const auto& color = j["View"]["Server model color"]; color.is_array() && color.size() == 4) {
             for (std::size_t i = 0; i < 4; ++i) {
                 if (color[i].is_number())
@@ -514,6 +555,11 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Sync render", config.view.syncRender);
         read(j["View"], "Screen logs", config.view.screenLogs);
         read(j["View"], "Watermark", config.view.watermark);
+        read(j["View"], "Hotkeys", config.view.hotkeys);
+        read(j["View"], "Hotkeys x", config.view.hotkeysX);
+        read(j["View"], "Hotkeys y", config.view.hotkeysY);
+        config.view.hotkeysX = std::clamp(config.view.hotkeysX, 0.0f, 0.95f);
+        config.view.hotkeysY = std::clamp(config.view.hotkeysY, 0.0f, 0.95f);
         read(j["View"], "Aspect ratio", config.view.aspectRatio);
         read(j["View"], "Aspect ratio value", config.view.aspectRatioValue);
         read(j["View"], "Viewmodel", config.view.viewmodel);
@@ -622,13 +668,23 @@ void fromJson(const json& j) noexcept
         read(e, "Double tap", ex.doubleTap);
         read(e, "Double tap key", ex.doubleTapKey);
         read(e, "Shift ticks", ex.shiftTicks);
+        read(e, "Server pack limit", ex.serverPackLimit);
+        ex.serverPackLimit = ex.serverPackLimit <= 0 ? 0 : std::clamp(ex.serverPackLimit, 2, 16);
+        read(e, "Knife air no lag", ex.knifeAirNoLag);
         read(e, "Double tap mode", ex.doubleTapMode);
         read(e, "Teleport key", ex.teleportKey);
         read(e, "Hide shots", ex.hideShots);
         read(e, "Hide shots key", ex.hideShotsKey);
+        read(e, "Lag peek", ex.lagPeek);
+        read(e, "Lag peek key", ex.lagPeekKey);
+        read(e, "Lag peek ticks", ex.lagPeekTicks);
+        ex.lagPeekTicks = std::clamp(ex.lagPeekTicks, 2, 14);
+        read(e, "Lag peek predict", ex.lagPeekPredict);
+        ex.lagPeekPredict = std::clamp(ex.lagPeekPredict, 2, 16);
         read(e, "Auto hide shots", ex.autoHideShots);
         read(e, "Auto hide shots rifles", ex.autoHsRifles);
         read(e, "Auto hide shots deagle", ex.autoHsDeagle);
+        read(e, "Auto hide shots autosnipers", ex.autoHsAuto);
     }
 
     if (j.contains("Defensive") && j["Defensive"].is_object()) {
@@ -636,6 +692,7 @@ void fromJson(const json& j) noexcept
         auto& df = config.defensive;
         read(d, "Enabled", df.enabled);
         read(d, "Triggers", df.triggers);
+        read(d, "In air", df.inAir);
         read(d, "Key", df.key);
         read(d, "Peek ticks", df.peekTicks);
         df.peekTicks = std::clamp(df.peekTicks, 2, 16);
@@ -676,6 +733,252 @@ void fromJson(const json& j) noexcept
 void resetConfig() noexcept
 {
     config = {};
+    binds::reset();
+}
+
+}
+
+// ================= бинды на любую настройку =================
+namespace hvh::binds
+{
+
+namespace
+{
+std::vector<Bind> list;
+
+[[nodiscard]] char* fieldOf(const Bind& bind) noexcept
+{
+    return reinterpret_cast<char*>(&config) + bind.offset;
+}
+
+[[nodiscard]] std::size_t sizeOf(Type type) noexcept
+{
+    return type == Type::Bool ? sizeof(bool) : type == Type::Float ? sizeof(float) : sizeof(int);
+}
+}
+
+bool bindable(const void* field) noexcept
+{
+    const auto* p = static_cast<const char*>(field);
+    const auto* begin = reinterpret_cast<const char*>(&config);
+    return p >= begin && p < begin + sizeof(Config);
+}
+
+Bind* find(std::uint32_t id) noexcept
+{
+    for (auto& b : list)
+        if (b.id == id)
+            return &b;
+    return nullptr;
+}
+
+void migrate(void* field, Type type, const KeyBind& key, Mode mode, float value, const char* label) noexcept
+{
+    if (!key.isSet() || !bindable(field))
+        return;
+    const auto offset = static_cast<std::uint32_t>(static_cast<char*>(field) - reinterpret_cast<char*>(&config));
+    for (const auto& b : list) {
+        if (b.offset == offset)
+            return;
+    }
+    Bind fresh;
+    fresh.id = offset * 2654435761u;
+    fresh.row = 0;
+    fresh.label = label;
+    fresh.type = type;
+    fresh.offset = offset;
+    fresh.resolved = true;
+    fresh.key = key;
+    fresh.mode = mode;
+    fresh.value = value;
+    list.push_back(std::move(fresh));
+}
+
+Bind* attach(std::uint32_t row, const char* label, Type type, void* field, bool create) noexcept
+{
+    if (!bindable(field))
+        return nullptr;
+    const auto offset = static_cast<std::uint32_t>(static_cast<char*>(field) - reinterpret_cast<char*>(&config));
+    if (offset + sizeOf(type) > sizeof(Config))
+        return nullptr;
+    const std::uint32_t id = row ^ (offset * 2654435761u);
+    Bind* bind = find(id);
+    if (!bind) {
+        // конфиг из другой сборки: бинд этой строки ещё не привязан — забираем его
+        for (auto& b : list) {
+            // row 0 — перенесён из старого оверрайда: строки ещё не знал, только поле
+            if ((!b.resolved && b.row == row && b.type == type) || (b.row == 0 && b.offset == offset && b.type == type)) {
+                b.row = row;
+                b.id = id;
+                b.offset = offset;
+                b.resolved = true;
+                bind = &b;
+                break;
+            }
+        }
+    }
+    if (!bind) {
+        if (!create)
+            return nullptr;
+        Bind fresh;
+        fresh.id = id;
+        fresh.row = row;
+        fresh.type = type;
+        fresh.offset = offset;
+        fresh.resolved = true;
+        fresh.label = label;
+        // по умолчанию бинд делает противоположное текущему (для тоггла) или то же значение
+        const float now = type == Type::Bool ? (*reinterpret_cast<bool*>(field) ? 1.0f : 0.0f)
+            : type == Type::Float ? *reinterpret_cast<float*>(field) : static_cast<float>(*reinterpret_cast<int*>(field));
+        fresh.value = type == Type::Bool ? (now != 0.0f ? 0.0f : 1.0f) : now;
+        list.push_back(std::move(fresh));
+        return &list.back();
+    }
+    if (label && bind->label != label)
+        bind->label = label;
+    return bind;
+}
+
+void remove(std::uint32_t id) noexcept
+{
+    for (auto it = list.begin(); it != list.end(); ++it) {
+        if (it->id != id)
+            continue;
+        if (it->active && it->resolved)
+            write(*it, it->base);
+        list.erase(it);
+        return;
+    }
+}
+
+std::vector<Bind>& all() noexcept
+{
+    return list;
+}
+
+float read(const Bind& bind) noexcept
+{
+    char* field = fieldOf(bind);
+    switch (bind.type) {
+    case Type::Bool: return *reinterpret_cast<bool*>(field) ? 1.0f : 0.0f;
+    case Type::Float: return *reinterpret_cast<float*>(field);
+    default: return static_cast<float>(*reinterpret_cast<int*>(field));
+    }
+}
+
+void write(const Bind& bind, float value) noexcept
+{
+    char* field = fieldOf(bind);
+    switch (bind.type) {
+    case Type::Bool: *reinterpret_cast<bool*>(field) = value != 0.0f; break;
+    case Type::Float: *reinterpret_cast<float*>(field) = value; break;
+    default: *reinterpret_cast<int*>(field) = static_cast<int>(value); break;
+    }
+}
+
+void update() noexcept
+{
+    for (auto& b : list) {
+        if (!b.resolved)
+            continue;
+        bool want = false;
+        if (b.key.isSet()) {
+            switch (b.mode) {
+            case Mode::Hold: want = b.key.isDown(); break;
+            case Mode::HoldOff: want = !b.key.isDown(); break;
+            case Mode::Toggle:
+                if (b.key.isPressed())
+                    b.toggled = !b.toggled;
+                want = b.toggled;
+                break;
+            }
+        }
+        if (want && !b.active) {
+            b.base = read(b);
+            write(b, b.value);
+            b.active = true;
+        } else if (want) {
+            b.value = read(b);          // поменяли в меню, пока бинд держится, — это новое значение бинда
+        } else if (b.active) {
+            write(b, b.base);
+            b.active = false;
+        }
+    }
+}
+
+void suspend() noexcept
+{
+    for (const auto& b : list)
+        if (b.active && b.resolved)
+            write(b, b.base);
+}
+
+void resume() noexcept
+{
+    for (const auto& b : list)
+        if (b.active && b.resolved)
+            write(b, b.value);
+}
+
+void reset() noexcept
+{
+    list.clear();
+}
+
+json toJson() noexcept
+{
+    json j = json::array();
+    for (const auto& b : list) {
+        if (!b.key.isSet())
+            continue;   // открыли окно бинда и не назначили клавишу — не сохраняем
+        json e;
+        e["Id"] = b.id;
+        e["Row"] = b.row;
+        e["Label"] = b.label;
+        e["Type"] = static_cast<int>(b.type);
+        e["Offset"] = b.offset;
+        e["Layout"] = sizeof(Config);
+        e["Mode"] = static_cast<int>(b.mode);
+        e["Value"] = b.value;
+        if (b.key.isSet())
+            e["Key"] = b.key.toString();
+        j.push_back(std::move(e));
+    }
+    return j;
+}
+
+void fromJson(const json& j) noexcept
+{
+    if (!j.is_array())
+        return;
+    for (const auto& e : j) {
+        if (!e.is_object() || !e.contains("Id"))
+            continue;
+        Bind b;
+        b.id = e.value("Id", 0u);
+        b.row = e.value("Row", 0u);
+        b.label = e.value("Label", std::string{});
+        b.type = static_cast<Type>(std::clamp(e.value("Type", 0), 0, 3));
+        b.offset = e.value("Offset", 0u);
+        b.mode = static_cast<Mode>(std::clamp(e.value("Mode", 0), 0, 2));
+        b.value = e.value("Value", 1.0f);
+        if (e.contains("Key") && e["Key"].is_string())
+            b.key = KeyBind{ e["Key"].get<std::string>() };
+        // та же раскладка Config — адрес верный сразу, иначе ждём, пока строка нарисуется в меню
+        b.resolved = e.value("Layout", std::size_t{ 0 }) == sizeof(Config) && b.offset + sizeOf(b.type) <= sizeof(Config);
+        if (b.id && !find(b.id))
+            list.push_back(std::move(b));
+    }
+}
+
+const char* modeName(Mode mode) noexcept
+{
+    switch (mode) {
+    case Mode::Hold: return "Зажатие";
+    case Mode::Toggle: return "Переключение";
+    case Mode::HoldOff: return "Выкл. на зажатие";
+    }
+    return "";
 }
 
 }

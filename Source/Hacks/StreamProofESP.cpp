@@ -21,6 +21,7 @@
 #include "../Memory.h"
 
 #include "../imguiCustom.h"
+#include "HvH/HvhGui.h"
 
 static constexpr auto operator-(float sub, const std::array<float, 3>& a) noexcept
 {
@@ -103,11 +104,32 @@ static std::pair<std::array<ImVec2, 8>, std::size_t> convexHull(std::array<ImVec
     return std::make_pair(hull, count);
 }
 
+// Чёрная обводка той же прозрачности, что цвет (меньше — на полупрозрачном не «грязнит»)
+[[nodiscard]] static ImU32 outlineOf(ImU32 col) noexcept
+{
+    const auto a = static_cast<unsigned>(((col >> IM_COL32_A_SHIFT) & 0xFF) * 0.85f);
+    return a << IM_COL32_A_SHIFT;
+}
+
 static void addRectFilled(const ImVec2& p1, const ImVec2& p2, ImU32 col, bool shadow) noexcept
 {
+    const ImVec2 min{ (std::min)(p1.x, p2.x), (std::min)(p1.y, p2.y) };
+    const ImVec2 max{ (std::max)(p1.x, p2.x), (std::max)(p1.y, p2.y) };
     if (shadow)
-        drawList->AddRectFilled(p1 + ImVec2{ 1.0f, 1.0f }, p2 + ImVec2{ 1.0f, 1.0f }, col & IM_COL32_A_MASK);
-    drawList->AddRectFilled(p1, p2, col);
+        drawList->AddRectFilled(min - ImVec2{ 1.0f, 1.0f }, max + ImVec2{ 1.0f, 1.0f }, outlineOf(col));
+    drawList->AddRectFilled(min, max, col);
+}
+
+// Текст с контуром в 1 px (четыре сдвига) — читается на любом фоне, не «плывёт», как тень
+static void outlinedText(ImFont* font, float size, const ImVec2& pos, ImU32 col, const char* text) noexcept
+{
+    const ImU32 outline = outlineOf(col);
+    const ImVec2 p = ImFloor(pos);
+    drawList->AddText(font, size, { p.x + 1.0f, p.y }, outline, text);
+    drawList->AddText(font, size, { p.x - 1.0f, p.y }, outline, text);
+    drawList->AddText(font, size, { p.x, p.y + 1.0f }, outline, text);
+    drawList->AddText(font, size, { p.x, p.y - 1.0f }, outline, text);
+    drawList->AddText(font, size, p, col, text);
 }
 
 static void renderBox(const Memory& memory, const BoundingBox& bbox, const Box& config) noexcept
@@ -119,19 +141,22 @@ static void renderBox(const Memory& memory, const BoundingBox& bbox, const Box& 
     const ImU32 fillColor = Helpers::calculateColor(memory.globalVars->realtime, config.fill.asColor4());
 
     switch (config.type) {
-    case Box::_2d:
+    case Box::_2d: {
+        // рамка цвета между двумя чёрными: снаружи и внутри — чёткая на любом фоне
+        const ImVec2 min = ImFloor(bbox.min), max = ImFloor(bbox.max);
         if (config.fill.enabled)
-            drawList->AddRectFilled(bbox.min + ImVec2{ 1.0f, 1.0f }, bbox.max - ImVec2{ 1.0f, 1.0f }, fillColor, config.rounding, ImDrawFlags_RoundCornersAll);
-        else
-            drawList->AddRect(bbox.min + ImVec2{ 1.0f, 1.0f }, bbox.max + ImVec2{ 1.0f, 1.0f }, color & IM_COL32_A_MASK, config.rounding, ImDrawFlags_RoundCornersAll);
-        drawList->AddRect(bbox.min, bbox.max, color, config.rounding, ImDrawFlags_RoundCornersAll);
+            drawList->AddRectFilled(min + ImVec2{ 1.0f, 1.0f }, max - ImVec2{ 1.0f, 1.0f }, fillColor, config.rounding, ImDrawFlags_RoundCornersAll);
+        drawList->AddRect(min - ImVec2{ 1.0f, 1.0f }, max + ImVec2{ 1.0f, 1.0f }, outlineOf(color), config.rounding + 1.0f, ImDrawFlags_RoundCornersAll);
+        drawList->AddRect(min + ImVec2{ 1.0f, 1.0f }, max - ImVec2{ 1.0f, 1.0f }, outlineOf(color), std::max(config.rounding - 1.0f, 0.0f), ImDrawFlags_RoundCornersAll);
+        drawList->AddRect(min, max, color, config.rounding, ImDrawFlags_RoundCornersAll);
         break;
+    }
     case Box::_2dCorners: {
         if (config.fill.enabled) {
             drawList->AddRectFilled(bbox.min + ImVec2{ 1.0f, 1.0f }, bbox.max - ImVec2{ 1.0f, 1.0f }, fillColor, config.rounding, ImDrawFlags_RoundCornersAll);
         }
 
-        const bool wantsShadow = !config.fill.enabled;
+        const bool wantsShadow = true;   // обводка уголков — всегда
 
         const auto quarterWidth = IM_FLOOR((bbox.max.x - bbox.min.x) * 0.25f);
         const auto quarterHeight = IM_FLOOR((bbox.max.y - bbox.min.y) * 0.25f);
@@ -203,14 +228,15 @@ static ImVec2 renderText(const Memory& memory, float distance, float cullDistanc
     if (cullDistance && Helpers::units2meters(distance) > cullDistance)
         return { };
 
-    const auto textSize = ImGui::CalcTextSize(text);
+    ImFont* font = ImGui::GetFont();
+    const float size = font->FontSize;
+    const auto textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
 
     const auto horizontalOffset = centered ? textSize.x / 2 : 0.0f;
     const auto verticalOffset = adjustHeight ? textSize.y : 0.0f;
 
     const auto color = Helpers::calculateColor(memory.globalVars->realtime, textCfg);
-    drawList->AddText({ pos.x - horizontalOffset + 1.0f, pos.y - verticalOffset + 1.0f }, color & IM_COL32_A_MASK, text);
-    drawList->AddText({ pos.x - horizontalOffset, pos.y - verticalOffset }, color, text);
+    outlinedText(font, size, { pos.x - horizontalOffset, pos.y - verticalOffset }, color, text);
 
     return textSize;
 }
@@ -261,7 +287,8 @@ struct FontPush {
             }(it->second, distance));
         }
         else {
-            ImGui::PushFont(nullptr);
+            // шрифт не выбран — мелкий Noto из меню (с контуром читается лучше крупного)
+            ImGui::PushFont(hvh::ui::fonts.uiSmall ? hvh::ui::fonts.uiSmall : nullptr);
         }
     }
 
@@ -271,36 +298,41 @@ struct FontPush {
     }
 };
 
+// Полоска хп: 2 px на чёрной подложке во всю высоту; цвет от зелёного к красному,
+// при неполном хп сверху заливки — число. Для «Сплошной» — цвет из настроек.
 static void drawHealthBar(const Memory& memory, const HealthBar& config, const ImVec2& pos, float height, int health) noexcept
 {
     if (!config.enabled)
         return;
 
-    constexpr float width = 3.0f;
+    constexpr float width = 2.0f;
+    const float fraction = std::clamp(health / 100.0f, 0.0f, 1.0f);
+    const ImVec2 min = ImFloor(pos);
+    const float bottom = std::floor(pos.y + height);
+    const float top = std::floor(bottom - (bottom - min.y) * fraction);
 
-    drawList->PushClipRect(pos + ImVec2{ 0.0f, (100 - health) / 100.0f * height }, pos + ImVec2{ width + 1.0f, height + 1.0f });
-
-    if (config.type == HealthBar::Gradient) {
-        const auto green = Helpers::calculateColor(0, 255, 0, 255);
-        const auto yellow = Helpers::calculateColor(255, 255, 0, 255);
-        const auto red = Helpers::calculateColor(255, 0, 0, 255);
-
-        ImVec2 min = pos;
-        ImVec2 max = min + ImVec2{ width, height / 2.0f };
-
-        drawList->AddRectFilled(min + ImVec2{ 1.0f, 1.0f }, pos + ImVec2{ width + 1.0f, height + 1.0f }, Helpers::calculateColor(0, 0, 0, 255));
-
-        drawList->AddRectFilledMultiColor(ImFloor(min), ImFloor(max), green, green, yellow, yellow);
-        min.y += height / 2.0f;
-        max.y += height / 2.0f;
-        drawList->AddRectFilledMultiColor(ImFloor(min), ImFloor(max), yellow, yellow, red, red);
+    ImU32 color;
+    if (config.type == HealthBar::Solid) {
+        color = Helpers::calculateColor(memory.globalVars->realtime, config.asColor4());
     } else {
-        const auto color = config.type == HealthBar::HealthBased ? Helpers::healthColor(std::clamp(health / 100.0f, 0.0f, 1.0f)) : Helpers::calculateColor(memory.globalVars->realtime, config.asColor4());
-        drawList->AddRectFilled(pos + ImVec2{ 1.0f, 1.0f }, pos + ImVec2{ width + 1.0f, height + 1.0f }, color & IM_COL32_A_MASK);
-        drawList->AddRectFilled(pos, pos + ImVec2{ width, height }, color);
+        // красный → жёлтый → зелёный
+        const float t = fraction;
+        const int r = t > 0.5f ? static_cast<int>(255 * (1.0f - t) * 2.0f) : 255;
+        const int g = t > 0.5f ? 220 : static_cast<int>(220 * t * 2.0f);
+        color = Helpers::calculateColor(std::clamp(r, 0, 255), std::clamp(g, 0, 255), 70, 255);
     }
+    drawList->AddRectFilled({ min.x - 1.0f, min.y - 1.0f }, { min.x + width + 1.0f, bottom + 1.0f }, Helpers::calculateColor(0, 0, 0, 190));
+    drawList->AddRectFilled({ min.x, top }, { min.x + width, bottom }, color);
 
-    drawList->PopClipRect();
+    if (health < 100 && health > 0) {
+        ImFont* font = hvh::ui::fonts.uiSmall ? hvh::ui::fonts.uiSmall : ImGui::GetFont();
+        const float size = std::max(font->FontSize - 1.0f, 9.0f);
+        char text[8];
+        std::snprintf(text, sizeof(text), "%d", health);
+        const auto textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+        outlinedText(font, size, { min.x + width * 0.5f - textSize.x * 0.5f, std::max(top - textSize.y * 0.5f, min.y - textSize.y * 0.5f) },
+            Helpers::calculateColor(255, 255, 255, 255), text);
+    }
 }
 
 static void renderPlayerBox(const Memory& memory, const Config& configGlobal, const PlayerData& playerData, const Player& config) noexcept
@@ -314,7 +346,7 @@ static void renderPlayerBox(const Memory& memory, const Config& configGlobal, co
 
     ImVec2 offsetMins{}, offsetMaxs{};
 
-    drawHealthBar(memory, config.healthBar, bbox.min - ImVec2{ 5.0f, 0.0f }, (bbox.max.y - bbox.min.y), playerData.health);
+    drawHealthBar(memory, config.healthBar, bbox.min - ImVec2{ 6.0f, 0.0f }, (bbox.max.y - bbox.min.y), playerData.health);
 
     FontPush font{ configGlobal, config.font.name, playerData.distanceToLocal };
 

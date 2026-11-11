@@ -12,6 +12,7 @@ struct NetworkChannelPOD {
 };
 
 struct NetworkChannel : GameClass<NetworkChannel, NetworkChannelPOD> {
+    VIRTUAL_METHOD(bool, isLoopback, 6, (), ())
     VIRTUAL_METHOD(float, getLatency, 9, (int flow), (flow))
 };
 

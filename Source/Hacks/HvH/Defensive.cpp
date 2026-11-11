@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 
@@ -201,7 +202,12 @@ void advanceWindow(float realtime, int rttTicks) noexcept
 {
     // Пачка прошла — открываем окно по факту её длины, а не по догадке о том, сколько будет заряда
     if (const int shifted = tickbase::takeShiftPack(); shifted > 0) {
-        const int after = expectedRollback(shifted);
+        // 11.11: чоковая пачка тикбейс не двигает, и отката от неё не бывает в принципе. Раньше она
+        // считалась «рывком без отката»: через 40 пачек (2-3 секунды пика) вердикт становился
+        // «сервер не откатывает» и дефенсив чоком выключал себя на 30 секунд. И окна «после пачки»
+        // у неё нет — left от неё только блокировал предсказание пика на длину пачки.
+        const bool choke = tickbase::lastPackWasChoke();
+        const int after = choke ? 0 : expectedRollback(shifted);
         left = after;
         // длину окна уже поставил первый тик пачки — тут только уточняем, если пачка вышла длиннее
         length = std::max(length, shifted + after);
@@ -210,8 +216,10 @@ void advanceWindow(float realtime, int rttTicks) noexcept
         // Из-за этого рисунки скрытых углов, которые зависят от номера окна, стояли на месте.
         counter = (counter + 1) & 0xFFFF;
         ++pulses;
-        ++pulsesSinceRollback;
-        sincePulse = 0;
+        if (!choke) {
+            ++pulsesSinceRollback;
+            sincePulse = 0;
+        }
     }
 
     if (left > 0)
@@ -295,6 +303,227 @@ void setStatus(const char* text) noexcept
     std::snprintf(status, sizeof(status), "%s", text);
 }
 
+// ---- лаг-пик ----
+// Пока выходим из-за угла, команды держатся в чоке: у нас на экране враг уже виден, а сервер
+// (и сам враг) ещё считает нас за углом. Выстрел отпускает пачку (onShot → sendNext), и сервер
+// получает «вышел и выстрелил» за один свой тик — враг видит нас уже после выстрела.
+//
+// Фазы:
+//   Idle    — чока нет. Предсказали, что новый враг вот-вот увидит, — Holding.
+//   Holding — пока выход не вплотную (дальше 2 тиков), пачку сливаем каждый тик: за углом это
+//             бесплатно. За 2 тика до выхода чок копится, на выходе — весь лимит до выстрела.
+//             Без выстрела — не дольше секунды.
+//   Spent   — выстрелили или пик затянулся: обычный фейклаг, пока снова не спрячемся.
+//
+// 11.11 (вечер): лаг-пик почти не включался. Предсказание смотрело только луч в глаза, а «видит»
+// считается и по ногам, и по рукам — они выходят из-за угла раньше головы. Враг «видел» руку
+// раньше, чем срабатывало предсказание, и условие «предсказали, но ещё не видят» не выполнялось.
+// Плюс любой враг, который уже видел нас, запрещал пик на всех остальных.
+enum class PeekPhase { Idle, Holding, Spent };
+PeekPhase peekPhase = PeekPhase::Idle;
+int peekTicks = 0;          // тиков в текущей фазе
+int peekExposed = 0;        // тиков, как нас видит «новый» враг (в Holding)
+int peekQuiet = 0;          // тиков подряд: никто новый не видит и выхода не предвидится
+int peekShots = 0;
+int peekCount = 0;          // сколько пиков с чоком было (для меню)
+std::uint64_t seenBefore = 0;   // кто видел нас ещё до начала пика — от них лаг-пик не прячет
+char peekStatus[128] = "Выключен";
+
+void setPeekStatus(const char* text) noexcept
+{
+    std::snprintf(peekStatus, sizeof(peekStatus), "%s", text);
+}
+
+void peekLog(const char* text) noexcept
+{
+    char line[160];
+    std::snprintf(line, sizeof(line), "[лаг-пик] %s", text);
+    ragebot::logToFile(line);
+}
+
+void resetLagPeek() noexcept
+{
+    peekPhase = PeekPhase::Idle;
+    peekTicks = peekExposed = peekQuiet = 0;
+    peekShots = 0;
+    seenBefore = 0;
+    tickbase::setLagPeekChoke(0);
+}
+
+// Увидит ли враг хоть что-то из нас через `ahead` секунд: глаза, ноги, плечи — те же части,
+// по которым visibleTo считает «видит»
+[[nodiscard]] bool willExpose(const EngineInterfaces& engineInterfaces, const Memory& memory, const csgo::Entity& enemy,
+                              const csgo::Vector& drift, float ahead) noexcept
+{
+    const auto& self = localPlayer.get();
+    const csgo::Vector eye = self.getEyePosition();
+    const csgo::Vector feet = self.getAbsOrigin() + csgo::Vector{ 0.0f, 0.0f, 5.0f };
+    const auto enemyVelocity = enemy.velocity();
+    const csgo::Vector enemyEye = enemy.getEyePosition();
+    // плечи — поперёк направления на врага
+    csgo::Vector across{ -(enemyEye.y - eye.y), enemyEye.x - eye.x, 0.0f };
+    const float len = std::max(std::hypot(across.x, across.y), 1.0f);
+    across = { across.x / len * 14.0f, across.y / len * 14.0f, 0.0f };
+
+    const auto reaches = [&](const csgo::Vector& from, const csgo::Vector& to) {
+        if (memory.lineGoesThroughSmoke(from, to, 1))
+            return false;
+        csgo::Trace trace;
+        engineInterfaces.engineTrace().traceRay({ from, to }, 0x46004009, enemy.getPOD(), trace);
+        return trace.entity == self.getPOD() || trace.fraction > 0.97f;
+    };
+    for (const float part : { 0.5f, 1.0f }) {
+        const float t = ahead * part;
+        const csgo::Vector shift{ drift.x * t, drift.y * t, 0.0f };
+        const csgo::Vector from = enemyEye + csgo::Vector{ enemyVelocity.x * t, enemyVelocity.y * t, 0.0f };
+        const csgo::Vector chest = eye + shift - csgo::Vector{ 0.0f, 0.0f, 18.0f };
+        if (reaches(from, eye + shift + csgo::Vector{ 0.0f, 0.0f, 5.0f }) || reaches(from, feet + shift)
+            || reaches(from, chest + across) || reaches(from, chest - across))
+            return true;
+    }
+    return false;
+}
+
+void updateLagPeek(const csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces,
+                   const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept
+{
+    const auto& ex = config.exploits;
+    const bool keyOk = !ex.lagPeekKey.isSet() || ex.lagPeekKey.isDown();
+    const char* off = !ex.lagPeek ? "Выключен"
+        : !keyOk ? "Ждёт клавишу"
+        : !tickbase::isInstalled() ? "Детур CL_Move не встал — чока нет"
+        : movement::isFakeDucking() ? "Фейкдак: чок занят им"
+        : tickbase::knifeAirQuiet() ? "Нож в прыжке с DT — без лагов"
+        : !localPlayer || !localPlayer.get().isAlive() ? "Ждём респауна"
+        : nullptr;
+    if (off) {
+        if (peekPhase != PeekPhase::Idle || tickbase::lagPeekChokeTicks() > 0)
+            resetLagPeek();
+        setPeekStatus(off);
+        return;
+    }
+
+    const int limit = std::clamp(ex.lagPeekTicks, 2, 14);
+    const int predict = std::clamp(ex.lagPeekPredict, 2, 16);
+    const float interval = memory.globalVars->intervalPerTick;
+    const csgo::Vector drift = driftVelocity(cmd, localPlayer.get().velocity());
+
+    // Наблюдение — по нашей локальной (предсказанной) позиции: её сервер и получит, когда пачка уйдёт.
+    // «Новый» — враг, который не видел нас до начала пика: прячемся именно от него.
+    std::uint64_t seenNow = 0;
+    bool coming = false;    // новый враг увидит в пределах «предсказания»
+    bool close = false;     // ... или уже через 3 тика — чок пора копить
+    const int maxClients = std::min(engineInterfaces.getEngine().getMaxClients(), 63);
+    for (int i = 1; i <= maxClients; ++i) {
+        const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
+        if (!entity.getPOD() || entity.getNetworkable().isDormant() || !entity.isAlive()
+            || !localPlayer.get().isOtherEnemy(memory, entity))
+            continue;
+        if (localPlayer.get().visibleTo(engineInterfaces, memory, entity)) {
+            seenNow |= std::uint64_t{ 1 } << i;
+            continue;
+        }
+        if (peekPhase == PeekPhase::Spent)
+            continue;
+        if (!coming && willExpose(engineInterfaces, memory, entity, drift, static_cast<float>(predict) * interval))
+            coming = true;
+        if (coming && !close)
+            // 3 тика, а не 2: по логам 11.11 выход часто случался раньше прогноза, и на выходе в чоке
+            // было 0 — сервер получал уже открытую позицию. Тик запаса стоит одного тика чока после выхода.
+            close = willExpose(engineInterfaces, memory, entity, drift, 3.0f * interval);
+    }
+    const bool newSees = (seenNow & ~seenBefore) != 0;
+
+    // Клавиша лаг-пика зажата — чок держим сразу, ещё за стеной: серверная модель отстаёт уже
+    // на подходе к углу, а не только с момента, когда предсказание поймало выход. Пачку не сливаем
+    // и по тишине/таймауту не отпускаем — пока клавиша зажата и выстрела не было.
+    const bool keyHeld = ex.lagPeekKey.isSet() && ex.lagPeekKey.isDown();
+
+    const int shots = localPlayer.get().shotsFired();
+    const bool justShot = shots > peekShots;
+    peekShots = shots;
+    ++peekTicks;
+    peekQuiet = (newSees || coming) ? 0 : peekQuiet + 1;
+
+    char text[128];
+    switch (peekPhase) {
+    case PeekPhase::Idle:
+        seenBefore = seenNow;
+        if (coming || keyHeld) {
+            peekPhase = PeekPhase::Holding;
+            peekTicks = peekExposed = 0;
+            ++peekCount;
+            // в чоке уже лежит фейклаг — сливаем, пока мы за углом (если выход не вплотную)
+            if (!close && !keyHeld && tickbase::chokedCommands() > 0)
+                tickbase::sendNextPacket();
+        }
+        break;
+    case PeekPhase::Holding:
+        if (justShot) {
+            std::snprintf(text, sizeof(text), "выстрел через %d тик. после выхода, в пачке %d", peekExposed, tickbase::chokedCommands() + 1);
+            peekLog(text);
+            peekPhase = PeekPhase::Spent;
+            peekTicks = 0;
+            break;
+        }
+        if (peekQuiet >= 8 && !keyHeld) {
+            if (peekExposed > 0) {
+                std::snprintf(text, sizeof(text), "ушли обратно без выстрела (на виду %d тик.)", peekExposed);
+                peekLog(text);
+            }
+            peekPhase = PeekPhase::Idle;
+            peekTicks = 0;
+            break;
+        }
+        if (newSees) {
+            if (peekExposed == 0) {
+                const int held = tickbase::chokedCommands();
+                std::snprintf(text, sizeof(text), held == 0 ? "вышли раньше прогноза — сервер уже видит выход (чок 0 из %d)"
+                    : "вышли: сервер держит нас на %d тик. позади (лимит %d)", held == 0 ? tickbase::lagPeekChokeTicks() : held, tickbase::lagPeekChokeTicks());
+                peekLog(text);
+            }
+            ++peekExposed;
+        } else if (!close && !keyHeld && tickbase::chokedCommands() > 0) {
+            // выход ещё не вплотную — пачку сливаем, на выходе нужен весь лимит
+            tickbase::sendNextPacket();
+        }
+        if (peekTicks > 64 && !keyHeld) {
+            std::snprintf(text, sizeof(text), "секунда без выстрела — отпускаем (на виду %d тик.)", peekExposed);
+            peekLog(text);
+            peekPhase = PeekPhase::Spent;
+            peekTicks = 0;
+        }
+        break;
+    case PeekPhase::Spent:
+        // с зажатой клавишей после выстрела снова держим, как только оружие готово (не ждём, пока спрячемся)
+        if ((peekQuiet >= 16 && !newSees) || (keyHeld && peekTicks > 8)) {
+            peekPhase = PeekPhase::Idle;
+            peekTicks = 0;
+        }
+        break;
+    }
+
+    tickbase::setLagPeekChoke(peekPhase == PeekPhase::Holding ? limit : 0);
+
+    switch (peekPhase) {
+    case PeekPhase::Idle:
+        setPeekStatus("Ждём выхода из-за угла");
+        break;
+    case PeekPhase::Holding:
+        if (peekExposed > 0)
+            std::snprintf(text, sizeof(text), "На виду %d тик., чок %d из %d", peekExposed, tickbase::chokedCommands(), tickbase::lagPeekChokeTicks());
+        else
+            std::snprintf(text, sizeof(text), keyHeld ? "Клавиша зажата: держим чок за стеной (%d из %d)"
+                : close ? "Выход через 3 тика: копим чок (%d из %d)" : "Подходим к углу (чок %d из %d)",
+                tickbase::chokedCommands(), tickbase::lagPeekChokeTicks());
+        setPeekStatus(text);
+        break;
+    case PeekPhase::Spent:
+        setPeekStatus("Пик отыгран — следующий, когда спрячемся");
+        break;
+    }
+}
+
 }
 
 void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces,
@@ -320,6 +549,9 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
         return;
     }
     shiftWindow = 0;
+
+    // Лаг-пик — своя политика чока, от галки дефенсива не зависит
+    updateLagPeek(cmd, engineInterfaces, clientInterfaces, memory);
 
     // ---- стадия 1: затвор ----
     // Заряд один. Если DT стреляет второй пулей, он принадлежит выстрелу — дефенсив молчит.
@@ -397,6 +629,16 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
         || (!aiming && (cfg.triggers & DefNear) && sight.nearest < 1200.0f)
         || ((cfg.triggers & DefKey) && keyDown)
         || ((cfg.triggers & DefShot) && shotHold > 0);
+    // В воздухе — окна всегда (кроме момента, когда рейдж целится: пачка задержала бы выстрел)
+    if (cfg.inAir && !aiming && !(localPlayer.get().flags() & FL_ONGROUND))
+        trigger = true;
+    // Нож в прыжке с DT — без лагов (настройка «Нож в прыжке — без лагов»)
+    if (tickbase::knifeAirQuiet())
+        trigger = false;
+    // Лаг-пик держит пачку — рывков и своего чока нет: рывок отправил бы пачку досрочно
+    // (Tickbase: сдвиг при полном чоке ждёт отправки), и сервер получил бы нас уже на выходе
+    if (peekPhase == PeekPhase::Holding)
+        trigger = false;
 
     // ---- стадия 4: решение ----
     const bool nearEnemy = sight.nearest < 1200.0f;
@@ -511,6 +753,11 @@ int chargePercent() noexcept
 void onRoundStart() noexcept
 {
     reset();
+    resetLagPeek();
 }
+
+bool lagPeekHolding() noexcept { return peekPhase == PeekPhase::Holding && tickbase::lagPeekChokeTicks() > 0; }
+int lagPeekCount() noexcept { return peekCount; }
+const char* lagPeekStatus() noexcept { return peekStatus; }
 
 }

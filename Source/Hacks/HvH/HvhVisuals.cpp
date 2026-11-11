@@ -19,6 +19,8 @@
 #include "AntiAim.h"
 #include "HvhVisuals.h"
 #include "Ragebot.h"
+#include "Defensive.h"
+#include "Tickbase.h"
 
 #include <GameData.h>
 #include <Helpers.h>
@@ -119,17 +121,28 @@ std::minstd_rand sparkRng{ 1337 };
 }
 
 // текст с чёрной тенью — читается на любом фоне
+// мелкий Noto с контуром — как имена и оружие в ESP
+[[nodiscard]] ImFont* espFont() noexcept
+{
+    return ui::fonts.uiSmall ? ui::fonts.uiSmall : ui::fonts.menu;
+}
+
 void shadowText(ImDrawList* drawList, ImVec2 position, ImU32 color, const char* text) noexcept
 {
-    ImFont* font = ui::fonts.menu;
+    ImFont* font = espFont();
     const float size = font ? font->FontSize : ImGui::GetFontSize();
-    drawList->AddText(font, size, { position.x + 1.0f, position.y + 1.0f }, withAlpha(IM_COL32(0, 0, 0, 255), ((color >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f), text);
+    const ImU32 outline = withAlpha(IM_COL32(0, 0, 0, 255), ((color >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f * 0.85f);
+    position = { std::floor(position.x), std::floor(position.y) };
+    drawList->AddText(font, size, { position.x + 1.0f, position.y }, outline, text);
+    drawList->AddText(font, size, { position.x - 1.0f, position.y }, outline, text);
+    drawList->AddText(font, size, { position.x, position.y + 1.0f }, outline, text);
+    drawList->AddText(font, size, { position.x, position.y - 1.0f }, outline, text);
     drawList->AddText(font, size, position, color, text);
 }
 
 [[nodiscard]] ImVec2 textSize(const char* text) noexcept
 {
-    ImFont* font = ui::fonts.menu;
+    ImFont* font = espFont();
     if (!font)
         return ImGui::CalcTextSize(text);
     return font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text);
@@ -660,9 +673,70 @@ void drawExtendedYaw(ImDrawList* drawList) noexcept
     ray(view.lby, 32.0f, withAlpha(ui::color::accent, 1.0f), false, "LBY");
 }
 
+// Где модель стоит на сервере, пока пакеты в чоке (лаг-пик, фейклаг): хитбокс-коробка игрока
+// на позиции последней отправленной команды, линия от ног до неё и подпись с числом тиков.
+// Видно и от 1-го лица: на лаг-пике коробка остаётся за углом, пока не отпустишь пачку.
+void drawServerPosition(ImDrawList* drawList) noexcept
+{
+    if (!config.view.serverBox)
+        return;
+    const auto& local = GameData::local();
+    if (!local.exists || !local.alive)
+        return;
+    const int choked = tickbase::chokedCommands();
+    float sent[3];
+    bool ducked = false;
+    if (choked <= 0 || !antiaim::sentOrigin(sent, ducked))
+        return;
+    const csgo::Vector origin{ sent[0], sent[1], sent[2] };
+    const float distance = (origin - local.origin).length();
+    const bool peeking = defensive::lagPeekHolding();
+    // стоим на месте — коробка совпала бы с нами; телепорт/респаун — точка устарела
+    if ((distance < 2.0f && !peeking) || distance > 256.0f)
+        return;
+
+    const auto& c = config.view.serverBoxColor;
+    const ImU32 color = ImGui::ColorConvertFloat4ToU32({ c[0], c[1], c[2], c[3] });
+    const ImU32 fill = ImGui::ColorConvertFloat4ToU32({ c[0], c[1], c[2], c[3] * 0.12f });
+    const float height = ducked ? 54.0f : 72.0f;
+    ImVec2 corners[8];
+    for (int i = 0; i < 8; ++i) {
+        const csgo::Vector point{ origin.x + ((i & 1) ? 16.0f : -16.0f), origin.y + ((i & 2) ? 16.0f : -16.0f), origin.z + ((i & 4) ? height : 0.0f) };
+        if (!Helpers::worldToScreen(point, corners[i]))
+            return;
+    }
+    // заливка — по выпуклой оболочке не заморачиваемся: две грани (низ и верх) полупрозрачно
+    const ImVec2 bottom[]{ corners[0], corners[1], corners[3], corners[2] };
+    const ImVec2 top[]{ corners[4], corners[5], corners[7], corners[6] };
+    drawList->AddConvexPolyFilled(bottom, 4, fill);
+    drawList->AddConvexPolyFilled(top, 4, fill);
+    for (int i = 0; i < 8; ++i) {
+        for (int bit = 1; bit <= 4; bit <<= 1) {
+            if (i & bit)
+                continue;
+            drawList->AddLine(corners[i], corners[i | bit], withAlpha(IM_COL32(0, 0, 0, 255), c[3] * 0.6f), 3.0f);
+            drawList->AddLine(corners[i], corners[i | bit], color, 1.2f);
+        }
+    }
+
+    // линия от наших ног до серверных
+    ImVec2 feet, serverFeet;
+    if (Helpers::worldToScreen(local.origin, feet) && Helpers::worldToScreen(origin, serverFeet))
+        drawList->AddLine(feet, serverFeet, withAlpha(color, 0.6f), 1.0f);
+
+    ImVec2 label;
+    if (Helpers::worldToScreen({ origin.x, origin.y, origin.z + height + 6.0f }, label)) {
+        char text[48];
+        std::snprintf(text, sizeof(text), peeking ? "лаг-пик · %d т." : "сервер · %d т.", choked);
+        const auto size = textSize(text);
+        shadowText(drawList, { label.x - size.x * 0.5f, label.y - size.y }, color, text);
+    }
+}
+
 void draw(ImDrawList* drawList, float realtime) noexcept
 {
     GameData::Lock lock;
+    drawServerPosition(drawList);
     for (const auto& player : GameData::players()) {
         drawFlags(drawList, player, realtime);
         drawAimDot(drawList, player, realtime);

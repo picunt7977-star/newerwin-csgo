@@ -73,4 +73,10 @@ enum class Verdict {
 
 void onRoundStart() noexcept;
 
+// ---- лаг-пик (живёт тут же: ему нужно то же предсказание выхода из-за угла) ----
+// Сейчас держим чок на выглядывании
+[[nodiscard]] bool lagPeekHolding() noexcept;
+[[nodiscard]] int lagPeekCount() noexcept;
+[[nodiscard]] const char* lagPeekStatus() noexcept;
+
 }

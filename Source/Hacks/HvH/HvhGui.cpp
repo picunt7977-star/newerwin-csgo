@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <cmath>
@@ -17,6 +19,14 @@
 #include "Resolver.h"
 #include "Defensive.h"
 #include "Tickbase.h"
+#include "Blur.h"
+#include "Binds.h"
+
+// прототипы GL 3 (glCreateShader и т.п.) — как в бэкенде ImGui
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES
+#endif
+#include <SDL2/SDL_opengl.h>
 
 #include <InputUtil.h>
 #include <CSGO/LocalPlayer.h>
@@ -28,9 +38,11 @@ namespace hvh::ui
 namespace
 {
 
-constexpr float rowHeight = 19.0f;
-constexpr float rounding = 0.0f;
-constexpr float indent = 20.0f;   // подписи и поля сдвинуты под чекбокс, как в gamesense
+// Строка настройки 26 px (+4 отступ — шаг 30), поле внутри строки 22 px, скругление полей 5 px
+constexpr float rowHeight = 26.0f;
+constexpr float fieldH = 22.0f;
+constexpr float rounding = 5.0f;
+int groupRow = 0;                 // номер строки в текущей карточке — разделитель рисуется со второй
 
 ImVec4 toVec4(ImU32 col) noexcept
 {
@@ -41,6 +53,11 @@ ImU32 withAlpha(ImU32 col, float alpha) noexcept
 {
     const auto a = static_cast<int>(((col >> IM_COL32_A_SHIFT) & 0xFF) * std::clamp(alpha, 0.0f, 1.0f));
     return (col & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a) << IM_COL32_A_SHIFT);
+}
+
+ImFont* uiFont() noexcept
+{
+    return fonts.ui ? fonts.ui : ImGui::GetFont();
 }
 
 }
@@ -66,30 +83,30 @@ ImU32 lerpColor(ImU32 a, ImU32 b, float t) noexcept
 void applyStyle() noexcept
 {
     auto& style = ImGui::GetStyle();
-    style.WindowRounding = 0.0f;
-    style.ChildRounding = 0.0f;
+    style.WindowRounding = 14.0f;
+    style.ChildRounding = 12.0f;
     style.FrameRounding = rounding;
-    style.PopupRounding = rounding;
+    style.PopupRounding = 10.0f;
     style.GrabRounding = rounding;
-    style.ScrollbarRounding = rounding;
+    style.ScrollbarRounding = 3.0f;
     style.TabRounding = rounding;
     style.WindowBorderSize = 0.0f;
     style.ChildBorderSize = 0.0f;
     style.PopupBorderSize = 1.0f;
-    style.FrameBorderSize = 1.0f;
-    style.WindowPadding = { 12.0f, 12.0f };
-    style.FramePadding = { 8.0f, 3.0f };
-    style.ItemSpacing = { 8.0f, 4.0f };
+    style.FrameBorderSize = 0.0f;
+    style.WindowPadding = { 10.0f, 10.0f };
+    style.FramePadding = { 9.0f, 5.0f };
+    style.ItemSpacing = { 8.0f, 6.0f };
     style.ItemInnerSpacing = { 6.0f, 4.0f };
-    style.ScrollbarSize = 6.0f;
+    style.ScrollbarSize = 4.0f;
     style.GrabMinSize = 8.0f;
 
     auto* c = style.Colors;
-    c[ImGuiCol_Text] = toVec4(color::text);
+    c[ImGuiCol_Text] = toVec4(color::textMid);
     c[ImGuiCol_TextDisabled] = toVec4(color::textDim);
-    c[ImGuiCol_WindowBg] = toVec4(color::windowBg);
-    c[ImGuiCol_ChildBg] = toVec4(color::groupBg);
-    c[ImGuiCol_PopupBg] = toVec4(IM_COL32(29, 29, 29, 255));
+    c[ImGuiCol_WindowBg] = toVec4(IM_COL32(13, 15, 22, 250));
+    c[ImGuiCol_ChildBg] = { 0, 0, 0, 0 };
+    c[ImGuiCol_PopupBg] = toVec4(color::popupBg);
     c[ImGuiCol_Border] = toVec4(color::outline);
     c[ImGuiCol_FrameBg] = toVec4(color::frame);
     c[ImGuiCol_FrameBgHovered] = toVec4(color::frameHover);
@@ -98,61 +115,144 @@ void applyStyle() noexcept
     c[ImGuiCol_TitleBgActive] = toVec4(color::sidebarBg);
     c[ImGuiCol_MenuBarBg] = toVec4(color::sidebarBg);
     c[ImGuiCol_ScrollbarBg] = { 0, 0, 0, 0 };
-    c[ImGuiCol_ScrollbarGrab] = toVec4(color::frameHover);
-    c[ImGuiCol_ScrollbarGrabHovered] = toVec4(withAlpha(color::accent, 0.6f));
+    c[ImGuiCol_ScrollbarGrab] = toVec4(color::selected);
+    c[ImGuiCol_ScrollbarGrabHovered] = toVec4(color::textOff);
     c[ImGuiCol_ScrollbarGrabActive] = toVec4(color::accent);
     c[ImGuiCol_CheckMark] = toVec4(color::accent);
     c[ImGuiCol_SliderGrab] = toVec4(color::accent);
-    c[ImGuiCol_SliderGrabActive] = toVec4(color::accent2);
+    c[ImGuiCol_SliderGrabActive] = toVec4(color::accent);
     c[ImGuiCol_Button] = toVec4(color::frame);
     c[ImGuiCol_ButtonHovered] = toVec4(color::frameHover);
-    c[ImGuiCol_ButtonActive] = toVec4(withAlpha(color::accent, 0.5f));
-    c[ImGuiCol_Header] = toVec4(withAlpha(color::accent, 0.22f));
-    c[ImGuiCol_HeaderHovered] = toVec4(withAlpha(color::accent, 0.32f));
-    c[ImGuiCol_HeaderActive] = toVec4(withAlpha(color::accent, 0.45f));
-    c[ImGuiCol_Separator] = toVec4(color::groupLine);
+    c[ImGuiCol_ButtonActive] = toVec4(color::selected);
+    c[ImGuiCol_Header] = toVec4(withAlpha(color::accent, 0.16f));
+    c[ImGuiCol_HeaderHovered] = toVec4(withAlpha(color::accent, 0.12f));
+    c[ImGuiCol_HeaderActive] = toVec4(withAlpha(color::accent, 0.22f));
+    c[ImGuiCol_Separator] = toVec4(color::divider);
     c[ImGuiCol_Tab] = toVec4(color::frame);
-    c[ImGuiCol_TabHovered] = toVec4(withAlpha(color::accent, 0.5f));
-    c[ImGuiCol_TabActive] = toVec4(withAlpha(color::accent, 0.35f));
+    c[ImGuiCol_TabHovered] = toVec4(color::frameHover);
+    c[ImGuiCol_TabActive] = toVec4(color::selected);
     c[ImGuiCol_TextSelectedBg] = toVec4(withAlpha(color::accent, 0.35f));
     c[ImGuiCol_NavHighlight] = toVec4(color::accent);
     c[ImGuiCol_ModalWindowDimBg] = { 0, 0, 0, 0.5f };
 }
 
+// Подпись раздела заглавными: «Окно» → «ОКНО». ImGui сам регистр не меняет, а заголовки у нас
+// по-русски — латиница и кириллица (а-я, ё) переводятся вручную, остальное как есть.
+const char* upperCaption(const char* text) noexcept
+{
+    static char buffer[128];
+    std::size_t out = 0;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p && out + 3 < sizeof(buffer);) {
+        if (*p >= 'a' && *p <= 'z') {
+            buffer[out++] = static_cast<char>(*p - 32);
+            ++p;
+        } else if (p[0] == 0xD0 && p[1] >= 0xB0 && p[1] <= 0xBF) {          // а-п
+            buffer[out++] = static_cast<char>(0xD0);
+            buffer[out++] = static_cast<char>(p[1] - 0x20);
+            p += 2;
+        } else if (p[0] == 0xD1 && p[1] >= 0x80 && p[1] <= 0x8F) {          // р-я
+            buffer[out++] = static_cast<char>(0xD0);
+            buffer[out++] = static_cast<char>(p[1] + 0x20);
+            p += 2;
+        } else if (p[0] == 0xD1 && p[1] == 0x91) {                          // ё
+            buffer[out++] = static_cast<char>(0xD0);
+            buffer[out++] = static_cast<char>(0x81);
+            p += 2;
+        } else {
+            buffer[out++] = static_cast<char>(*p++);
+        }
+    }
+    buffer[out] = '\0';
+    return buffer;
+}
+
+// Строки внутри карточки разделены тонкой линией — кроме первой
+void rowDivider(ImDrawList* d, const ImVec2& pos, float width) noexcept
+{
+    if (groupRow++ > 0)
+        d->AddLine({ pos.x - 2.0f, pos.y - 2.0f }, { pos.x + width + 2.0f, pos.y - 2.0f }, color::divider);
+}
+
+// подпись строки слева по центру высоты, обрезанная до `right`
+void rowLabel(ImDrawList* d, const ImVec2& pos, float right, const char* label, ImU32 col) noexcept
+{
+    ImFont* font = uiFont();
+    d->PushClipRect(pos, { right, pos.y + rowHeight }, true);
+    d->AddText(font, font->FontSize, { pos.x, pos.y + std::floor((rowHeight - font->FontSize) * 0.5f) }, col, label, ImGui::FindRenderedTextEnd(label));
+    d->PopClipRect();
+}
+
+// Карточка: подпись заглавными над ней, сама — скруглённая, с рамкой в 1 px.
+// Высота 0 — по содержимому: меряем в endGroup, со следующего кадра карточка плавно
+// подстраивается (раскрылись доп. строки — выросла), прокрутки внутри нет — крутится вся страница.
+namespace
+{
+struct GroupFrame {
+    ImGuiID key;
+    bool autoHeight;
+};
+ImVector<GroupFrame> groupStack;
+std::unordered_map<ImGuiID, float> groupHeights;
+constexpr float groupPadY = 7.0f;
+}
+
 bool beginGroup(const char* title, const ImVec2& requestedSize) noexcept
 {
-    // Название лежит на верхней линии и вылезает над группой — у верхнего края оставляем ему место
-    ImVec2 size = requestedSize;
-    if (const float y = ImGui::GetCursorPosY(); y < 8.0f) {
-        ImGui::SetCursorPosY(8.0f);
-        size.y -= 8.0f - y;
+    ImFont* captionFont = fonts.uiSmall ? fonts.uiSmall : uiFont();
+    constexpr float captionH = 22.0f;
+
+    const ImGuiID key = ImGui::GetID(title);
+    const bool autoHeight = requestedSize.y <= 0.0f;
+    float height = requestedSize.y;
+    if (autoHeight) {
+        const auto it = groupHeights.find(key);
+        const float target = it != groupHeights.end() ? it->second : rowHeight * 3.0f;
+        float* shown = ImGui::GetStateStorage()->GetFloatRef(key ^ 0x6A11u, target);
+        *shown += (target - *shown) * std::min(1.0f, ImGui::GetIO().DeltaTime * 18.0f);
+        if (std::abs(target - *shown) < 0.5f)
+            *shown = target;
+        height = captionH + std::floor(*shown);
     }
-    // рамка и название рисуются в окне-родителе
+    groupStack.push_back({ key, autoHeight });
+
     auto* parentList = ImGui::GetWindowDrawList();
     const auto pos = ImGui::GetCursorScreenPos();
-    const ImVec2 max{ pos.x + size.x, pos.y + size.y };
-    parentList->AddRectFilled(pos, max, color::groupBg);
-    parentList->AddRect(pos, max, color::outline);
-    parentList->AddRect({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, color::groupLine);
-    ImFont* titleFont = fonts.menuBold ? fonts.menuBold : ImGui::GetFont();
-    const float titleSize = titleFont->FontSize;
-    const auto titleWidth = titleFont->CalcTextSizeA(titleSize, FLT_MAX, 0.0f, title, ImGui::FindRenderedTextEnd(title)).x;
-    parentList->AddRectFilled({ pos.x + 10.0f, pos.y - 1.0f }, { pos.x + 18.0f + titleWidth, pos.y + 2.0f }, color::groupBg);
-    parentList->AddText(titleFont, titleSize, { pos.x + 14.0f, pos.y - titleSize * 0.5f }, color::text, title, ImGui::FindRenderedTextEnd(title));
+    const ImVec2 size{ requestedSize.x, std::max(captionH + rowHeight + groupPadY * 2.0f, height) };
+    parentList->AddText(captionFont, captionFont->FontSize, { pos.x + 12.0f, pos.y + 4.0f }, color::textDim,
+        upperCaption(title));
+    const ImVec2 cardMin{ pos.x, pos.y + captionH };
+    const ImVec2 cardMax{ pos.x + size.x, pos.y + size.y };
+    parentList->AddRectFilled(cardMin, cardMax, color::groupBg, 11.0f);
+    parentList->AddRect(cardMin, cardMax, color::groupLine, 11.0f);
 
+    ImGui::SetCursorScreenPos(cardMin);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 14.0f, 14.0f });
-    const bool open = ImGui::BeginChild(title, size, false, ImGuiWindowFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 14.0f, groupPadY });
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_AlwaysUseWindowPadding
+        | (autoHeight ? ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse : 0);
+    const bool open = ImGui::BeginChild(title, { size.x, size.y - captionH }, false, flags);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, { 8.0f, 4.0f });
     ImGui::PushItemWidth(-1.0f);
+    groupRow = 0;
     return open;
 }
 
 void endGroup() noexcept
 {
     ImGui::PopItemWidth();
-    ImGui::Dummy({ 0.0f, 4.0f });
+    ImGui::PopStyleVar();
+    ImGui::Dummy({ 0.0f, 1.0f });
+    if (!groupStack.empty()) {
+        const auto frame = groupStack.back();
+        groupStack.pop_back();
+        // карточка за краем прокрутки: содержимое не рисовалось — мерить нечего, высота прежняя
+        if (frame.autoHeight && !ImGui::GetCurrentWindow()->SkipItems) {
+            const auto* window = ImGui::GetCurrentWindow();
+            groupHeights[frame.key] = std::ceil(window->DC.CursorMaxPos.y - window->DC.CursorStartPos.y + groupPadY * 2.0f);
+        }
+    }
     ImGui::EndChild();
 }
 
@@ -164,15 +264,14 @@ bool colorEdit(const char* label, float* rgba) noexcept
 
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
-    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    window->DrawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, labelEnd);
+    rowDivider(window->DrawList, pos, width);
+    rowLabel(window->DrawList, pos, pos.x + width - 30.0f, label, color::textMid);
 
-    // прямоугольник цвета справа, по клику — палитра ImGui
-    ImGui::SetCursorScreenPos({ pos.x + width - 20.0f, pos.y + 4.0f });
+    ImGui::SetCursorScreenPos({ pos.x + width - 18.0f, pos.y + (rowHeight - 18.0f) * 0.5f });
     ImGui::PushID(label);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 0.0f, 0.0f });
-    ImGui::PushItemWidth(20.0f);
+    ImGui::PushItemWidth(18.0f);
     const bool changed = ImGui::ColorEdit4("##color", rgba, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf);
     ImGui::PopItemWidth();
     ImGui::PopStyleVar(2);
@@ -182,15 +281,112 @@ bool colorEdit(const char* label, float* rgba) noexcept
     return changed;
 }
 
-// Квадратик 8×8 с градиентом слева, подпись справа — как в gamesense
-void checkboxBox(ImDrawList* d, const ImVec2& at, bool on, bool hovered) noexcept
+// ---- бинды на строки ----
+// Метка клавиши справа от подписи: серая — бинд ждёт, акцентная — держится.
+static void bindBadge(ImDrawList* d, const ImVec2& pos, const char* label, const binds::Bind* bind) noexcept
 {
-    const ImVec2 max{ at.x + 8.0f, at.y + 8.0f };
-    if (on)
-        d->AddRectFilledMultiColor(at, max, color::accent, color::accent, color::accent2, color::accent2);
-    else
-        d->AddRectFilledMultiColor(at, max, hovered ? IM_COL32(80, 80, 80, 255) : IM_COL32(68, 68, 68, 255), hovered ? IM_COL32(80, 80, 80, 255) : IM_COL32(68, 68, 68, 255), IM_COL32(48, 48, 48, 255), IM_COL32(48, 48, 48, 255));
-    d->AddRect({ at.x - 1.0f, at.y - 1.0f }, { max.x + 1.0f, max.y + 1.0f }, color::outline);
+    if (!bind || !bind->key.isSet())
+        return;
+    ImFont* font = uiFont();
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : font;
+    const float labelW = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, label, ImGui::FindRenderedTextEnd(label)).x;
+    const char* key = bind->key.toString();
+    const float keyW = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, key).x;
+    const ImVec2 min{ pos.x + labelW + 7.0f, pos.y + (rowHeight - 15.0f) * 0.5f };
+    const ImVec2 max{ min.x + keyW + 10.0f, min.y + 15.0f };
+    const ImU32 col = bind->active ? color::accent : color::textOff;
+    d->AddRectFilled(min, max, withAlpha(bind->active ? color::accent : color::frame, bind->active ? 0.18f : 1.0f), 4.0f);
+    d->AddText(small, small->FontSize, { min.x + 5.0f, min.y + (15.0f - small->FontSize) * 0.5f }, col, key);
+}
+
+// ПКМ по строке — окно бинда: клавиша, режим, значение на бинде (тем же виджетом, что строка).
+// Только для полей hvh::config; редактор получает float и рисует свой виджет на временной копии.
+template <typename Editor>
+static void bindMenu(ImGuiID row, const char* label, binds::Type type, void* field, const ImVec2& rowMin, float width, Editor editor) noexcept
+{
+    if (!binds::bindable(field))
+        return;
+    binds::Bind* bind = binds::attach(row, label, type, field, false);
+    bindBadge(ImGui::GetWindowDrawList(), rowMin, label, bind);
+
+    ImGui::PushID(static_cast<int>(row));
+    const bool rowHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)
+        && ImGui::IsMouseHoveringRect(rowMin, { rowMin.x + width, rowMin.y + rowHeight });
+    if (rowHovered && ImGui::GetIO().MouseClicked[1])
+        ImGui::OpenPopup("##bind");
+
+    ImGui::SetNextWindowSize({ 290.0f, 0.0f });
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 14.0f, 12.0f });
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, toVec4(color::popupBg));
+    if (ImGui::BeginPopup("##bind")) {
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
+        if (!bind)
+            bind = binds::attach(row, label, type, field, true);
+        if (bind) {
+            ImFont* bold = fonts.uiBold ? fonts.uiBold : uiFont();
+            ImGui::PushFont(bold);
+            ImGui::TextUnformatted(label, ImGui::FindRenderedTextEnd(label));
+            ImGui::PopFont();
+            ImGui::PushStyleColor(ImGuiCol_Text, toVec4(color::textDim));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted("Пока бинд активен, настройка принимает значение ниже");
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+            ImGui::Dummy({ 0.0f, 4.0f });
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, { 8.0f, 4.0f });
+            const int savedRow = groupRow;
+            groupRow = 0;
+            keybind("Клавиша", bind->key);
+            static constexpr const char* modes[]{ "Зажатие", "Переключение", "Выкл. на зажатие" };
+            int mode = static_cast<int>(bind->mode);
+            if (combo("Режим", &mode, modes, IM_ARRAYSIZE(modes))) {
+                bind->mode = static_cast<binds::Mode>(mode);
+                bind->toggled = false;
+            }
+            float value = bind->value;
+            if (editor(value)) {
+                bind->value = value;
+                if (bind->active)
+                    binds::write(*bind, value);
+            }
+            groupRow = savedRow;
+            ImGui::PopStyleVar();
+
+            ImGui::Dummy({ 0.0f, 6.0f });
+            ImGui::PushStyleColor(ImGuiCol_Text, toVec4(color::bad));
+            ImGui::PushStyleColor(ImGuiCol_Button, toVec4(withAlpha(color::bad, 0.10f)));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, toVec4(withAlpha(color::bad, 0.20f)));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, toVec4(withAlpha(color::bad, 0.30f)));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+            if (ImGui::Button("Удалить бинд", { -1.0f, 26.0f })) {
+                binds::remove(bind->id);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(4);
+        }
+        ImGui::EndPopup();
+    } else {
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
+    }
+    ImGui::PopID();
+}
+
+// Переключатель-таблетка: выключен — тёмная дорожка и серая кнопка, включён — акцент и белая.
+// При наведении вокруг мягкий ореол акцента.
+static void switchBox(ImDrawList* d, const ImVec2& at, float t, float hover) noexcept
+{
+    constexpr float w = 30.0f, h = 18.0f;
+    const ImVec2 max{ at.x + w, at.y + h };
+    if (hover > 0.01f)
+        d->AddRectFilled({ at.x - 2.0f, at.y - 2.0f }, { max.x + 2.0f, max.y + 2.0f }, withAlpha(color::accent, 0.16f * hover), h * 0.5f + 2.0f);
+    d->AddRectFilled(at, max, lerpColor(color::switchOff, color::accent, t), h * 0.5f);
+    const float cx = at.x + h * 0.5f + (w - h) * t;
+    d->AddCircleFilled({ cx, at.y + h * 0.5f }, 7.0f, lerpColor(color::accentSoft, IM_COL32(250, 251, 253, 255), t), 20);
 }
 
 bool toggle(const char* label, bool* value) noexcept
@@ -201,11 +397,10 @@ bool toggle(const char* label, bool* value) noexcept
 
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
-    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    const float labelWidth = ImGui::CalcTextSize(label, labelEnd).x;
-    const ImRect bb{ pos, { pos.x + indent + labelWidth + 4.0f, pos.y + rowHeight } };
+    const float width = ImGui::GetContentRegionAvail().x;
+    const ImRect bb{ pos, { pos.x + width, pos.y + rowHeight } };
 
-    ImGui::ItemSize(ImRect{ pos, { pos.x + ImGui::GetContentRegionAvail().x, pos.y + rowHeight } });
+    ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
         return false;
 
@@ -216,12 +411,45 @@ bool toggle(const char* label, bool* value) noexcept
         ImGui::MarkItemEdited(id);
     }
 
-    auto* drawList = window->DrawList;
-    checkboxBox(drawList, { pos.x, pos.y + (rowHeight - 8.0f) * 0.5f }, *value, hovered);
-    drawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, labelEnd);
+    const float t = animate(id, *value, 18.0f);
+    const float h = animate(id ^ 0x5A17u, hovered, 18.0f);
+    auto* d = window->DrawList;
+    rowDivider(d, pos, width);
+    rowLabel(d, pos, bb.Max.x - 40.0f, label, lerpColor(color::textMid, color::text, h));
+    switchBox(d, { bb.Max.x - 30.0f, pos.y + (rowHeight - 18.0f) * 0.5f }, t, h);
+    bindMenu(id, label, binds::Type::Bool, value, pos, width, [](float& v) {
+        bool on = v != 0.0f;
+        if (!toggle("Значение", &on))
+            return false;
+        v = on ? 1.0f : 0.0f;
+        return true;
+    });
     return pressed;
 }
 
+bool colorToggle(const char* label, bool* value, float* rgba) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems)
+        return false;
+
+    const auto pos = window->DC.CursorPos;
+    const float width = ImGui::GetContentRegionAvail().x;
+    // квадрат цвета — первым: так клик по нему не доходит до переключателя строки
+    ImGui::SetCursorScreenPos({ pos.x + width - 30.0f - 10.0f - 18.0f, pos.y + (rowHeight - 18.0f) * 0.5f });
+    ImGui::PushID(label);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 0.0f, 0.0f });
+    ImGui::PushItemWidth(18.0f);
+    ImGui::ColorEdit4("##color", rgba, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf);
+    ImGui::PopItemWidth();
+    ImGui::PopStyleVar(2);
+    ImGui::PopID();
+    ImGui::SetCursorScreenPos(pos);
+    return toggle(label, value);
+}
+
+// Слайдер в одну строку: подпись слева, дорожка и значение в плашке справа
 template <typename T>
 static bool slider(const char* label, T* value, T min, T max, const char* format) noexcept
 {
@@ -232,16 +460,36 @@ static bool slider(const char* label, T* value, T min, T max, const char* format
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
-    const float height = 32.0f;
-    const ImRect bb{ pos, { pos.x + width, pos.y + height } };
-    const ImRect track{ { pos.x + indent, pos.y + 18.0f }, { pos.x + width, pos.y + 24.0f } };
+    const ImRect bb{ pos, { pos.x + width, pos.y + rowHeight } };
+
+    ImFont* font = uiFont();
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : font;
+    char buffer[32];
+    // «@hp» — мин. урон: выше 100 это «HP+N». Подпись считается от значения, а не вписывается
+    // заранее: в окне бинда тот же формат рисовал число строки, а не бинда («HP+1» при 1)
+    if (std::strcmp(format, "@hp") == 0) {
+        const int v = static_cast<int>(*value);
+        if (v > 100)
+            std::snprintf(buffer, sizeof(buffer), "HP+%d", v - 100);
+        else
+            std::snprintf(buffer, sizeof(buffer), "%d", v);
+    } else if constexpr (std::is_integral_v<T>)
+        std::snprintf(buffer, sizeof(buffer), format, *value);
+    else
+        std::snprintf(buffer, sizeof(buffer), format, static_cast<double>(*value));
+    const float textW = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, buffer).x;
+    const float pillW = std::max(44.0f, textW + 14.0f);
+    const ImVec2 pillMin{ bb.Max.x - pillW, pos.y + (rowHeight - 20.0f) * 0.5f };
+    const float trackW = std::clamp(width * 0.3f, 48.0f, 100.0f);
+    const float cy = pos.y + rowHeight * 0.5f;
+    const ImRect track{ { pillMin.x - 12.0f - trackW, cy - 2.0f }, { pillMin.x - 12.0f, cy + 2.0f } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
         return false;
 
     bool hovered, held;
-    ImGui::ButtonBehavior(ImRect{ { bb.Min.x, track.Min.y - 8.0f }, { bb.Max.x, track.Max.y + 8.0f } }, id, &hovered, &held);
+    ImGui::ButtonBehavior(ImRect{ { track.Min.x - 6.0f, pos.y + 4.0f }, { track.Max.x + 6.0f, bb.Max.y - 4.0f } }, id, &hovered, &held);
 
     bool changed = false;
     if (held) {
@@ -258,27 +506,112 @@ static bool slider(const char* label, T* value, T min, T max, const char* format
         }
     }
 
-    auto* drawList = window->DrawList;
-    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
-    drawList->AddText({ pos.x + indent, pos.y + 1.0f }, color::text, label, labelEnd);
+    auto* d = window->DrawList;
+    rowDivider(d, pos, width);
+    rowLabel(d, pos, track.Min.x - 10.0f, label, color::textMid);
 
-    char buffer[32];
-    if constexpr (std::is_integral_v<T>)
-        std::snprintf(buffer, sizeof(buffer), format, *value);
-    else
-        std::snprintf(buffer, sizeof(buffer), format, static_cast<double>(*value));
-    const auto valueSize = ImGui::CalcTextSize(buffer);
-
-    // полоса с градиентом в чёрной рамке, число — на конце заливки, с тенью
+    // плавное положение кнопки, а не скачок
     const float ratio = std::clamp(static_cast<float>(*value - min) / static_cast<float>(max - min), 0.0f, 1.0f);
-    const float fillX = track.Min.x + track.GetWidth() * ratio;
-    drawList->AddRectFilledMultiColor(track.Min, track.Max, IM_COL32(52, 52, 52, 255), IM_COL32(52, 52, 52, 255), IM_COL32(68, 68, 68, 255), IM_COL32(68, 68, 68, 255));
-    drawList->AddRectFilledMultiColor(track.Min, { fillX, track.Max.y }, color::accent, color::accent, color::accent2, color::accent2);
-    drawList->AddRect({ track.Min.x - 1.0f, track.Min.y - 1.0f }, { track.Max.x + 1.0f, track.Max.y + 1.0f }, hovered || held ? IM_COL32(70, 70, 70, 255) : color::outline);
-    const float textX = std::clamp(fillX - valueSize.x * 0.5f, track.Min.x, track.Max.x - valueSize.x);
-    drawList->AddText({ textX + 1.0f, track.Min.y - 3.0f }, color::outline, buffer);
-    drawList->AddText({ textX, track.Min.y - 4.0f }, IM_COL32(255, 255, 255, 255), buffer);
+    float* shown = ImGui::GetStateStorage()->GetFloatRef(id ^ 0x51D3u, ratio);
+    *shown += (ratio - *shown) * std::min(1.0f, ImGui::GetIO().DeltaTime * 20.0f);
+    const float fillX = track.Min.x + track.GetWidth() * *shown;
+    d->AddRectFilled(track.Min, track.Max, color::switchOff, 2.0f);
+    if (fillX > track.Min.x + 0.5f)
+        d->AddRectFilled(track.Min, { fillX, track.Max.y }, color::accent, 2.0f);
+    const float active = animate(id ^ 0x2B1Cu, hovered || held, 18.0f);
+    d->AddCircleFilled({ fillX, cy }, 5.5f + active, IM_COL32(248, 249, 252, 255), 20);
 
+    // Плашка значения — настоящее поле ввода: клик ставит курсор, Enter или клик мимо — принять,
+    // Esc — отмена. Раньше плашка была кнопкой, которая включала поле через SetKeyboardFocusHere:
+    // в нашем окне фокус не доходил, поле через 3 кадра закрывалось — «нажимаю, и ничего».
+    // Пока не редактируем, в поле лежит подпись («60%», «HP+5»); разбор понимает и её.
+    static ImGuiID editing = 0;
+    static char editText[32];
+    const ImRect pillRect{ pillMin, { bb.Max.x, pillMin.y + 20.0f } };
+    const bool pillHovered = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(pillRect.Min, pillRect.Max);
+    char shownText[32];
+    std::snprintf(shownText, sizeof(shownText), "%s", buffer);
+    {
+        const auto savedCursor = window->DC.CursorPos;
+        const auto savedPrevLine = window->DC.CursorPosPrevLine;
+        const auto savedPrevSize = window->DC.PrevLineSize;
+        const auto savedMax = window->DC.CursorMaxPos;
+        ImGui::SetCursorScreenPos(pillMin);
+        const bool isEditing = editing == id;
+        // текст по центру плашки, пока не редактируем
+        const float padX = isEditing ? 6.0f : std::max(4.0f, (pillW - textW) * 0.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { padX, std::floor((20.0f - small->FontSize) * 0.5f) });
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, toVec4(isEditing ? color::frame : (pillHovered ? color::frameHover : withAlpha(color::frame, 0.6f))));
+        ImGui::PushStyleColor(ImGuiCol_Border, toVec4(isEditing || pillHovered ? color::accent : color::outline));
+        ImGui::PushStyleColor(ImGuiCol_Text, toVec4(color::accentText));
+        ImGui::PushFont(small);
+        ImGui::SetNextItemWidth(pillW);
+        ImGui::PushID(static_cast<int>(id ^ 0x9E11u));
+        ImGui::InputText("##edit", isEditing ? editText : shownText, isEditing ? sizeof(editText) : sizeof(shownText),
+                         ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopID();
+        const bool activated = ImGui::IsItemActivated();
+        const bool deactivated = ImGui::IsItemDeactivated();
+        const bool escaped = deactivated && ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Escape), false);
+        ImGui::PopFont();
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar(3);
+        window->DC.CursorPos = savedCursor;
+        window->DC.CursorPosPrevLine = savedPrevLine;
+        window->DC.PrevLineSize = savedPrevSize;
+        window->DC.CursorMaxPos = savedMax;
+
+        if (activated) {
+            editing = id;
+            std::snprintf(editText, sizeof(editText), "%s", shownText);
+        }
+        if (deactivated && editing == id) {
+            editing = 0;
+            if (!escaped) {
+                // «HP+5» → 105, «60%» → 60, запятая — как точка
+                char text[32];
+                std::snprintf(text, sizeof(text), "%s", editText);
+                for (char* c = text; *c; ++c)
+                    if (*c == ',')
+                        *c = '.';
+                const char* from = text;
+                while (*from == ' ')
+                    ++from;
+                double base = 0.0;
+                if ((from[0] == 'H' || from[0] == 'h') && (from[1] == 'P' || from[1] == 'p')) {
+                    base = 100.0;
+                    from += 2;
+                    while (*from == ' ' || *from == '+')
+                        ++from;
+                }
+                char* end = nullptr;
+                const double typed = std::strtod(from, &end);
+                if (end != from) {
+                    const double result = base + typed;
+                    T newValue;
+                    if constexpr (std::is_integral_v<T>)
+                        newValue = static_cast<T>(std::clamp<long long>(std::llround(result), min, max));
+                    else
+                        newValue = std::clamp(static_cast<T>(result), min, max);
+                    if (newValue != *value) {
+                        *value = newValue;
+                        changed = true;
+                        ImGui::MarkItemEdited(id);
+                    }
+                }
+            }
+        }
+    }
+
+    bindMenu(id, label, std::is_integral_v<T> ? binds::Type::Int : binds::Type::Float, value, pos, width, [&](float& v) {
+        T tmp = static_cast<T>(v);
+        if (!slider<T>("Значение", &tmp, min, max, format))
+            return false;
+        v = static_cast<float>(tmp);
+        return true;
+    });
     return changed;
 }
 
@@ -292,27 +625,123 @@ bool sliderFloat(const char* label, float* value, float min, float max, const ch
     return slider(label, value, min, max, format);
 }
 
-static void smallLabel(const char* label) noexcept
+// Выпадающий список: поле с рамкой справа в строке, меню — тёмная карточка со скруглением
+static void pushComboStyle() noexcept
 {
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
-    ImGui::TextUnformatted(label, ImGui::FindRenderedTextEnd(label));
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+    ImFont* font = uiFont();
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 9.0f, std::floor((fieldH - font->FontSize) * 0.5f) });
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, { 6.0f, 2.0f });
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 6.0f, 6.0f });
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, toVec4(color::frame));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, toVec4(color::frameHover));
+    ImGui::PushStyleColor(ImGuiCol_Button, toVec4(color::frame));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, toVec4(color::frameHover));
+    ImGui::PushStyleColor(ImGuiCol_Border, toVec4(color::outline));
+    ImGui::PushStyleColor(ImGuiCol_Text, toVec4(color::accentText));
+}
+
+// превью в поле: не длиннее maxWidth, иначе обрезка по символам UTF-8 и «...»
+static std::string fitPreview(const char* text, float maxWidth) noexcept
+{
+    ImFont* font = uiFont();
+    std::string out = text;
+    if (font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, out.c_str()).x <= maxWidth)
+        return out;
+    while (!out.empty()) {
+        do
+            out.pop_back();
+        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80);
+        while (!out.empty() && (out.back() == ' ' || out.back() == ','))
+            out.pop_back();
+        if (font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, (out + "...").c_str()).x <= maxWidth)
+            break;
+    }
+    return out + "...";
+}
+
+static void popComboStyle() noexcept
+{
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(6);
+}
+
+// Строка с полем справа: рисует разделитель и подпись, ставит курсор на поле, возвращает ширину поля
+static float fieldRow(const char* label, ImVec2& rowPos) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    rowPos = window->DC.CursorPos;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float fieldW = std::floor(std::clamp(width * 0.5f, 100.0f, 156.0f));
+    rowDivider(window->DrawList, rowPos, width);
+    rowLabel(window->DrawList, rowPos, rowPos.x + width - fieldW - 8.0f, label, color::textMid);
+    ImGui::SetCursorScreenPos({ rowPos.x + width - fieldW, rowPos.y + (rowHeight - fieldH) * 0.5f });
+    return fieldW;
+}
+
+static void endFieldRow(const ImVec2& rowPos) noexcept
+{
+    ImGui::SetCursorScreenPos({ rowPos.x, rowPos.y + rowHeight });
+    ImGui::Dummy({ 0.0f, 0.0f });
+}
+
+// шеврон «v» у правого края последнего поля
+static void fieldChevron(bool open) noexcept
+{
+    const auto min = ImGui::GetItemRectMin();
+    const auto max = ImGui::GetItemRectMax();
+    const ImVec2 c{ max.x - 11.0f, (min.y + max.y) * 0.5f };
+    const float dir = open ? -1.0f : 1.0f;
+    auto* d = ImGui::GetWindowDrawList();
+    const ImU32 col = ImGui::IsItemHovered() || open ? color::text : color::textOff;
+    d->AddLine({ c.x - 3.5f, c.y - 1.5f * dir }, { c.x, c.y + 2.0f * dir }, col, 1.5f);
+    d->AddLine({ c.x, c.y + 2.0f * dir }, { c.x + 3.5f, c.y - 1.5f * dir }, col, 1.5f);
 }
 
 bool combo(const char* label, int* value, const char* const items[], int count) noexcept
 {
-    smallLabel(label);
+    ImVec2 rowPos;
+    const float fieldW = fieldRow(label, rowPos);
+    bool changed = false;
     ImGui::PushID(label);
-    ImGui::SetNextItemWidth(-1.0f);
-    const bool changed = ImGui::Combo("##combo", value, items, count);
+    ImGui::SetNextItemWidth(fieldW);
+    pushComboStyle();
+    const std::string preview = fitPreview(*value >= 0 && *value < count ? items[*value] : "—", fieldW - 32.0f);
+    const bool open = ImGui::BeginCombo("##combo", preview.c_str(), ImGuiComboFlags_NoArrowButton);
+    if (open) {
+        for (int i = 0; i < count; ++i) {
+            const bool isSelected = i == *value;
+            ImGui::PushStyleColor(ImGuiCol_Text, toVec4(isSelected ? color::text : color::textMid));
+            if (ImGui::Selectable(items[i], isSelected)) {
+                *value = i;
+                changed = true;
+            }
+            ImGui::PopStyleColor();
+            if (isSelected)
+                ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    fieldChevron(open);
+    popComboStyle();
     ImGui::PopID();
-    ImGui::Dummy({ 0.0f, 2.0f });
+    endFieldRow(rowPos);
+    bindMenu(ImGui::GetID(label), label, binds::Type::Int, value, rowPos, ImGui::GetContentRegionAvail().x, [&](float& v) {
+        int tmp = static_cast<int>(v);
+        if (!combo("Значение", &tmp, items, count))
+            return false;
+        v = static_cast<float>(tmp);
+        return true;
+    });
     return changed;
 }
 
 bool multiCombo(const char* label, int* flags, const char* const items[], int count) noexcept
 {
-    smallLabel(label);
+    ImVec2 rowPos;
+    const float fieldW = fieldRow(label, rowPos);
 
     std::string preview;
     for (int i = 0; i < count; ++i) {
@@ -327,19 +756,41 @@ bool multiCombo(const char* label, int* flags, const char* const items[], int co
 
     bool changed = false;
     ImGui::PushID(label);
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo("##multi", preview.c_str())) {
+    ImGui::SetNextItemWidth(fieldW);
+    pushComboStyle();
+    preview = fitPreview(preview.c_str(), fieldW - 32.0f);
+    const bool open = ImGui::BeginCombo("##multi", preview.c_str(), ImGuiComboFlags_NoArrowButton);
+    if (open) {
         for (int i = 0; i < count; ++i) {
             const bool selected = *flags & (1 << i);
-            if (ImGui::Selectable(items[i], selected, ImGuiSelectableFlags_DontClosePopups)) {
+            const auto rowStart = ImGui::GetCursorScreenPos();
+            ImGui::PushStyleColor(ImGuiCol_Text, toVec4(selected ? color::text : color::textOff));
+            if (ImGui::Selectable((std::string{ "      " } + items[i]).c_str(), false, ImGuiSelectableFlags_DontClosePopups)) {
                 *flags ^= 1 << i;
                 changed = true;
+            }
+            ImGui::PopStyleColor();
+            if (selected) {
+                // галочка слева
+                auto* d = ImGui::GetWindowDrawList();
+                const float cy = rowStart.y + ImGui::GetTextLineHeight() * 0.5f;
+                d->AddLine({ rowStart.x + 3.0f, cy }, { rowStart.x + 6.0f, cy + 3.0f }, color::accent, 1.6f);
+                d->AddLine({ rowStart.x + 6.0f, cy + 3.0f }, { rowStart.x + 12.0f, cy - 3.0f }, color::accent, 1.6f);
             }
         }
         ImGui::EndCombo();
     }
+    fieldChevron(open);
+    popComboStyle();
     ImGui::PopID();
-    ImGui::Dummy({ 0.0f, 2.0f });
+    endFieldRow(rowPos);
+    bindMenu(ImGui::GetID(label), label, binds::Type::Flags, flags, rowPos, ImGui::GetContentRegionAvail().x, [&](float& v) {
+        int tmp = static_cast<int>(v);
+        if (!multiCombo("Значение", &tmp, items, count))
+            return false;
+        v = static_cast<float>(tmp);
+        return true;
+    });
     return changed;
 }
 
@@ -353,12 +804,13 @@ void keybind(const char* label, KeyBind& key) noexcept
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
     const ImRect bb{ pos, { pos.x + width, pos.y + rowHeight } };
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : uiFont();
 
     const bool listening = ImGui::GetActiveID() == id;
-    char keyName[48];
-    std::snprintf(keyName, sizeof(keyName), "[%s]", listening ? "..." : (key.isSet() ? key.toString() : "-"));
-    const auto keySize = ImGui::CalcTextSize(keyName);
-    const ImRect button{ { bb.Max.x - keySize.x - 4.0f, pos.y }, { bb.Max.x, pos.y + rowHeight } };
+    const char* keyName = listening ? "..." : (key.isSet() ? key.toString() : "—");
+    const auto keySize = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, keyName);
+    const float chipW = std::max(keySize.x + 18.0f, 44.0f);
+    const ImRect button{ { bb.Max.x - chipW, pos.y + (rowHeight - fieldH) * 0.5f }, { bb.Max.x, pos.y + (rowHeight + fieldH) * 0.5f } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -380,18 +832,27 @@ void keybind(const char* label, KeyBind& key) noexcept
         ImGui::ClearActiveID();
     }
 
-    auto* drawList = window->DrawList;
-    drawList->AddText({ pos.x + indent, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, color::text, label, ImGui::FindRenderedTextEnd(label));
-    drawList->AddText({ button.Min.x + 4.0f, pos.y + (rowHeight - ImGui::GetFontSize()) * 0.5f }, listening ? color::accent : (hovered ? color::text : IM_COL32(110, 110, 110, 255)), keyName);
+    auto* d = window->DrawList;
+    rowDivider(d, pos, width);
+    rowLabel(d, pos, button.Min.x - 8.0f, label, color::textMid);
+    d->AddRectFilled(button.Min, button.Max, hovered ? color::frameHover : color::frame, 5.0f);
+    d->AddRect(button.Min, button.Max, listening ? color::accent : color::outline, 5.0f);
+    d->AddText(small, small->FontSize, { (button.Min.x + button.Max.x - keySize.x) * 0.5f, (button.Min.y + button.Max.y - small->FontSize) * 0.5f },
+        listening ? color::accent : (key.isSet() ? color::text : color::textOff), keyName);
 }
 
+// Подвкладка — сегмент переключателя: выбранная на светлой плашке белым, остальные серым.
+// Общую подложку под сегментами рисует subTabs.
 bool pill(const char* label, bool selected) noexcept
 {
     auto* window = ImGui::GetCurrentWindow();
     const auto id = window->GetID(label);
-    const auto textSize = ImGui::CalcTextSize(label, ImGui::FindRenderedTextEnd(label));
+    ImFont* font = uiFont();
+    const auto labelEnd = ImGui::FindRenderedTextEnd(label);
+    const auto textSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, label, labelEnd);
     const auto pos = window->DC.CursorPos;
-    const ImRect bb{ pos, { pos.x + textSize.x + 20.0f, pos.y + 24.0f } };
+    constexpr float h = 28.0f;
+    const ImRect bb{ pos, { pos.x + textSize.x + 28.0f, pos.y + h } };
 
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, id))
@@ -399,22 +860,49 @@ bool pill(const char* label, bool selected) noexcept
 
     bool hovered, held;
     const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
-    const float t = animate(id, selected);
-    const float h = animate(id + 1, hovered, 16.0f);
+    const float t = animate(id, selected, 16.0f);
+    const float hv = animate(id ^ 0x77u, hovered, 18.0f);
 
-    auto* drawList = window->DrawList;
-    const ImU32 top = h > 0.5f ? IM_COL32(40, 40, 40, 255) : IM_COL32(35, 35, 35, 255);
-    drawList->AddRectFilledMultiColor(bb.Min, bb.Max, top, top, IM_COL32(27, 27, 27, 255), IM_COL32(27, 27, 27, 255));
-    drawList->AddRect(bb.Min, bb.Max, color::outline);
-    drawList->AddRect({ bb.Min.x + 1.0f, bb.Min.y + 1.0f }, { bb.Max.x - 1.0f, bb.Max.y - 1.0f }, IM_COL32(50, 50, 50, 255));
-    drawList->AddText({ pos.x + 10.0f, pos.y + (24.0f - textSize.y) * 0.5f }, lerpColor(color::text, color::accent, t), label, ImGui::FindRenderedTextEnd(label));
+    auto* d = window->DrawList;
+    if (const float fill = std::max(t, hv * 0.35f); fill > 0.01f)
+        d->AddRectFilled(bb.Min, bb.Max, withAlpha(color::selected, fill), 6.0f);
+    if (t > 0.01f)
+        d->AddRect(bb.Min, bb.Max, withAlpha(color::outline, t), 6.0f);
+    d->AddText(font, font->FontSize, { pos.x + 14.0f, pos.y + std::floor((h - textSize.y) * 0.5f) },
+        lerpColor(lerpColor(color::textOff, color::textMid, hv), color::text, t), label, labelEnd);
     return pressed;
+}
+
+namespace
+{
+ImVec2 segmentsStart;
+}
+
+void beginSegments() noexcept
+{
+    auto* d = ImGui::GetWindowDrawList();
+    d->ChannelsSplit(2);
+    d->ChannelsSetCurrent(1);
+    segmentsStart = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos({ segmentsStart.x + 3.0f, segmentsStart.y + 3.0f });
+    ImGui::BeginGroup();
+}
+
+void endSegments() noexcept
+{
+    ImGui::EndGroup();
+    const auto max = ImGui::GetItemRectMax();
+    auto* d = ImGui::GetWindowDrawList();
+    d->ChannelsSetCurrent(0);
+    d->AddRectFilled(segmentsStart, { max.x + 3.0f, max.y + 3.0f }, withAlpha(color::frame, 0.9f), 9.0f);
+    d->AddRect(segmentsStart, { max.x + 3.0f, max.y + 3.0f }, withAlpha(color::outline, 0.7f), 9.0f);
+    d->ChannelsMerge();
 }
 
 void drawIcon(ImDrawList* d, Icon icon, const ImVec2& c, float s, ImU32 col) noexcept
 {
     const float r = s * 0.5f;
-    const float th = 1.6f;
+    const float th = s > 18.0f ? 1.6f : 1.4f;
     switch (icon) {
     case Icon::Rage: // прицел
         d->AddCircle(c, r * 0.72f, col, 24, th);
@@ -478,39 +966,225 @@ void drawIcon(ImDrawList* d, Icon icon, const ImVec2& c, float s, ImU32 col) noe
         d->AddLine({ c.x - r * 0.9f, c.y - r * 0.75f }, { c.x - r * 0.15f, c.y - r * 0.75f }, col, th);
         d->AddLine({ c.x - r * 0.15f, c.y - r * 0.75f }, { c.x + r * 0.05f, c.y - r * 0.45f }, col, th);
         break;
+    // мелкие иконки HUD и шапки — те же, что у NewerWin (ClientIcon)
+    case Icon::User: // голова и плечи
+        d->AddCircle({ c.x, c.y - r * 0.35f }, r * 0.38f, col, 16, th);
+        d->PathArcTo({ c.x, c.y + r * 1.0f }, r * 0.72f, IM_PI * 1.1f, IM_PI * 1.9f, 14);
+        d->PathStroke(col, ImDrawFlags_None, th);
+        break;
+    case Icon::Speed: // спидометр
+        d->PathArcTo({ c.x, c.y + r * 0.3f }, r * 0.9f, IM_PI * 1.0f, IM_PI * 2.0f, 18);
+        d->PathStroke(col, ImDrawFlags_None, th);
+        d->AddLine({ c.x - r * 0.9f, c.y + r * 0.3f }, { c.x + r * 0.9f, c.y + r * 0.3f }, col, th);
+        d->AddLine({ c.x, c.y + r * 0.3f }, { c.x + r * 0.45f, c.y - r * 0.25f }, col, th);
+        break;
+    case Icon::Clock:
+        d->AddCircle(c, r * 0.9f, col, 20, th);
+        d->AddLine(c, { c.x, c.y - r * 0.55f }, col, th);
+        d->AddLine(c, { c.x + r * 0.4f, c.y + r * 0.1f }, col, th);
+        break;
+    case Icon::Ping: { // компас — как иконка координат у NewerWin
+        d->AddCircle(c, r * 0.9f, col, 20, th);
+        const ImVec2 pts[]{ { c.x + r * 0.42f, c.y - r * 0.42f }, { c.x + r * 0.12f, c.y + r * 0.12f }, { c.x - r * 0.42f, c.y + r * 0.42f }, { c.x - r * 0.12f, c.y - r * 0.12f } };
+        d->AddPolyline(pts, 4, col, ImDrawFlags_Closed, th);
+        break;
+    }
+    case Icon::Save: // дискета
+        d->AddRect({ c.x - r * 0.8f, c.y - r * 0.8f }, { c.x + r * 0.8f, c.y + r * 0.8f }, col, 2.0f, ImDrawFlags_None, th);
+        d->AddRect({ c.x - r * 0.4f, c.y - r * 0.8f }, { c.x + r * 0.35f, c.y - r * 0.3f }, col, 0.0f, ImDrawFlags_None, th);
+        d->AddRect({ c.x - r * 0.45f, c.y + r * 0.15f }, { c.x + r * 0.45f, c.y + r * 0.8f }, col, 0.0f, ImDrawFlags_None, th);
+        break;
+    case Icon::Keyboard: // плашка-клавиатура, как значок «Server Binds»
+        d->AddRectFilled({ c.x - r * 0.95f, c.y - r * 0.6f }, { c.x + r * 0.95f, c.y + r * 0.6f }, col, 2.0f);
+        d->AddRectFilled({ c.x - r * 0.7f, c.y - r * 0.38f }, { c.x + r * 0.7f, c.y + r * 0.38f }, withAlpha(IM_COL32(0, 0, 0, 255), 0.45f), 1.0f);
+        break;
+    case Icon::Chevron: // «>»
+        d->AddLine({ c.x - r * 0.25f, c.y - r * 0.5f }, { c.x + r * 0.25f, c.y }, col, th);
+        d->AddLine({ c.x + r * 0.25f, c.y }, { c.x - r * 0.25f, c.y + r * 0.5f }, col, th);
+        break;
     }
 }
 
+// Пункт сайдбара: иконка + название. Выбранный — на светлой плашке, иконка акцентом;
+// наведение — плашка вполсилы. Переходы плавные.
 bool sidebarTab(const char* label, Icon icon, bool selected) noexcept
 {
     auto* window = ImGui::GetCurrentWindow();
     const auto id = window->GetID(label);
     const auto pos = window->DC.CursorPos;
     const float width = ImGui::GetContentRegionAvail().x;
-    const ImRect bb{ pos, { pos.x + width, pos.y + 64.0f } };
+    constexpr float h = 32.0f;
+    const ImRect bb{ pos, { pos.x + width, pos.y + h } };
 
-    ImGui::ItemSize(bb);
+    ImGui::ItemSize(ImRect{ pos, { bb.Max.x, bb.Max.y + 2.0f } });
     if (!ImGui::ItemAdd(bb, id))
         return false;
 
     bool hovered, held;
     const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
-    const float h = animate(id + 1, hovered, 16.0f);
+    const float t = animate(id, selected, 16.0f);
+    const float hv = animate(id ^ 0x3C1Au, hovered, 18.0f);
 
-    // в окне-родителе: выбранная вкладка сливается с областью контента (без правой линии)
-    auto* d = window->RootWindow->DrawList;
-    if (selected) {
-        d->AddRectFilled(bb.Min, { bb.Max.x + 1.0f, bb.Max.y }, color::windowBg);
-        d->AddLine({ bb.Min.x, bb.Min.y }, { bb.Max.x + 1.0f, bb.Min.y }, color::outline);
-        d->AddLine({ bb.Min.x, bb.Min.y + 1.0f }, { bb.Max.x + 1.0f, bb.Min.y + 1.0f }, color::groupLine);
-        d->AddLine({ bb.Min.x, bb.Max.y - 1.0f }, { bb.Max.x + 1.0f, bb.Max.y - 1.0f }, color::groupLine);
-        d->AddLine({ bb.Min.x, bb.Max.y }, { bb.Max.x + 1.0f, bb.Max.y }, color::outline);
-    }
-    const ImU32 col = selected ? IM_COL32(210, 210, 210, 255) : lerpColor(IM_COL32(90, 90, 90, 255), IM_COL32(150, 150, 150, 255), h);
-    drawIcon(d, icon, { bb.Min.x + width * 0.5f, bb.Min.y + 32.0f }, 24.0f, col);
-    if (hovered)
-        ImGui::SetTooltip("%s", label);
+    auto* d = window->DrawList;
+    if (const float fill = std::max(t, hv * 0.45f); fill > 0.01f)
+        d->AddRectFilled(bb.Min, bb.Max, withAlpha(color::selected, fill), 7.0f);
+    const ImU32 textCol = lerpColor(lerpColor(color::textOff, color::textMid, hv), color::text, t);
+    drawIcon(d, icon, { bb.Min.x + 19.0f, bb.Min.y + h * 0.5f }, 14.0f, lerpColor(textCol, color::accent, t));
+    ImFont* font = uiFont();
+    d->AddText(font, font->FontSize, { bb.Min.x + 38.0f, bb.Min.y + std::floor((h - font->FontSize) * 0.5f) }, textCol, label, ImGui::FindRenderedTextEnd(label));
     return pressed;
+}
+
+bool sidebarSubTab(const char* label, bool selected) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    const auto id = window->GetID(label);
+    const auto pos = window->DC.CursorPos;
+    const float width = ImGui::GetContentRegionAvail().x;
+    constexpr float h = 30.0f, indentX = 18.0f;
+    const ImRect bb{ { pos.x + indentX, pos.y }, { pos.x + width, pos.y + h } };
+
+    ImGui::ItemSize(ImRect{ pos, { bb.Max.x, bb.Max.y + 2.0f } });
+    if (!ImGui::ItemAdd(bb, id))
+        return false;
+
+    bool hovered, held;
+    const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    const float t = animate(id, selected, 16.0f);
+    const float hv = animate(id ^ 0x3C1Bu, hovered, 18.0f);
+
+    auto* d = window->DrawList;
+    if (const float fill = std::max(t, hv * 0.45f); fill > 0.01f)
+        d->AddRectFilled(bb.Min, bb.Max, withAlpha(color::selected, fill), 7.0f);
+    const ImU32 textCol = lerpColor(lerpColor(color::textOff, color::textMid, hv), color::text, t);
+    const ImVec2 dot{ bb.Min.x + 16.0f, bb.Min.y + h * 0.5f };
+    d->AddCircle(dot, 3.5f, lerpColor(textCol, color::accent, t), 16, 1.4f);
+    if (t > 0.01f)
+        d->AddCircleFilled(dot, 2.0f, withAlpha(color::accent, t), 12);
+    ImFont* font = uiFont();
+    d->AddText(font, font->FontSize, { bb.Min.x + 30.0f, bb.Min.y + std::floor((h - font->FontSize) * 0.5f) }, textCol, label, ImGui::FindRenderedTextEnd(label));
+    return pressed;
+}
+
+void sidebarSection(const char* label) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    const auto pos = window->DC.CursorPos;
+    ImFont* font = fonts.uiSmall ? fonts.uiSmall : uiFont();
+    constexpr float h = 28.0f;
+    ImGui::ItemSize(ImRect{ pos, { pos.x + 10.0f, pos.y + h } });
+    window->DrawList->AddText(font, font->FontSize, { pos.x + 12.0f, pos.y + h - font->FontSize - 7.0f }, color::textDim, upperCaption(label));
+}
+
+void drawBackdrop(ImDrawList* d, const ImVec2& min, const ImVec2& max, float r) noexcept
+{
+    // тень: несколько расходящихся контуров с затуханием
+    for (int i = 1; i <= 10; ++i) {
+        const float grow = static_cast<float>(i) * 2.0f;
+        const float a = 0.10f * (1.0f - static_cast<float>(i) / 11.0f);
+        d->AddRect({ min.x - grow, min.y - grow + 4.0f }, { max.x + grow, max.y + grow + 4.0f },
+            withAlpha(IM_COL32(0, 0, 0, 255), a), r + grow, ImDrawFlags_None, 2.0f);
+    }
+    // размытая игра под окном; без неё (меню в главном меню игры, нет FBO) — просто плотнее тонировка
+    blur::request();
+    const ImTextureID blurred = blur::texture();
+    if (blurred) {
+        ImVec2 uv0, uv1;
+        blur::uv(min, max, uv0, uv1);
+        d->AddImageRounded(blurred, min, max, uv0, uv1, IM_COL32_WHITE, r);
+        d->AddRectFilled(min, max, color::windowBg, r);
+    } else {
+        d->AddRectFilled(min, max, (color::windowBg & ~IM_COL32_A_MASK) | IM_COL32(0, 0, 0, 248), r);
+    }
+    // лёгкий блик сверху и рамка
+    d->AddRectFilledMultiColor({ min.x + r, min.y + 1.0f }, { max.x - r, min.y + 60.0f },
+        IM_COL32(255, 255, 255, 6), IM_COL32(255, 255, 255, 6), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 0));
+    d->AddRect(min, max, withAlpha(IM_COL32(255, 255, 255, 255), 0.07f), r);
+}
+
+void drawLogo(ImDrawList* d, const ImVec2& pos) noexcept
+{
+    // затмение: диск акцента, сверху сдвинутый тёмный — остаётся серп, вокруг слабое свечение
+    const ImVec2 c{ pos.x + 16.0f, pos.y + 16.0f };
+    d->AddCircleFilled(c, 9.0f, color::accent, 32);
+    d->AddCircleFilled({ c.x + 3.5f, c.y - 2.5f }, 7.6f, IM_COL32(12, 14, 19, 255), 32);
+
+    ImFont* title = fonts.uiTitle ? fonts.uiTitle : uiFont();
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : uiFont();
+    d->AddText(title, title->FontSize, { pos.x + 34.0f, pos.y + 1.0f }, color::text, "ECLIPSE");
+    d->AddText(small, small->FontSize, { pos.x + 34.0f, pos.y + 19.0f }, color::textDim, "Counter-Strike: GO");
+}
+
+bool selectButton(const char* idText, Icon icon, const char* text, float width) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    const auto id = window->GetID(idText);
+    const auto pos = window->DC.CursorPos;
+    constexpr float h = 30.0f;
+    const ImRect bb{ pos, { pos.x + width, pos.y + h } };
+    ImGui::ItemSize(bb);
+    if (!ImGui::ItemAdd(bb, id))
+        return false;
+    bool hovered, held;
+    const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    const float hv = animate(id, hovered, 18.0f);
+
+    auto* d = window->DrawList;
+    d->AddRectFilled(bb.Min, bb.Max, lerpColor(color::frame, color::frameHover, hv), 7.0f);
+    d->AddRect(bb.Min, bb.Max, color::outline, 7.0f);
+    drawIcon(d, icon, { bb.Min.x + 16.0f, bb.Min.y + h * 0.5f }, 12.0f, color::accent);
+    ImFont* font = uiFont();
+    d->PushClipRect(bb.Min, { bb.Max.x - 26.0f, bb.Max.y }, true);
+    d->AddText(font, font->FontSize, { bb.Min.x + 30.0f, bb.Min.y + std::floor((h - font->FontSize) * 0.5f) }, color::text, text);
+    d->PopClipRect();
+    const ImVec2 c{ bb.Max.x - 14.0f, bb.Min.y + h * 0.5f };
+    const ImU32 col = lerpColor(color::textOff, color::text, hv);
+    d->AddLine({ c.x - 3.5f, c.y - 1.5f }, { c.x, c.y + 2.0f }, col, 1.5f);
+    d->AddLine({ c.x, c.y + 2.0f }, { c.x + 3.5f, c.y - 1.5f }, col, 1.5f);
+    return pressed;
+}
+
+bool iconButton(const char* idText, Icon icon, const char* tip) noexcept
+{
+    auto* window = ImGui::GetCurrentWindow();
+    const auto id = window->GetID(idText);
+    const auto pos = window->DC.CursorPos;
+    constexpr float s = 30.0f;
+    const ImRect bb{ pos, { pos.x + s, pos.y + s } };
+    ImGui::ItemSize(bb);
+    if (!ImGui::ItemAdd(bb, id))
+        return false;
+    bool hovered, held;
+    const bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    const float hv = animate(id, hovered, 18.0f);
+
+    auto* d = window->DrawList;
+    d->AddRectFilled(bb.Min, bb.Max, lerpColor(color::frame, color::frameHover, hv), 7.0f);
+    d->AddRect(bb.Min, bb.Max, color::outline, 7.0f);
+    drawIcon(d, icon, { bb.Min.x + s * 0.5f, bb.Min.y + s * 0.5f }, 12.0f, held ? color::accent : lerpColor(color::textMid, color::text, hv));
+    if (hovered && tip)
+        ImGui::SetTooltip("%s", tip);
+    return pressed;
+}
+
+void drawProfile(ImDrawList* d, const ImVec2& min, float width, const char* name, const char* caption) noexcept
+{
+    d->AddLine({ min.x, min.y }, { min.x + width, min.y }, withAlpha(IM_COL32(255, 255, 255, 255), 0.06f));
+    const ImVec2 c{ min.x + 26.0f, min.y + 30.0f };
+    d->AddCircleFilled(c, 15.0f, color::frameHover, 32);
+    d->AddCircle(c, 15.0f, withAlpha(color::accent, 0.55f), 32, 1.2f);
+    drawIcon(d, Icon::User, { c.x, c.y + 1.0f }, 14.0f, color::textMid);
+    // точка «в сети»
+    d->AddCircleFilled({ c.x + 10.5f, c.y + 10.5f }, 4.5f, IM_COL32(13, 16, 24, 255), 16);
+    d->AddCircleFilled({ c.x + 10.5f, c.y + 10.5f }, 3.0f, color::good, 16);
+
+    ImFont* font = fonts.uiBold ? fonts.uiBold : uiFont();
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : uiFont();
+    d->PushClipRect({ min.x, min.y }, { min.x + width - 6.0f, min.y + 60.0f }, true);
+    d->AddText(font, font->FontSize, { c.x + 24.0f, c.y - font->FontSize + 1.0f }, color::text, name);
+    d->AddText(small, small->FontSize, { c.x + 24.0f, c.y + 3.0f }, color::textDim, caption);
+    d->PopClipRect();
+    drawIcon(d, Icon::Chevron, { min.x + width - 10.0f, c.y }, 14.0f, color::textOff);
 }
 
 }
@@ -522,9 +1196,9 @@ using namespace hvh::ui;
 
 void updateInput() noexcept
 {
+    binds::update();
     antiaim::updateInput();
     config.exploits.doubleTapKey.handleToggle();
-    config.rage.forceShotKey.handleToggle();
 }
 
 void drawIndicators(ImDrawList* drawList) noexcept
@@ -604,6 +1278,8 @@ void drawIndicators(ImDrawList* drawList) noexcept
             line(text, percent >= 100 ? color::good : color::accent);
         }
     }
+    if (defensive::lagPeekHolding())
+        line("LAG PEEK", color::good);
     if (config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown())
         line("PEEK", color::accent);
     if (config.antiAim.enabled) {
@@ -636,78 +1312,239 @@ void drawIndicators(ImDrawList* drawList) noexcept
     }
 }
 
-// Ватермарка как у gamesense: двойная рамка, радужная полоска сверху,
-// «newer» белым + «win» акцентом | ник | задержка | тикрейт | время
+// ---- HUD ----
+namespace
+{
+
+// HUD в цветах NewerWin (как было до переделки меню) — свои константы, палитра меню другая
+constexpr ImU32 hudBg = IM_COL32(12, 20, 31, 225);
+constexpr ImU32 hudLine = IM_COL32(35, 42, 56, 160);
+constexpr ImU32 nwAccent = IM_COL32(66, 135, 245, 255);
+constexpr ImU32 nwAccent2 = IM_COL32(80, 147, 255, 255);
+constexpr ImU32 nwChip = IM_COL32(31, 38, 49, 255);
+constexpr ImU32 nwChipText = IM_COL32(166, 200, 253, 255);
+
+ImFont* hudFont() noexcept
+{
+    return fonts.ui ? fonts.ui : (fonts.menu ? fonts.menu : ImGui::GetFont());
+}
+
+}
+
+// Ватермарка NewerWin: пилюля сверху по центру — «NW» акцентом, дальше сегменты
+// [синяя иконка + белый текст]: ник, FPS, время, пинг. Цвета свои, старые NewerWin —
+// остальной интерфейс в другой палитре
 void drawWatermark(ImDrawList* d) noexcept
 {
     if (!config.view.watermark)
         return;
 
+
     char nick[32] = "";
-    int tickRate = 64;
+    bool inMatch = false;
     {
         GameData::Lock lock;
         const auto& local = GameData::local();
-        if (local.exists) {
+        inMatch = local.exists;
+        if (local.exists)
             std::snprintf(nick, sizeof(nick), "%s", local.name);
-            tickRate = local.tickRate;
-        }
+    }
+    if (!*nick) {
+        const char* user = std::getenv("USER");
+        std::snprintf(nick, sizeof(nick), "%s", user && *user ? user : "user");
     }
 
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
     localtime_r(&now, &tm);
 
-    char rest[128];
-    if (*nick)
-        std::snprintf(rest, sizeof(rest), " | %s | delay: %dms | %dtick | %02d:%02d:%02d", nick, GameData::getNetOutgoingLatency(), tickRate, tm.tm_hour, tm.tm_min, tm.tm_sec);
-    else
-        std::snprintf(rest, sizeof(rest), " | %02d:%02d:%02d", tm.tm_hour, tm.tm_min, tm.tm_sec);
+    // FPS сглаженный, обновляется 4 раза в секунду — чтобы цифры не мельтешили
+    static float shownFps = 0.0f;
+    static double fpsAt = 0.0;
+    if (ImGui::GetTime() - fpsAt > 0.25) {
+        shownFps = ImGui::GetIO().Framerate;
+        fpsAt = ImGui::GetTime();
+    }
 
-    ImFont* font = fonts.menu ? fonts.menu : ImGui::GetFont();
+    char fps[24], time[16], ping[24];
+    std::snprintf(fps, sizeof(fps), "%d FPS", static_cast<int>(shownFps + 0.5f));
+    std::snprintf(time, sizeof(time), "%02d:%02d", tm.tm_hour, tm.tm_min);
+    std::snprintf(ping, sizeof(ping), "%d ms", GameData::getNetOutgoingLatency());
+
+    struct Segment { Icon icon; const char* text; };
+    const Segment segments[]{ { Icon::User, nick }, { Icon::Speed, fps }, { Icon::Clock, time }, { Icon::Ping, ping } };
+
+    ImFont* font = hudFont();
+    ImFont* logo = fonts.uiBold ? fonts.uiBold : font;
     const float fontSize = font->FontSize;
-    const auto sizeOf = [&](const char* text) { return font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text); };
-    const auto wNewer = sizeOf("newer");
-    const auto wWin = sizeOf("win");
-    const auto wRest = sizeOf(rest);
+    const float logoSize = logo->FontSize + 2.0f;
+    constexpr float padX = 10.0f, height = 26.0f, iconSize = 12.0f, iconGap = 5.0f, segmentGap = 11.0f;
 
-    constexpr float padX = 6.0f, padY = 4.0f, border = 4.0f, margin = 10.0f;
-    const float textW = wNewer.x + wWin.x + wRest.x;
-    const float textH = wNewer.y;
-    const ImVec2 size{ textW + padX * 2.0f + border * 2.0f, textH + padY * 2.0f + border * 2.0f + 2.0f };
+    const float logoW = logo->CalcTextSizeA(logoSize, FLT_MAX, 0.0f, "NW").x;
+    float width = padX * 2.0f + logoW;
+    float textW[4];
+    for (int i = 0; i < 4; ++i) {
+        textW[i] = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, segments[i].text).x;
+        width += segmentGap + iconSize + iconGap + textW[i];
+    }
+
     const auto& display = ImGui::GetIO().DisplaySize;
-    const ImVec2 pos{ display.x - size.x - margin, margin };
-    const ImVec2 max{ pos.x + size.x, pos.y + size.y };
+    // В матче сверху по центру стоит табло счёта (время раунда, счёт, аватарки) — уходим под него.
+    // Высота табло Panorama растёт с высотой экрана: ~8.5% (≈92 px на 1080p). Съезжает плавно.
+    static float shownY = 4.0f;
+    const float targetY = inMatch ? std::floor(display.y * 0.085f) + 4.0f : 4.0f;
+    shownY += (targetY - shownY) * std::min(1.0f, ImGui::GetIO().DeltaTime * 10.0f);
+    if (std::abs(targetY - shownY) < 0.5f)
+        shownY = targetY;
+    const ImVec2 pos{ std::floor((display.x - width) * 0.5f), std::floor(shownY) };
+    const ImVec2 max{ pos.x + width, pos.y + height };
+    d->AddRectFilled(pos, max, hudBg, 8.0f);
 
-    // рамка: чёрная, серая, полоса, серая — как у окна меню
-    d->AddRectFilled(pos, max, IM_COL32(0, 0, 0, 255));
-    d->AddRectFilled({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, IM_COL32(60, 60, 60, 255));
-    d->AddRectFilled({ pos.x + 2.0f, pos.y + 2.0f }, { max.x - 2.0f, max.y - 2.0f }, IM_COL32(40, 40, 40, 255));
-    d->AddRectFilled({ pos.x + border - 1.0f, pos.y + border - 1.0f }, { max.x - border + 1.0f, max.y - border + 1.0f }, IM_COL32(60, 60, 60, 255));
-    const ImVec2 inner{ pos.x + border, pos.y + border };
-    const ImVec2 innerMax{ max.x - border, max.y - border };
-    d->AddRectFilled(inner, innerMax, color::windowBg);
+    float x = pos.x + padX;
+    const float cy = pos.y + height * 0.5f;
+    d->AddText(logo, logoSize, { x, cy - logoSize * 0.5f - 0.5f }, nwAccent2, "NW");
+    x += logoW;
+    for (int i = 0; i < 4; ++i) {
+        x += segmentGap;
+        drawIcon(d, segments[i].icon, { x + iconSize * 0.5f, cy }, iconSize, nwAccent);
+        x += iconSize + iconGap;
+        d->AddText(font, fontSize, { x, cy - fontSize * 0.5f }, IM_COL32(255, 255, 255, 255), segments[i].text);
+        x += textW[i];
+    }
+}
 
-    // радужная полоска (вторая строка — тёмная копия)
-    const float mid = (inner.x + innerMax.x) * 0.5f;
-    const ImU32 cyan = IM_COL32(55, 177, 218, 255), magenta = IM_COL32(204, 70, 205, 255), yellow = IM_COL32(204, 227, 54, 255);
-    const ImU32 cyanD = IM_COL32(28, 89, 109, 255), magentaD = IM_COL32(102, 35, 103, 255), yellowD = IM_COL32(102, 114, 27, 255);
-    d->AddRectFilledMultiColor(inner, { mid, inner.y + 1.0f }, cyan, magenta, magenta, cyan);
-    d->AddRectFilledMultiColor({ mid, inner.y }, { innerMax.x, inner.y + 1.0f }, magenta, yellow, yellow, magenta);
-    d->AddRectFilledMultiColor({ inner.x, inner.y + 1.0f }, { mid, inner.y + 2.0f }, cyanD, magentaD, magentaD, cyanD);
-    d->AddRectFilledMultiColor({ mid, inner.y + 1.0f }, { innerMax.x, inner.y + 2.0f }, magentaD, yellowD, yellowD, magentaD);
+// Панель «Hotkeys» NewerWin: шапка (иконка + название), под ней активные бинды:
+// слева название, справа клавиша. Строки появляются и уходят плавно.
+// При открытом меню панель видна всегда и таскается за шапку. Единственный список биндов.
+void drawHotkeys(ImDrawList* d, bool menuOpen) noexcept
+{
+    if (!config.view.hotkeys)
+        return;
+    const bool inGame = localPlayer && localPlayer.get().isAlive();
+    if (!inGame && !menuOpen)
+        return;
 
-    // текст с тенью
-    float x = inner.x + padX;
-    const float y = inner.y + 2.0f + padY;
-    const auto put = [&](const char* text, ImU32 col, float width) {
-        d->AddText(font, fontSize, { x + 1.0f, y + 1.0f }, IM_COL32(0, 0, 0, 200), text);
-        d->AddText(font, fontSize, { x, y }, col, text);
-        x += width;
+    struct Row { const char* name; const char* value; bool active; };
+    Row rows[40];
+    int count = 0;
+    const auto add = [&](const char* name, const KeyBind& key, bool active) {
+        if (count < 40 && key.isSet())
+            rows[count++] = { name, key.toString(), inGame && active };
     };
-    put("newer", IM_COL32(255, 255, 255, 255), wNewer.x);
-    put("win", color::accent, wWin.x);
-    put(rest, color::text, wRest.x);
+    const auto& ex = config.exploits;
+    const auto& aa = config.antiAim;
+    add("Double tap", ex.doubleTapKey, ex.doubleTap && ex.doubleTapKey.isToggled());
+    add("Hide shots", ex.hideShotsKey, ex.hideShots && ex.hideShotsKey.isToggled());
+    add("Defensive", config.defensive.key, config.defensive.key.isDown());
+    add("Teleport", ex.teleportKey, ex.teleportKey.isDown());
+    add("Lag peek", ex.lagPeekKey, ex.lagPeek && ex.lagPeekKey.isDown());
+    add("Fake duck", config.movement.fakeDuckKey, movement::isFakeDucking());
+    add("Auto peek", config.movement.autoPeekKey, config.movement.autoPeekKey.isDown());
+    add("Freestand", aa.freestandKey, aa.freestandKey.isDown() && antiaim::isFreestanding());
+    add("Edge yaw", aa.edgeKey, aa.edgeYaw && aa.edgeKey.isDown());
+    add("Inverter", aa.inverter, aa.inverter.isToggled());
+    // бинды на настройки (ПКМ в меню)
+    // одна строка на «подпись + клавишу»: «Мин. урон» висит на каждой группе оружия — 8 одинаковых строк
+    {
+        const auto& all = binds::all();
+        for (std::size_t k = 0; k < all.size(); ++k) {
+            bool duplicate = false, active = all[k].resolved && all[k].active;
+            for (std::size_t m = 0; m < all.size(); ++m) {
+                if (m == k || all[m].label != all[k].label || all[m].key.toString() != std::string_view{ all[k].key.toString() })
+                    continue;
+                if (m < k)
+                    duplicate = true;
+                active = active || (all[m].resolved && all[m].active);
+            }
+            if (!duplicate)
+                add(all[k].label.c_str(), all[k].key, active);
+        }
+    }
+    if (count < 40 && aa.enabled) {
+        const auto manual = antiaim::manualDirection();
+        const char* dir = manual == antiaim::Manual::Left ? "Left" : manual == antiaim::Manual::Right ? "Right"
+            : manual == antiaim::Manual::Back ? "Back" : manual == antiaim::Manual::Forward ? "Forward" : "";
+        rows[count++] = { "Manual", dir, inGame && manual != antiaim::Manual::None };
+    }
+
+    ImFont* font = hudFont();
+    ImFont* small = fonts.uiSmall ? fonts.uiSmall : font;
+    const float fontSize = font->FontSize;
+    constexpr float headerH = 26.0f, rowH = 21.0f, padX = 10.0f;
+
+    // плавность строк по имени
+    float shown[40];
+    float bodyH = 0.0f;
+    float widest = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, "Hotkeys").x + 26.0f;
+    for (int i = 0; i < count; ++i) {
+        shown[i] = animate(ImHashStr(rows[i].name) ^ 0x484b, rows[i].active, 10.0f);
+        if (shown[i] <= 0.001f)
+            continue;
+        bodyH += rowH * shown[i];
+        const float w = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, rows[i].name).x
+            + small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, rows[i].value).x + 30.0f;
+        widest = std::max(widest, w);
+    }
+    // ширина тоже плывёт, а не прыгает
+    static float width = 0.0f;
+    const float targetW = std::max(130.0f, widest + padX * 2.0f);
+    width = width <= 0.0f ? targetW : width + (targetW - width) * std::min(1.0f, ImGui::GetIO().DeltaTime * 14.0f);
+
+    const auto& display = ImGui::GetIO().DisplaySize;
+    ImVec2 pos{ std::floor(config.view.hotkeysX * display.x), std::floor(config.view.hotkeysY * display.y) };
+
+    // перетаскивание за шапку при открытом меню (если мышь не над окном меню)
+    static bool dragging = false;
+    static ImVec2 grab{};
+    const auto& io = ImGui::GetIO();
+    if (menuOpen) {
+        const bool overHeader = io.MousePos.x >= pos.x && io.MousePos.x <= pos.x + width && io.MousePos.y >= pos.y && io.MousePos.y <= pos.y + headerH;
+        if (!dragging && overHeader && io.MouseClicked[0] && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+            dragging = true;
+            grab = { io.MousePos.x - pos.x, io.MousePos.y - pos.y };
+        }
+        if (dragging) {
+            if (io.MouseDown[0]) {
+                pos.x = std::clamp(io.MousePos.x - grab.x, 0.0f, display.x - width);
+                pos.y = std::clamp(io.MousePos.y - grab.y, 0.0f, display.y - headerH);
+                config.view.hotkeysX = pos.x / display.x;
+                config.view.hotkeysY = pos.y / display.y;
+            } else {
+                dragging = false;
+            }
+        }
+    } else {
+        dragging = false;
+    }
+
+    const ImVec2 max{ pos.x + width, pos.y + headerH + (bodyH > 0.5f ? bodyH + 6.0f : 0.0f) };
+    d->AddRectFilled(pos, max, hudBg, 8.0f);
+    if (dragging)
+        d->AddRect(pos, max, withAlpha(nwAccent2, 0.7f), 8.0f);
+
+    // шапка
+    drawIcon(d, Icon::Keyboard, { pos.x + padX + 7.0f, pos.y + headerH * 0.5f }, 13.0f, nwAccent);
+    d->AddText(font, fontSize, { pos.x + padX + 20.0f, pos.y + (headerH - fontSize) * 0.5f }, IM_COL32(255, 255, 255, 255), "Hotkeys");
+    if (bodyH > 0.5f)
+        d->AddLine({ pos.x + padX, pos.y + headerH }, { max.x - padX, pos.y + headerH }, hudLine);
+
+    // строки: клип по телу, чтобы уходящая строка не вылезала
+    d->PushClipRect({ pos.x, pos.y + headerH }, max, true);
+    float y = pos.y + headerH + 3.0f;
+    for (int i = 0; i < count; ++i) {
+        if (shown[i] <= 0.001f)
+            continue;
+        const float a = shown[i];
+        const float cy = y + rowH * 0.5f;
+        d->AddText(font, fontSize, { pos.x + padX, cy - fontSize * 0.5f }, withAlpha(IM_COL32(255, 255, 255, 255), a), rows[i].name);
+        // клавиша — в плашке справа, как у Server Binds
+        const auto valueSize = small->CalcTextSizeA(small->FontSize, FLT_MAX, 0.0f, rows[i].value);
+        const ImVec2 chipMin{ max.x - padX - valueSize.x - 10.0f, cy - 8.0f };
+        d->AddRectFilled(chipMin, { max.x - padX, cy + 8.0f }, withAlpha(nwChip, a), 5.0f);
+        d->AddText(small, small->FontSize, { chipMin.x + 5.0f, cy - small->FontSize * 0.5f }, withAlpha(nwChipText, a), rows[i].value);
+        y += rowH * a;
+    }
+    d->PopClipRect();
 }
 
 static int selectedWeapon = 0;
@@ -716,18 +1553,13 @@ void drawRageTab() noexcept
 {
     auto& rage = config.rage;
 
-    for (int i = 0; i < static_cast<int>(weaponGroupNames.size()); ++i) {
-        if (i)
-            ImGui::SameLine(0.0f, 6.0f);
-        if (pill(weaponGroupNames[i], selectedWeapon == i))
-            selectedWeapon = i;
-    }
-    ImGui::Dummy({ 0.0f, 4.0f });
-
+    selectedWeapon = std::clamp(selectedWeapon, 0, static_cast<int>(weaponGroupNames.size()) - 1);
     const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    const float height = ImGui::GetContentRegionAvail().y;
+    constexpr float gap = 10.0f;
 
-    if (beginGroup("Основное", { width, height })) {
+    // ---- левая колонка: основное, резольвер, эксплойты ----
+    ImGui::BeginGroup();
+    if (beginGroup("Основное", { width, 0.0f })) {
         toggle("Включить", &rage.enabled);
         toggle("Сайлент", &rage.silent);
         toggle("Автовыстрел", &rage.autoFire);
@@ -738,9 +1570,23 @@ void drawRageTab() noexcept
                               "порог опускается до лучшего достижимого урона, и выстрел всё равно идёт.\n"
                               "Без него не стреляет — кроме случая, когда порог требует убийства, а набирается\n"
                               "хотя бы половина хп (вторая пуля DT добьёт).");
-        if (rage.forceShot)
-            keybind("Клавиша форсшута", rage.forceShotKey);
-        toggle("Резольвер", &rage.resolver);
+        sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
+        toggle("Только в тело", &rage.forceBody);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Клавиша, МД на клавишу и прочие «оверрайды» — ПКМ по строке: бинд");
+        toggle("Дормант-аимбот", &rage.dormantAim);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Враг за пределами видимости (дормант), но слышен — шаги, выстрел —\n"
+                              "или виден союзникам на радаре: стрельба в живот через стену,\n"
+                              "если пробивает на мин. урон. Только когда видимых целей нет.");
+        if (rage.dormantAim)
+            sliderInt("Мин. точность", &rage.dormantAccuracy, 25, 95, "%d%%");
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Резольвер", { width, 0.0f })) {
+        toggle("Включить", &rage.resolver);
         if (rage.resolver) {
             toggle("По слоям анимации", &rage.layerResolver);
             if (ImGui::IsItemHovered())
@@ -762,41 +1608,12 @@ void drawRageTab() noexcept
                                   "и так получает больший шанс, чем точка одной стороны.\n"
                                   "После промаха / Всегда — стрелять ТОЛЬКО в точки, общие для всех гипотез.");
         }
-        sliderFloat("FOV", &rage.fov, 1.0f, 180.0f, "%.0f°");
-        keybind("Мин. урон (override)", rage.minDamageOverrideKey);
-        keybind("Только в тело", rage.forceBodyKey);
-        toggle("Дормант-аимбот", &rage.dormantAim);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Враг за пределами видимости (дормант), но слышен — шаги, выстрел —\n"
-                              "или виден союзникам на радаре: стрельба в живот через стену,\n"
-                              "если пробивает на мин. урон. Только когда видимых целей нет.");
-        if (rage.dormantAim)
-            sliderInt("Мин. точность", &rage.dormantAccuracy, 25, 95, "%d%%");
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
 
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Нож и зевс");
-        ImGui::PopFont();
-        toggle("Кнайфбот", &rage.knifeBot);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("С ножом в руке сам бьёт врага в радиусе удара (с учётом бектрека):\n"
-                              "ПКМ (до 32 ед.) — 65 урона, в спину 180; ЛКМ (до 48 ед.) — 25, в спину 90.\n"
-                              "Броня режет урон на 15%%. Сначала смертельный ПКМ, потом смертельный ЛКМ.");
-        if (rage.knifeBot) {
-            static constexpr const char* knifeModes[]{ "Только наповал", "Любой удар" };
-            combo("Когда бить", &rage.knifeBotMode, knifeModes, IM_ARRAYSIZE(knifeModes));
-        }
-        toggle("Зевсбот", &rage.zeusBot);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("С зевсом в руке стреляет только наверняка: грудь/живот/таз,\nурон должен убивать, автостоп по точности.");
-        if (rage.zeusBot)
-            sliderInt("Хитшанс зевса", &rage.zeusHitchance, 30, 100, "%d%%");
-
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushFont(fonts.bold);
-        ImGui::TextUnformatted("Эксплойты");
-        ImGui::PopFont();
-        auto& ex = config.exploits;
+    auto& ex = config.exploits;
+    if (beginGroup("Эксплойты", { width, 0.0f })) {
         toggle("Double tap", &ex.doubleTap);
         keybind("Клавиша DT", ex.doubleTapKey);
         static constexpr const char* dtModes[]{ "Быстрая стрельба", "Дефенсив" };
@@ -806,6 +1623,12 @@ void drawRageTab() noexcept
         sliderInt("Тиков сдвига", &ex.shiftTicks, 6, 14);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Заряд под вторую пулю DT (быстрая стрельба). У дефенсива свой ползунок ниже.");
+        sliderInt("Команд за тик (сервер)", &ex.serverPackLimit, 0, 16, ex.serverPackLimit == 0 ? "выкл" : "%d");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Сколько команд удалённый сервер принимает за тик. Чок, фейклаг, лаг-пик и сдвиг DT\n"
+                              "не длиннее этого: хвост длинной пачки сервер выкидывает, и выстрел уходит из старой\n"
+                              "позиции (в стену). Мисы с «пуля застряла» на лаг-пике — уменьши. На своём сервере — не важно.");
+        toggle("Нож в прыжке с DT — без лагов", &ex.knifeAirNoLag);
         keybind("Телепорт", ex.teleportKey);
         toggle("Хайдшоты", &ex.hideShots);
         if (ImGui::IsItemHovered())
@@ -822,22 +1645,11 @@ void drawRageTab() noexcept
         if (ex.autoHideShots) {
             toggle("Автоматы, ПП, пистолеты", &ex.autoHsRifles);
             toggle("Дигл", &ex.autoHsDeagle);
+            toggle("Автоснайперки (SCAR/G3SG1)", &ex.autoHsAuto);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Выключено — стоя и сидя у автоснайперки остаётся DT: вторая пуля\n"
+                                  "добивает того, кого первая только ранила.");
         }
-        keybind("Автопик", config.movement.autoPeekKey);
-        {
-            static constexpr const char* peekModes[]{ "После выстрела", "Выстрел или отпустил WASD" };
-            combo("Возврат автопика", &config.movement.autoPeekMode, peekModes, IM_ARRAYSIZE(peekModes));
-        }
-        toggle("AI peek", &config.movement.aiPeek);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Зажат автопик, WASD не трогаешь: ищет вокруг точку в паре шагов, откуда\n"
-                              "пробиваешь врага у прицела на мин. урон, сам выходит туда, рейдж стреляет,\n"
-                              "автопик возвращает. Лучше с DT (телепорт назад).");
-        if (config.movement.aiPeek) {
-            sliderInt("Качество поиска", &config.movement.aiPeekQuality, 30, 100, "%d%%");
-            sliderInt("Проверок подряд", &config.movement.aiPeekSafety, 1, 16);
-        }
-        keybind("Фейкдак", config.movement.fakeDuckKey);
         if (!tickbase::isInstalled()) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::bad));
             ImGui::TextWrapped("CL_Move не найден — DT и десинк недоступны в этом билде игры");
@@ -845,11 +1657,14 @@ void drawRageTab() noexcept
         }
     }
     endGroup();
+    ImGui::EndGroup();
 
     ImGui::SameLine(0.0f, 12.0f);
 
+    // ---- правая колонка: оружие (выбор в шапке), пик, нож и зевс ----
+    ImGui::BeginGroup();
     auto& weapon = rage.weapons[selectedWeapon];
-    if (beginGroup(weaponGroupNames[selectedWeapon], { width, height })) {
+    if (beginGroup("Наведение", { width, 0.0f })) {
         if (selectedWeapon != 0)
             toggle("Свои настройки", &weapon.override);
         else
@@ -872,26 +1687,94 @@ void drawRageTab() noexcept
             ImGui::SetTooltip("Как раньше: доля из 256 сидов разброса, где пуля даёт мин. урон по главной модели врага.\n"
                               "Сомнения резольвера (сторона, прогноз, джиттер) выбирают точку, а стрелять запрещают\n"
                               "только если с ними шанс ниже половины этого порога.");
-        // выше 100 — «HP+N»: подпись без %d, число уже вписано
-        char minDamageFormat[16];
-        std::snprintf(minDamageFormat, sizeof(minDamageFormat), "HP+%d", weapon.minDamage - 100);
-        sliderInt("Мин. урон", &weapon.minDamage, 1, 120, weapon.minDamage > 100 ? minDamageFormat : "%d");
-        sliderInt("Мин. урон (override)", &weapon.minDamageOverride, 1, 120);
+        // выше 100 — «HP+N»; другое значение на клавишу — ПКМ по строке (бинд)
+        sliderInt("Мин. урон", &weapon.minDamage, 1, 120, "@hp");
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Точность", { width, 0.0f })) {
         static constexpr const char* autoStops[]{ "Выкл", "Полный", "Точность" };
         combo("Автостоп", &weapon.autoStop, autoStops, IM_ARRAYSIZE(autoStops));
-        if (weapon.autoStop != static_cast<int>(AutoStop::Off))
+        if (weapon.autoStop != static_cast<int>(AutoStop::Off)) {
             toggle("Тормозить между выстрелами", &weapon.autoStopEarly);
+            toggle("Стоп перед пиком", &weapon.peekStop);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Через пару тиков выйдем туда, откуда враг простреливается с мин. уроном, —\n"
+                                  "тормозим и скопимся заранее. На выходе уже стоим точно и стреляем сразу,\n"
+                                  "а не гасим скорость 5–7 тиков под прицелом холдера.");
+        }
         toggle("Автоскоуп", &weapon.autoScope);
         toggle("Предпочитать тело", &weapon.preferBody);
         toggle("В тело, если летально", &weapon.bodyIfLethal);
     }
     endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Пик", { width, 0.0f })) {
+        toggle("Лаг-пик", &ex.lagPeek);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Держит чок, пока выходишь из-за угла; выстрел отпускает пачку.\n"
+                              "Не работает с DT «Быстрая стрельба» и фейкдаком.");
+        if (ex.lagPeek) {
+            keybind("Клавиша лаг-пика", ex.lagPeekKey);
+            sliderInt("Чок на выходе", &ex.lagPeekTicks, 2, 14, "%d");
+            sliderInt("Предсказание выхода", &ex.lagPeekPredict, 2, 16, "%d");
+            colorToggle("Показывать позицию на сервере", &config.view.serverBox, config.view.serverBoxColor);
+        }
+        keybind("Автопик", config.movement.autoPeekKey);
+        {
+            static constexpr const char* peekModes[]{ "После выстрела", "Выстрел или отпустил WASD" };
+            combo("Возврат автопика", &config.movement.autoPeekMode, peekModes, IM_ARRAYSIZE(peekModes));
+        }
+        toggle("AI peek", &config.movement.aiPeek);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Зажат автопик, WASD не трогаешь: ищет вокруг точку в паре шагов, откуда\n"
+                              "пробиваешь врага у прицела на мин. урон, сам выходит туда, рейдж стреляет,\n"
+                              "автопик возвращает. Лучше с DT (телепорт назад).");
+        if (config.movement.aiPeek) {
+            sliderInt("Качество поиска", &config.movement.aiPeekQuality, 30, 100, "%d%%");
+            sliderInt("Проверок подряд", &config.movement.aiPeekSafety, 1, 16);
+        }
+        keybind("Фейкдак", config.movement.fakeDuckKey);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Нож и зевс", { width, 0.0f })) {
+        toggle("Кнайфбот", &rage.knifeBot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("С ножом в руке сам бьёт врага в радиусе удара (с учётом бектрека):\n"
+                              "ПКМ (до 32 ед.) — 65 урона, в спину 180; ЛКМ (до 48 ед.) — 25, в спину 90.\n"
+                              "Броня режет урон на 15%%. Сначала смертельный ПКМ, потом смертельный ЛКМ.");
+        if (rage.knifeBot) {
+            static constexpr const char* knifeModes[]{ "Только наповал", "Любой удар" };
+            combo("Когда бить", &rage.knifeBotMode, knifeModes, IM_ARRAYSIZE(knifeModes));
+        }
+        toggle("Зевсбот", &rage.zeusBot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("С зевсом в руке стреляет только наверняка: грудь/живот/таз,\nурон должен убивать, автостоп по точности.");
+        if (rage.zeusBot) {
+            sliderInt("Хитшанс зевса", &rage.zeusHitchance, 30, 100, "%d%%");
+            sliderInt("Запас урона", &rage.zeusMargin, 0, 20, "+%d хп");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Стреляет, только если урон больше хп цели на столько.\n"
+                                  "Урон зевса резко падает с дистанцией: впритык на краю — враг выживает.");
+        }
+    }
+    endGroup();
+    ImGui::EndGroup();
+}
+
+int& rageWeapon() noexcept
+{
+    return selectedWeapon;
 }
 
 static void sectionTitle(const char* title) noexcept
 {
     ImGui::Dummy({ 0.0f, 6.0f });
-    ImGui::PushFont(fonts.bold);
+    ImGui::PushFont(fonts.uiBold ? fonts.uiBold : fonts.bold);
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
 }
@@ -919,7 +1802,8 @@ static void tooltip(const char* text) noexcept
 // высота группы под n строк: отступы child'а + строки + хвост endGroup
 [[nodiscard]] static float rowsHeight(int n) noexcept
 {
-    return 32.0f + static_cast<float>(n) * rowHeight;
+    // подпись 22 + отступы карточки 14 + строки по 30
+    return 38.0f + static_cast<float>(n) * 30.0f;
 }
 
 // Строка списка (состояния билдера, пресеты): полоска акцента у выбранной, заметка справа серым
@@ -1137,7 +2021,7 @@ static void drawAaAngles(float width, float height) noexcept
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
 
-    const float left = std::max(height - rowsHeight(7) - rowsHeight(5) - 20.0f, rowsHeight(6));
+    const float left = std::max(height - rowsHeight(7) - rowsHeight(5) - 20.0f, rowsHeight(2));
     if (beginGroup("Укрытия", { width, left })) {
         toggle("Фристенд", &aa.freestanding);
         tooltip("Голову — за ближайшее укрытие от врага.");
@@ -1188,7 +2072,7 @@ static void drawAaBuilder(float width, float height) noexcept
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
 
-    const float left = std::max(height - rowsHeight(count + 3) - 10.0f, rowsHeight(8));
+    const float left = std::max(height - rowsHeight(count + 3) - 10.0f, rowsHeight(2));
     if (beginGroup("Флики", { width, left })) {
         toggle("Флики", &aa.flicks);
         tooltip("Рывок yaw вбок на тиках, которые враг не может разрезольвить.");
@@ -1312,7 +2196,7 @@ static void drawAaDesync(float width, float height) noexcept
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
 
-    const float left = std::max(height - rowsHeight(4) - 10.0f, rowsHeight(6));
+    const float left = std::max(height - rowsHeight(4) - 10.0f, rowsHeight(2));
     if (beginGroup("Фейклаг", { width, left })) {
         combo("Режим", &aa.fakeLagMode, fakeLagModeNames.data(), static_cast<int>(fakeLagModeNames.size()));
         tooltip("Статика — ровно столько тиков, сколько на ползунке.\n"
@@ -1351,7 +2235,7 @@ static void drawAaDesync(float width, float height) noexcept
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
 
-    const float rest = std::max(height - rowsHeight(5) - 10.0f, rowsHeight(5));
+    const float rest = std::max(height - rowsHeight(5) - 10.0f, rowsHeight(2));
     if (beginGroup("Проверка у себя", { width, rest })) {
         auto& view = config.view;
         toggle("Показывать AA в 3-м лице", &view.showFakeAngles);
@@ -1360,6 +2244,9 @@ static void drawAaDesync(float width, float height) noexcept
                 "уведены десинком, голова — по отправленному взгляду, наклон — roll.");
         if (view.serverModel)
             colorEdit("Цвет призрака", view.serverModelColor);
+        colorToggle("Позиция на сервере", &view.serverBox, view.serverBoxColor);
+        tooltip("Пока пакеты в чоке (лаг-пик, фейклаг) — коробка там, где модель стоит\n"
+                "на сервере, и сколько тиков в чоке. Видно и от 1-го лица.");
         ImGui::Dummy({ 0.0f, 6.0f });
         hint("Углы по состояниям — на странице «Билдер». Скрытые углы рывков — на «Дефенсиве».");
     }
@@ -1388,6 +2275,9 @@ static void drawAaDefensive(float width, float height) noexcept
                 "«Пока видят» — держать окна всё время, пока нас видно.\n"
                 "«Враг рядом» — даже когда не видит (живее, но заряд тратится впустую).\n"
                 "«После выстрела» — разрешить рывок сразу после своего выстрела.");
+        toggle("В воздухе", &df.inAir);
+        tooltip("В прыжке окна всегда: лагкомп по нам в воздухе не пишется.\n"
+                "С DT заряд под это уступает (вторая пуля в прыжке всё равно не попадает).");
         if (df.triggers & DefKey)
             keybind("Клавиша", df.key);
         if (df.triggers & DefPeek)
@@ -1426,7 +2316,7 @@ static void drawAaDefensive(float width, float height) noexcept
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
 
-    const float left = std::max(height - rowsHeight(9) - 10.0f, rowsHeight(5));
+    const float left = std::max(height - rowsHeight(9) - 10.0f, rowsHeight(2));
     if (beginGroup("Замер по серверу", { width, left })) {
         if (!df.enabled) {
             hint("Выключен: рывков нет, заряд не копится, тики не пропускаются.");
@@ -1624,33 +2514,27 @@ static void drawAaAntiBrute(float width, float height) noexcept
     endGroup();
 }
 
+static int aaPage = 0;
+
+int& antiAimPage() noexcept
+{
+    return aaPage;
+}
+
+bool antiAimStatus(char* text, std::size_t size) noexcept
+{
+    if (!localPlayer || !localPlayer.get().isAlive() || !config.antiAim.enabled)
+        return false;
+    const int side = antiaim::desyncSide();
+    std::snprintf(text, size, "%s · десинк %s%s", antiaim::stateName(),
+        side > 0 ? "вправо" : side < 0 ? "влево" : "нет",
+        antiaim::defensiveActive() ? " · дефенсив" : "");
+    return true;
+}
+
 void drawAntiAimTab() noexcept
 {
-    static int page = 0;
-    static constexpr const char* pages[]{ "Углы", "Билдер", "Десинк", "Дефенсив", "Анти-брут" };
-    for (int i = 0; i < IM_ARRAYSIZE(pages); ++i) {
-        if (i)
-            ImGui::SameLine(0.0f, 6.0f);
-        if (pill(pages[i], page == i))
-            page = i;
-    }
-    // справа от пилюль — короткая сводка: что сейчас реально уходит на сервер
-    if (localPlayer && localPlayer.get().isAlive() && config.antiAim.enabled) {
-        char text[96];
-        const int side = antiaim::desyncSide();
-        std::snprintf(text, sizeof(text), "%s · десинк %s%s", antiaim::stateName(),
-            side > 0 ? "вправо" : side < 0 ? "влево" : "нет",
-            antiaim::defensiveActive() ? " · дефенсив" : "");
-        const auto textSize = ImGui::CalcTextSize(text);
-        ImGui::SameLine(0.0f, 0.0f);
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(ImGui::GetContentRegionAvail().x - textSize.x - 2.0f, 8.0f));
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (24.0f - textSize.y) * 0.5f);   // 24 — высота пилюли
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-        ImGui::TextUnformatted(text);
-        ImGui::PopStyleColor();
-    }
-    ImGui::Dummy({ 0.0f, 4.0f });
-
+    const int page = aaPage;
     const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
     const float height = ImGui::GetContentRegionAvail().y;
     switch (page) {
@@ -1662,27 +2546,84 @@ void drawAntiAimTab() noexcept
     }
 }
 
+// Подсказка мелким серым под строками карточки
+static void cardNote(const char* text) noexcept
+{
+    ImGui::Dummy({ 0.0f, 2.0f });
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+}
+
+// «Мир → Прицел и HUD»: прицел снайпера, гранаты, HUD чита, ESP вне видимости
 void drawWorldGroup() noexcept
 {
     auto& view = config.view;
-    toggle("Без зума в прицеле", &view.removeScopeZoom);
-    if (view.removeScopeZoom) {
-        toggle("Второй зум приближает", &view.secondZoom);
-        if (view.secondZoom)
-            sliderFloat("Увеличение второго зума", &view.secondZoomFactor, 1.2f, 6.0f, "x%.1f");
-    }
-    toggle("Траектория гранаты", &view.grenadePrediction);
-    sliderFloat("ESP дормантов", &view.dormantTime, 1.5f, 20.0f, "%.1f сек");
-    toggle("Логи выстрелов на экране", &view.screenLogs);
-    toggle("Ватермарка", &view.watermark);
-    toggle("Ровный ESP", &view.syncRender);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Однопоточный рендер (mat_queue_mode 0): ESP рисуется по тому же кадру,\nчто на экране, и не дёргается. Может немного снизить FPS.");
+    const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
+    constexpr float gap = 10.0f;
 
-    ImGui::Dummy({ 0.0f, 6.0f });
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-    ImGui::TextWrapped("Дальность ESP ограничена тем, что присылает сервер. Игроки вне видимости показываются по последней позиции и по звукам шагов/выстрелов.");
-    ImGui::PopStyleColor();
+    ImGui::BeginGroup();
+    if (beginGroup("Прицел", { width, 0.0f })) {
+        toggle("Без зума в прицеле", &view.removeScopeZoom);
+        if (view.removeScopeZoom) {
+            toggle("Второй зум приближает", &view.secondZoom);
+            if (view.secondZoom)
+                sliderFloat("Увеличение второго зума", &view.secondZoomFactor, 1.2f, 6.0f, "x%.1f");
+        }
+        toggle("Свой прицел снайпера", &view.customScope);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Градиентные линии вместо чёрного прицела (работает с «Без зума в прицеле»).");
+        if (view.customScope) {
+            sliderInt("Длина линий", &view.scopeSize, 10, 300);
+            sliderInt("Отступ от центра", &view.scopeGap, 0, 100);
+            toggle("T-прицел (без верхней)", &view.scopeT);
+        }
+        toggle("Круг разброса", &view.spreadCircle);
+        toggle("Мин. урон у прицела", &view.damageIndicator);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Гранаты", { width, 0.0f })) {
+        toggle("Траектория гранаты", &view.grenadePrediction);
+        toggle("Таймеры дыма и огня", &view.grenadeTimers);
+    }
+    endGroup();
+    ImGui::EndGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    ImGui::BeginGroup();
+    if (beginGroup("HUD", { width, 0.0f })) {
+        toggle("Ватермарка", &view.watermark);
+        toggle("Панель биндов (Hotkeys)", &view.hotkeys);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Активные бинды с клавишами, как HUD «Hotkeys» в NewerWin.\nПри открытом меню панель видна всегда — тащи за шапку.");
+        toggle("Логи выстрелов на экране", &view.screenLogs);
+        toggle("Индикатор LC", &view.lcIndicator);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Зелёный — сейчас идёт дефенсив (лагкомп сломан), полоска — сколько тиков осталось.");
+        toggle("Предупреждение о замедлении", &view.slowdownWarning);
+        toggle("Метки попаданий", &view.shotMarkers);
+        if (view.shotMarkers) {
+            toggle("Метки промахов", &view.missMarkers);
+            sliderFloat("Время меток", &view.shotMarkerTime, 0.5f, 6.0f, "%.1f сек");
+        }
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("ESP вне видимости", { width, 0.0f })) {
+        sliderFloat("Держать дормантов", &view.dormantTime, 1.5f, 20.0f, "%.1f сек");
+        toggle("Ровный ESP", &view.syncRender);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Однопоточный рендер (mat_queue_mode 0): ESP рисуется по тому же кадру,\nчто на экране, и не дёргается. Может немного снизить FPS.");
+        cardNote("Дальность ESP ограничена тем, что присылает сервер. Игроки вне видимости — по последней позиции и по звукам шагов и выстрелов.");
+    }
+    endGroup();
+    ImGui::EndGroup();
 }
 
 void drawEspFlagsSetting() noexcept
@@ -1710,67 +2651,23 @@ void drawEspRageGroup(const ImVec2& size) noexcept
     endGroup();
 }
 
+// «Мир → Приколюхи»: эффекты, экран и руки, чат
 void drawVisualsTab() noexcept
 {
     auto& view = config.view;
     const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    const float height = ImGui::GetContentRegionAvail().y;
+    constexpr float gap = 10.0f;
 
-    if (beginGroup("Приколюхи", { width, height })) {
+    ImGui::BeginGroup();
+    if (beginGroup("Эффекты", { width, 0.0f })) {
         toggle("Цифры урона", &view.damageNumbers);
         toggle("Кольца шагов врагов", &view.footsteps);
         toggle("Вспышка при убийстве", &view.killFlash);
-        toggle("Таймеры дыма и огня", &view.grenadeTimers);
-        toggle("Круг разброса", &view.spreadCircle);
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-        ImGui::TextWrapped("Флаги ESP, точка прицела, скелет при выстреле и Tab — во вкладке «Визуалы».");
-        ImGui::PopStyleColor();
     }
     endGroup();
+    ImGui::Dummy({ 0.0f, gap });
 
-    ImGui::SameLine(0.0f, 12.0f);
-
-    if (beginGroup("Экран и чат", { width, height })) {
-        toggle("Aspect ratio", &view.aspectRatio);
-        if (view.aspectRatio) {
-            sliderFloat("Соотношение", &view.aspectRatioValue, 0.8f, 2.4f, "%.2f");
-            static constexpr const char* presets[]{ "5:4", "4:3", "3:2", "16:10", "16:9" };
-            static constexpr float values[]{ 1.25f, 1.3333f, 1.5f, 1.6f, 1.7778f };
-            for (int i = 0; i < IM_ARRAYSIZE(presets); ++i) {
-                if (i)
-                    ImGui::SameLine(0.0f, 4.0f);
-                if (ImGui::SmallButton(presets[i]))
-                    view.aspectRatioValue = values[i];
-            }
-        }
-        toggle("Вьюмодель", &view.viewmodel);
-        if (view.viewmodel) {
-            sliderInt("FOV рук", &view.viewmodelFov, 40, 120);
-            sliderFloat("Смещение X", &view.viewmodelX, -10.0f, 10.0f, "%.1f");
-            sliderFloat("Смещение Y", &view.viewmodelY, -10.0f, 10.0f, "%.1f");
-            sliderFloat("Смещение Z", &view.viewmodelZ, -10.0f, 10.0f, "%.1f");
-        }
-        toggle("Свой прицел снайпера", &view.customScope);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Градиентные линии вместо чёрного прицела (работает с «Без зума в прицеле»).");
-        if (view.customScope) {
-            sliderInt("Длина линий", &view.scopeSize, 10, 300);
-            sliderInt("Отступ от центра", &view.scopeGap, 0, 100);
-            toggle("T-прицел (без верхней)", &view.scopeT);
-        }
-        toggle("Мин. урон у прицела", &view.damageIndicator);
-        toggle("Метки попаданий", &view.shotMarkers);
-        if (view.shotMarkers) {
-            toggle("Метки промахов", &view.missMarkers);
-            sliderFloat("Время меток", &view.shotMarkerTime, 0.5f, 6.0f, "%.1f сек");
-        }
-        toggle("Предупреждение о замедлении", &view.slowdownWarning);
-        toggle("Список биндов", &view.keybindList);
-        toggle("Индикатор LC", &view.lcIndicator);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Зелёный — сейчас идёт дефенсив (лагкомп сломан), полоска — сколько тиков осталось.");
-        ImGui::Dummy({ 0.0f, 6.0f });
+    if (beginGroup("Чат", { width, 0.0f })) {
         toggle("Трештолк", &view.trashTalk);
         if (view.trashTalk) {
             static constexpr const char* when[]{ "При килле", "При смерти" };
@@ -1778,6 +2675,43 @@ void drawVisualsTab() noexcept
         }
     }
     endGroup();
+    ImGui::EndGroup();
+
+    ImGui::SameLine(0.0f, 12.0f);
+
+    ImGui::BeginGroup();
+    if (beginGroup("Экран", { width, 0.0f })) {
+        toggle("Aspect ratio", &view.aspectRatio);
+        if (view.aspectRatio) {
+            sliderFloat("Соотношение", &view.aspectRatioValue, 0.8f, 2.4f, "%.2f");
+            static constexpr const char* presets[]{ "5:4", "4:3", "3:2", "16:10", "16:9" };
+            static constexpr float values[]{ 1.25f, 1.3333f, 1.5f, 1.6f, 1.7778f };
+            ImGui::Dummy({ 0.0f, 2.0f });
+            beginSegments();
+            for (int i = 0; i < IM_ARRAYSIZE(presets); ++i) {
+                if (i)
+                    ImGui::SameLine(0.0f, 2.0f);
+                if (pill(presets[i], std::abs(view.aspectRatioValue - values[i]) < 0.005f))
+                    view.aspectRatioValue = values[i];
+            }
+            endSegments();
+            ImGui::Dummy({ 0.0f, 2.0f });
+        }
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Руки (вьюмодель)", { width, 0.0f })) {
+        toggle("Своя вьюмодель", &view.viewmodel);
+        if (view.viewmodel) {
+            sliderInt("FOV рук", &view.viewmodelFov, 40, 120);
+            sliderFloat("Смещение X", &view.viewmodelX, -10.0f, 10.0f, "%.1f");
+            sliderFloat("Смещение Y", &view.viewmodelY, -10.0f, 10.0f, "%.1f");
+            sliderFloat("Смещение Z", &view.viewmodelZ, -10.0f, 10.0f, "%.1f");
+        }
+    }
+    endGroup();
+    ImGui::EndGroup();
 }
 
 bool colorEdit3(const char* label, float* rgb) noexcept
@@ -1841,14 +2775,16 @@ void applyWorldPreset(const WorldPreset& p, bool* skyboxEnabled, int* skybox, co
 
 }
 
+// «Мир → Мир»: цвета карты, небо, туман, подсветка, искры
 void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skyboxNames, int skyboxCount) noexcept
 {
     auto& w = config.world;
     auto& view = config.view;
     const float width = (ImGui::GetContentRegionAvail().x - 12.0f) * 0.5f;
-    const float height = ImGui::GetContentRegionAvail().y;
+    constexpr float gap = 10.0f;
 
-    if (beginGroup("Вид мира", { width, height })) {
+    ImGui::BeginGroup();
+    if (beginGroup("Вид мира", { width, 0.0f })) {
         toggle("Включить", &w.enabled);
         const char* presetNames[IM_ARRAYSIZE(worldPresets) + 1]{ "Свой" };
         for (int i = 0; i < IM_ARRAYSIZE(worldPresets); ++i)
@@ -1858,21 +2794,25 @@ void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skybo
         if (colorEdit3("Стены", w.wallColor)) w.preset = 0;
         if (colorEdit3("Пропы", w.propColor)) w.preset = 0;
         sliderFloat("Прозрачность пропов", &w.propAlpha, 0.1f, 1.0f, "%.2f");
+        cardNote("Пресет ставит всё сразу: цвета, туман, подсветку и небо. Новые текстуры карты докрашиваются раз в секунду.");
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Небо", { width, 0.0f })) {
         toggle("Цвет неба", &w.skyColorOn);
         if (w.skyColorOn && colorEdit3("Небо", w.skyColor)) w.preset = 0;
         toggle("Скайбокс", skyboxEnabled);
         if (*skyboxEnabled)
             combo("Небо (скайбокс)", skybox, skyboxNames, skyboxCount);
-        ImGui::Dummy({ 0.0f, 6.0f });
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(color::textDim));
-        ImGui::TextWrapped("Пресет ставит всё сразу: цвета, туман, подсветку и небо. Дальше можно подкрутить руками. Новые текстуры карты докрашиваются раз в секунду.");
-        ImGui::PopStyleColor();
     }
     endGroup();
+    ImGui::EndGroup();
 
     ImGui::SameLine(0.0f, 12.0f);
 
-    if (beginGroup("Туман, свет, искры", { width, height })) {
+    ImGui::BeginGroup();
+    if (beginGroup("Туман", { width, 0.0f })) {
         toggle("Свой туман", &w.fog);
         if (w.fog) {
             colorEdit3("Цвет тумана", w.fogColor);
@@ -1880,11 +2820,20 @@ void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skybo
             sliderFloat("Конец", &w.fogEnd, 200.0f, 10000.0f, "%.0f ед.");
             sliderFloat("Плотность", &w.fogDensity, 0.0f, 1.0f, "%.2f");
         }
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Подсветка", { width, 0.0f })) {
         toggle("Подсветка", &w.ambient);
         if (w.ambient)
             colorEdit3("Цвет подсветки", w.ambientColor);
-        ImGui::Dummy({ 0.0f, 6.0f });
-        toggle("Искры от пуль", &view.impactSparks);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Искры от пуль", { width, 0.0f })) {
+        toggle("Искры", &view.impactSparks);
         if (view.impactSparks) {
             colorEdit("Цвет искр", view.sparkColor);
             sliderInt("Количество", &view.sparkCount, 4, 60);
@@ -1892,6 +2841,7 @@ void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skybo
         }
     }
     endGroup();
+    ImGui::EndGroup();
 }
 
 void drawAutoBuyTab() noexcept
@@ -1961,6 +2911,255 @@ void drawMovementTab() noexcept
         ImGui::PopStyleColor();
     }
     endGroup();
+}
+
+}
+
+// ======================= размытие фона (OpenGL) =======================
+// Кадр игры копируется из заднего буфера, уменьшается вчетверо (два шага ×2 с линейной
+// фильтрацией) и проходит два раза раздельным гауссом 9 отсчётов (по горизонтали и вертикали).
+// Всё, что трогаем в состоянии GL, сохраняется и возвращается: дальше рисует ImGui и сама игра.
+namespace hvh::blur
+{
+
+namespace
+{
+
+bool requested = false;
+bool failed = false;
+int width = 0, height = 0;          // размер экрана, под который созданы буферы
+GLuint program = 0, vao = 0;
+GLint uniformTex = -1, uniformDir = -1;
+// 0 — полный размер (снимок), 1 — половина, 2/3 — четверть (пинг-понг размытия)
+GLuint fbo[4]{}, tex[4]{};
+int texW[4]{}, texH[4]{};
+
+GLuint compile(GLenum type, const char* source) noexcept
+{
+    const GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool createProgram() noexcept
+{
+    // полноэкранный треугольник без буферов вершин — координаты из номера вершины
+    static constexpr const char* vertex =
+        "#version 130\n"
+        "out vec2 uv;\n"
+        "void main() {\n"
+        "    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+        "    uv = p;\n"
+        "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    // гаусс 9 отсчётов через 5 выборок с линейной фильтрацией между текселями
+    static constexpr const char* fragment =
+        "#version 130\n"
+        "in vec2 uv;\n"
+        "out vec4 outColor;\n"
+        "uniform sampler2D source;\n"
+        "uniform vec2 direction;\n"
+        "void main() {\n"
+        "    vec3 c = texture(source, uv).rgb * 0.2270270270;\n"
+        "    c += texture(source, uv + direction * 1.3846153846).rgb * 0.3162162162;\n"
+        "    c += texture(source, uv - direction * 1.3846153846).rgb * 0.3162162162;\n"
+        "    c += texture(source, uv + direction * 3.2307692308).rgb * 0.0702702703;\n"
+        "    c += texture(source, uv - direction * 3.2307692308).rgb * 0.0702702703;\n"
+        "    outColor = vec4(c, 1.0);\n"
+        "}\n";
+    const GLuint vs = compile(GL_VERTEX_SHADER, vertex);
+    const GLuint fs = compile(GL_FRAGMENT_SHADER, fragment);
+    if (!vs || !fs)
+        return false;
+    program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "unused");
+    glLinkProgram(program);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        glDeleteProgram(program);
+        program = 0;
+        return false;
+    }
+    uniformTex = glGetUniformLocation(program, "source");
+    uniformDir = glGetUniformLocation(program, "direction");
+    glGenVertexArrays(1, &vao);
+    return true;
+}
+
+void destroyTargets() noexcept
+{
+    glDeleteFramebuffers(4, fbo);
+    glDeleteTextures(4, tex);
+    for (int i = 0; i < 4; ++i)
+        fbo[i] = tex[i] = 0;
+    width = height = 0;
+}
+
+bool createTargets(int w, int h) noexcept
+{
+    destroyTargets();
+    const int sizes[4][2]{ { w, h }, { std::max(w / 2, 1), std::max(h / 2, 1) },
+                           { std::max(w / 4, 1), std::max(h / 4, 1) }, { std::max(w / 4, 1), std::max(h / 4, 1) } };
+    glGenTextures(4, tex);
+    glGenFramebuffers(4, fbo);
+    for (int i = 0; i < 4; ++i) {
+        texW[i] = sizes[i][0];
+        texH[i] = sizes[i][1];
+        glBindTexture(GL_TEXTURE_2D, tex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texW[i], texH[i], 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[i], 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            return false;
+    }
+    width = w;
+    height = h;
+    return true;
+}
+
+void blurPass(int from, int to, float dx, float dy) noexcept
+{
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[to]);
+    glViewport(0, 0, texW[to], texH[to]);
+    glBindTexture(GL_TEXTURE_2D, tex[from]);
+    glUniform2f(uniformDir, dx / static_cast<float>(texW[from]), dy / static_cast<float>(texH[from]));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+}
+
+void request() noexcept
+{
+    requested = true;
+}
+
+void process() noexcept
+{
+    if (!requested || failed)
+        return;
+    requested = false;
+
+    const auto& display = ImGui::GetIO().DisplaySize;
+    const auto& scale = ImGui::GetIO().DisplayFramebufferScale;
+    const int w = static_cast<int>(display.x * scale.x), h = static_cast<int>(display.y * scale.y);
+    if (w <= 0 || h <= 0)
+        return;
+
+    // ---- сохраняем состояние GL ----
+    GLint lastProgram, lastTexture, lastActive, lastVao, lastReadFb, lastDrawFb, lastViewport[4], lastArray, lastReadBuffer;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &lastProgram);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &lastActive);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &lastTexture);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &lastVao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &lastArray);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &lastReadFb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &lastDrawFb);
+    glGetIntegerv(GL_VIEWPORT, lastViewport);
+    const GLboolean lastBlend = glIsEnabled(GL_BLEND), lastScissor = glIsEnabled(GL_SCISSOR_TEST),
+        lastDepth = glIsEnabled(GL_DEPTH_TEST), lastCull = glIsEnabled(GL_CULL_FACE), lastSrgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+    GLint lastSampler = 0;
+    glGetIntegerv(GL_SAMPLER_BINDING, &lastSampler);
+
+    bool ok = (program || createProgram()) && (width == w && height == h ? true : createTargets(w, h));
+    if (ok) {
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_FRAMEBUFFER_SRGB);
+        glBindSampler(0, 0);
+
+        // старые ошибки игры не наши — сбрасываем, чтобы проверить только свой снимок
+        for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+
+        // снимок кадра из того буфера, куда сейчас рисуется (туда же ляжет и меню),
+        // и два шага уменьшения
+        const GLuint source = static_cast<GLuint>(lastDrawFb);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+        glGetIntegerv(GL_READ_BUFFER, &lastReadBuffer);
+        glReadBuffer(source == 0 ? GL_BACK : GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[0]);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glReadBuffer(lastReadBuffer);
+        if (glGetError() != GL_NO_ERROR)
+            ok = false;
+        for (int i = 0; i < 2; ++i) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[i]);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[i + 1]);
+            glBlitFramebuffer(0, 0, texW[i], texH[i], 0, 0, texW[i + 1], texH[i + 1], GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        }
+
+        // размытие: 2 → 3 (гориз.), 3 → 2 (верт.), дважды с растущим шагом
+        glUseProgram(program);
+        glUniform1i(uniformTex, 0);
+        glBindVertexArray(vao);
+        for (const float step : { 1.0f, 2.0f }) {
+            blurPass(2, 3, step, 0.0f);
+            blurPass(3, 2, 0.0f, step);
+        }
+        if (glGetError() != GL_NO_ERROR)
+            ok = false;
+    }
+    if (!ok) {
+        failed = true;  // шейдер не собрался или FBO не создался — меню просто без размытия
+    }
+
+    // ---- возвращаем состояние ----
+    glUseProgram(lastProgram);
+    glBindTexture(GL_TEXTURE_2D, lastTexture);
+    glActiveTexture(lastActive);
+    glBindVertexArray(lastVao);
+    glBindBuffer(GL_ARRAY_BUFFER, lastArray);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, lastReadFb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, lastDrawFb);
+    glViewport(lastViewport[0], lastViewport[1], lastViewport[2], lastViewport[3]);
+    glBindSampler(0, lastSampler);
+    if (lastBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (lastScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (lastDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (lastCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    if (lastSrgb) glEnable(GL_FRAMEBUFFER_SRGB); else glDisable(GL_FRAMEBUFFER_SRGB);
+}
+
+ImTextureID texture() noexcept
+{
+    return failed || !tex[2] ? nullptr : reinterpret_cast<ImTextureID>(static_cast<std::uintptr_t>(tex[2]));
+}
+
+void uv(const ImVec2& min, const ImVec2& max, ImVec2& uv0, ImVec2& uv1) noexcept
+{
+    // текстура снята из GL — строки снизу вверх
+    const auto& display = ImGui::GetIO().DisplaySize;
+    uv0 = { min.x / display.x, 1.0f - min.y / display.y };
+    uv1 = { max.x / display.x, 1.0f - max.y / display.y };
+}
+
+void shutdown() noexcept
+{
+    if (width)
+        destroyTargets();
+    if (program)
+        glDeleteProgram(program);
+    if (vao)
+        glDeleteVertexArrays(1, &vao);
+    program = vao = 0;
 }
 
 }

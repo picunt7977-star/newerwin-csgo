@@ -75,6 +75,13 @@ void setDefensiveCharge(int target, int spread) noexcept;
 // отстаёт от нашей на длину чока. Пачка и есть окно: сервер обработает её за один свой тик
 void setDefensiveChoke(int ticks) noexcept;
 [[nodiscard]] int defensiveChokeTicks() noexcept;
+// Лаг-пик: держать в чоке до `ticks` команд (0 — выключить). Выстрел отпускает пачку сам (onShot).
+// Главнее фейклага и чока дефенсива, предел — только sv_maxusrcmdprocessticks
+void setLagPeekChoke(int ticks) noexcept;
+// Сколько реально держим сейчас (0 — лаг-пик не действует: DT быстрая стрельба, фейкдак, выключен)
+[[nodiscard]] int lagPeekChokeTicks() noexcept;
+// Последняя пачка из takeShiftPack() была чоковой (тикбейс не двигала — отката от неё не бывает)
+[[nodiscard]] bool lastPackWasChoke() noexcept;
 // sv_maxusrcmdprocessticks, если сервер его реплицирует: больше этого в пачке держать нельзя —
 // хвост сервер выкинет (0 — неизвестно, тогда предел 14)
 void setProcessLimit(int ticks) noexcept;
@@ -91,6 +98,12 @@ void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizo
 [[nodiscard]] bool defensiveDoubleTap() noexcept;
 // Рейдж каждый тик: в руках оружие с перезарядкой > 0.4 с (скаут, AWP) — у него DT всегда дефенсивный
 void setSlowWeapon(bool slow) noexcept;
+// В руках нож (из CreateMove каждый тик)
+void setKnife(bool knife) noexcept;
+// Сервер наш (loopback): sv_maxusrcmdprocessticks из cvar верный; иначе — лимит из настроек
+void setServerLocal(bool local) noexcept;
+// Нож + прыжок + DT и включена «Нож в прыжке — без лагов»: чока, лаг-пика и рывков нет
+[[nodiscard]] bool knifeAirQuiet() noexcept;
 // Нас сейчас видит враг (из movement::exploits): дефенсив DT в это время не дозаряжается
 void setThreat(bool visible) noexcept;
 

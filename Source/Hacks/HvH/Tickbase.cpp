@@ -59,7 +59,12 @@ int defensiveTarget = 0;        // цель заряда под дефенсив
 // команду не создаёт вовсе: на этом тике персонаж никуда не идёт (при «1 из 3» это треть скорости),
 // а потом пачка прогоняется за один тик, предсказание улетает вперёд и коррекция тянет назад.
 int defensiveChoke = 0;
-int processLimit = 0;           // sv_maxusrcmdprocessticks, если сервер его реплицирует (0 — неизвестно)
+int lagPeekChoke = 0;           // лаг-пик: держать в чоке до стольких команд (0 — выключен)
+bool lastPackChoke = false;     // последняя пачка в shiftPackDone — чоковая, а не сдвиг тикбейса
+int processLimit = 0;           // сколько команд сервер обработает за тик (0 — неизвестно)
+int cvarProcessLimit = 0;       // sv_maxusrcmdprocessticks у клиента (на удалённом сервере — не его значение)
+bool serverLocal = false;
+bool knifeHeld = false;
 int defensiveSpread = 3;        // пропускать 1 тик из N при зарядке под дефенсив
 int groundTicks = 0;            // сколько тиков подряд стоим на земле без прыжка
 bool rising = false;            // летим вверх — до приземления далеко, пропуск тика не съест прыжок
@@ -144,9 +149,11 @@ void setSendPacket(bool value) noexcept
 // sv_clockcorrection_msecs (~60 мс ≈ 4 тика), и чем меньше заряд, тем чаще приходит окно.
 [[nodiscard]] int shiftSize() noexcept
 {
+    // сдвиг уходит одним пакетом — не больше, чем сервер обработает за тик
+    const int ceiling = processLimit > 0 ? std::clamp(processLimit - 1, 1, 14) : 14;
     if (fastFire())
-        return std::clamp(config.exploits.shiftTicks, 1, 14);
-    return defensiveTarget > 0 ? std::clamp(defensiveTarget, 4, 14) : std::clamp(config.exploits.shiftTicks, 1, 14);
+        return std::clamp(config.exploits.shiftTicks, 1, ceiling);
+    return defensiveTarget > 0 ? std::clamp(defensiveTarget, std::min(4, ceiling), ceiling) : std::clamp(config.exploits.shiftTicks, 1, ceiling);
 }
 
 // Зарядка — это пропуск вызова CL_Move: команда не создаётся, а вместе с ней не опрашивается мышь
@@ -205,6 +212,18 @@ int chargeTick = 0;
 {
     if (charged >= chargeTarget || shotPending || shiftRequested)
         return false;
+    // Лаг-пик копит чок: пропуск тика тут — это лишний тик, на который пачка с выстрелом опоздает
+    if (lagPeekChoke > 0)
+        return false;
+    // Чок дефенсива в воздухе: бюджет сервера занят пачками, заряд копить некуда
+    if (defensiveChoke > 0 && airborne)
+        return false;
+    // Ждёт отправки пакет с выстрелом (хайдшоты кладут выстрел в чок, фейклаг тоже может) или рейдж
+    // попросил отправить следующий тик. Пропуск тика под заряд тут — это не «один тик»: стоя пропуски
+    // идут подряд до полного заряда, и выстрел висел в чоке до ~14 тиков (200 мс) — враг успевал
+    // убить первым («нас убили раньше, чем сервер принял выстрел»). Сначала отправка, заряд потом.
+    if (sendNext)
+        return false;
     // Заряжаемся на земле (не сразу после приземления) и на взлёте. На спуске и на тике приземления —
     // нет: пропущенный тик там съедает прыжок распрыжки. На взлёте теряется лишь чуть стрейфа, зато
     // дефенсив работает и при распрыжке.
@@ -256,10 +275,27 @@ int chargeTick = 0;
     return std::clamp(static_cast<int>(distance / perTick), 1, 14);
 }
 
+[[nodiscard]] bool knifeQuiet() noexcept
+{
+    return config.exploits.knifeAirNoLag && knifeHeld && airborne && wantDoubleTap();
+}
+
 [[nodiscard]] int chokeLimit() noexcept
 {
     if (fakeDuck)
-        return fakeDuckChokeLimit;
+        return processLimit > 0 ? std::min(fakeDuckChokeLimit, std::max(processLimit - 1, 1)) : fakeDuckChokeLimit;
+    // Нож в прыжке с DT: без лагов — только чок под десинк
+    if (knifeQuiet())
+        return config.antiAim.enabled && config.antiAim.desync ? 1 : 0;
+    // Лаг-пик главнее и фейклага, и дефенсива: пока выходим из-за угла, сервер должен получить
+    // нас как можно позже. Без ограничений дефенсива «по шагу» и «4 тика, пока есть цель» —
+    // как раз они и делали из пика пачки по 4 тика (60 мс), которых враг не замечает.
+    // Предел — только сколько сервер обработает за раз (иначе хвост выкинет и потянет назад).
+    // С DT тоже: заряд под это место уступает (clMoveHook урезает его по бюджету сервера)
+    if (lagPeekChoke > 0) {
+        const int ceiling = processLimit > 0 ? std::clamp(processLimit - 1, 1, 14) : 14;
+        return std::clamp(lagPeekChoke, 1, ceiling);
+    }
     // Дефенсив в режиме «чоком»: его длина пачки главнее фейклага билдера — пачка и есть окно.
     // Выше того, что сервер обрабатывает за раз, не лезем: хвост он выкинет, и окна не будет.
     if (defensiveChoke > 0 && !fastFire()) {
@@ -327,6 +363,9 @@ int chargeTick = 0;
     // при DT серверу нужен запас под сдвиг — фейклаг только минимальный
     if (wantCharge())
         limit = std::min(limit, 1);
+    // больше, чем сервер обработает за тик, — хвост выкинет
+    if (processLimit > 0)
+        limit = std::min(limit, std::max(processLimit - 1, floor));
     return limit;
 }
 
@@ -400,16 +439,39 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         defensiveRecharge = false;
     sendNext = false;
     callOriginal(extraSamples, finalTick);
+
+    // Лаг-пик с включённым DT. Заряд и чок берут из ОДНОГО бюджета сервера: он обрабатывает за
+    // тик не больше sv_maxusrcmdprocessticks (16) команд, пропущенные и чокнутые тики одинаково
+    // копят этот запас до потолка. Полный заряд 14 + чок 14 = 28 — сервер выкидывал хвост: сдвиг
+    // после пачки лаг-пика (телепорт автопика, вторая пуля, рывок) терялся и тянуло назад, а
+    // рывок дефенсива досрочно сливал саму пачку — «сервер держит нас на 1 тик позади».
+    // Пока лаг-пик держит пачку, заряд — только то, что останется после неё.
+    // То же для чока дефенсива в воздухе (там он идёт постоянно, а DT свой заряд не отдаёт)
+    if (lagPeekChoke > 0 || (defensiveChoke > 0 && airborne)) {
+        const int budget = processLimit > 0 ? processLimit : 16;
+        const int pack = sendThis ? packSize : choked + 1;   // ушла или минимум уйдёт
+        charged = std::min(charged, std::max(budget - pack, 0));
+    }
     // Пачка чока ушла — это и есть «рывок» дефенсива в режиме «чоком»: сервер обработает все её
     // команды за один свой тик и запишет лагкомп только по последней
     // Пачка от двух команд уже даёт окно: сервер пишет лагкомп только по последней. Порог в 3
     // отрезал короткие пачки, а при sv_maxusrcmdprocessticks 2-3 (дефолт CS:GO — 2) длиннее и не
     // бывает: chokeLimit() держится под лимитом, иначе сервер выкинет хвост. Окна не было вовсе.
-    if (sendThis && defensiveChoke > 0 && !fastFire() && packSize >= 2)
+    if (sendThis && defensiveChoke > 0 && lagPeekChoke == 0 && !fastFire() && packSize >= 2) {
         shiftPackDone = packSize;
+        lastPackChoke = true;
+    }
 
+    // Сдвиг по запросу (телепорт автопика, рывок) при полном чоке ждёт тик: пачка ушла бы как
+    // «чок + сдвиг», 14 + 14 команд, а сервер обрабатывает за раз не больше sv_maxusrcmdprocessticks
+    // и хвост выкидывает — телепорт автопика после выстрела с лаг-пика тянуло назад. Следующим тиком
+    // пачка с выстрелом уходит (sendNext), чок обнуляется, и сдвиг идёт отдельной пачкой.
+    const bool shiftWaitsForPack = shiftRequested && !(shotPending && fastFire())
+        && choked > 0 && choked + std::min(requestedTicks > 0 ? requestedTicks : charged, charged) > 14;
+    if (shiftWaitsForPack)
+        sendNext = true;
     // DT сдвигает сразу на выстреле — второй выстрел не ждёт (с автопиком возврат идёт в этих же командах)
-    if (((shotPending && fastFire()) || shiftRequested) && charged > 0) {
+    if (((shotPending && fastFire()) || shiftRequested) && charged > 0 && !shiftWaitsForPack) {
         // сдвиг: прогоняем заряженные тики подряд, уходят одним пакетом с последним. Всегда весь заряд:
         // на 2 тиках сервер не откатывал тикбейс — окна дефенсива не было (проверено в игре 01.11).
         const bool small = false;
@@ -432,6 +494,7 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         // сколько заряда будет на момент сдвига. Чей сдвиг — не важно: откат от второй пули DT и от
         // телепорта автопика такой же настоящий, как от нашего рывка, и окна в нём такие же.
         shiftPackDone = shiftedCount;
+        lastPackChoke = false;
         if (shiftRequested && !lcShift) {
             char text[96];
             std::snprintf(text, sizeof(text), "[тикбейс] сдвиг по запросу: %d тиков%s", shiftedCount, shotPending ? " (с выстрелом)" : "");
@@ -679,6 +742,21 @@ void setDefensiveChoke(int ticks) noexcept
     defensiveChoke = std::clamp(ticks, 0, 14);
 }
 
+void setLagPeekChoke(int ticks) noexcept
+{
+    lagPeekChoke = std::clamp(ticks, 0, 14);
+}
+
+int lagPeekChokeTicks() noexcept
+{
+    return lagPeekChoke > 0 && !fakeDuck ? chokeLimit() : 0;
+}
+
+bool lastPackWasChoke() noexcept
+{
+    return lastPackChoke;
+}
+
 int defensiveChokeTicks() noexcept
 {
     return defensiveChoke;
@@ -686,7 +764,14 @@ int defensiveChokeTicks() noexcept
 
 void setProcessLimit(int ticks) noexcept
 {
-    processLimit = ticks > 0 ? std::clamp(ticks, 2, 32) : 0;
+    cvarProcessLimit = ticks > 0 ? std::clamp(ticks, 2, 32) : 0;
+    // cvar у клиента верен только на своём сервере. На удалённом клиент видит своё 16, а сервер
+    // режет раньше — берём меньшее из него и настройки «Команд за тик»
+    const int configured = config.exploits.serverPackLimit > 0 ? std::clamp(config.exploits.serverPackLimit, 2, 16) : 0;
+    if (serverLocal || configured == 0)
+        processLimit = cvarProcessLimit;
+    else
+        processLimit = cvarProcessLimit > 0 ? std::min(cvarProcessLimit, configured) : configured;
 }
 
 int processLimitTicks() noexcept
@@ -730,6 +815,21 @@ bool defensiveDoubleTap() noexcept
 void setSlowWeapon(bool value) noexcept
 {
     slowWeapon = value;
+}
+
+void setKnife(bool knife) noexcept
+{
+    knifeHeld = knife;
+}
+
+void setServerLocal(bool local) noexcept
+{
+    serverLocal = local;
+}
+
+bool knifeAirQuiet() noexcept
+{
+    return active && knifeQuiet();
 }
 
 void setThreat(bool value) noexcept

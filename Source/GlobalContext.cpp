@@ -2,6 +2,7 @@
 #include "Hacks/HvH/Movement.h"
 #include "Hacks/HvH/Ragebot.h"
 #include "Hacks/HvH/HvhGui.h"
+#include "Hacks/HvH/Blur.h"
 #include "Hacks/HvH/HvhVisuals.h"
 #include "Hacks/HvH/Extras.h"
 #include "Hacks/HvH/Scoreboard.h"
@@ -108,6 +109,8 @@ void GlobalContext::swapWindowHook(SDL_Window* window)
 
     renderFrame();
 
+    // кадр игры уже в буфере, ImGui ещё не рисовал — размываем фон под меню
+    hvh::blur::process();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     GameData::clearUnusedAvatars();
@@ -134,6 +137,7 @@ void GlobalContext::renderFrame()
         features->visuals.drawMolotovHull(ImGui::GetBackgroundDrawList());
         hvh::gui::drawIndicators(ImGui::GetBackgroundDrawList());
         hvh::gui::drawWatermark(ImGui::GetBackgroundDrawList());
+        hvh::gui::drawHotkeys(ImGui::GetBackgroundDrawList(), gui->isOpen());
         hvh::extras::draw(ImGui::GetBackgroundDrawList());
         hvh::scoreboard::draw(ImGui::GetBackgroundDrawList());
         hvh::movement::draw(ImGui::GetBackgroundDrawList());

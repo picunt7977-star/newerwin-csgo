@@ -71,6 +71,7 @@ public:
     void menuBarItem() noexcept;
     void tabItem() noexcept;
     void drawGUI(bool contentOnly) noexcept;
+    void drawMenuPage() noexcept;   // страница нового меню (карточки)
 
     // Config
     json toJson() noexcept;
