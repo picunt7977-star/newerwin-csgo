@@ -2,6 +2,8 @@
 #include <array>
 #include <bit>
 #include <cfloat>
+#include <cctype>
+#include <vector>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -17,9 +19,11 @@
 #include <imgui/imgui.h>
 
 #include "HitModel.h"
+#include "BacktrackWindow.h"
 #include "Autowall.h"
 #include "Binds.h"
 #include "HvhConfig.h"
+#include "Hud.h"
 #include "Extras.h"
 #include "Ragebot.h"
 #include "AntiAim.h"
@@ -97,6 +101,16 @@ std::optional<csgo::Engine> engine;
 
 std::mutex viewMutex;
 std::array<TargetView, 65> views{};
+
+// Бектрек-чамсы: кости самой старой записи врага, в которую рейдж ещё может выстрелить
+// (то же окно отката и тот же обрыв на телепорте, что и при выборе записи для выстрела)
+struct BacktrackGhost {
+    bool valid = false;
+    float at = 0.0f;                // realtime обновления
+    csgo::matrix3x4 bones[RECORD_BONES];
+};
+std::mutex ghostMutex;
+std::array<BacktrackGhost, 65> ghosts{};
 ShotView lastShot;
 
 // ---------- логи: консоль игры + файл ~/csgo-hvh/logs/ДАТА.log + коротко на экране ----------
@@ -132,13 +146,18 @@ void fileLog(const char* text) noexcept
     std::fflush(file);
 }
 
-struct ScreenLine {
-    std::string text;
-    ImU32 color = 0;
+// ---------- уведомления: консоль в стиле hysteria + лента под прицелом в стиле NL ----------
+// Строка собирается из кусков: связки («'s», « for », « due to ») — серые, имена и значения — белые.
+// В консоль: «eclipse — · hit Ник's head for 92 hp  ~  bt: 2t, hc: 85%» (точка цветом события),
+// на экран — только главная фраза с большой буквы: «Hit Ник's head for 92 hp».
+// Полная русская строка с разбором выстрела по-прежнему уходит в файл (logs/), консоль её больше не видит.
+struct Notice {
+    NoticeKind kind = NoticeKind::Hit;
+    std::vector<NoticePart> parts;
     double time = 0.0;
 };
-std::array<ScreenLine, 8> screenLines;
-int screenNext = 0;
+std::array<Notice, 8> notices;
+int noticeNext = 0;
 std::mutex screenMutex;   // пишет игровой поток (события), читает отрисовка
 
 [[nodiscard]] double steadySeconds() noexcept
@@ -146,20 +165,107 @@ std::mutex screenMutex;   // пишет игровой поток (событи�
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// одна строка на событие: в консоль (цветом) и файл — полностью, на экран — до «|»
-void report(const std::uint8_t (&color)[4], const char* text) noexcept
+// details — пары «ключ: значение» после «~» (только в консоли)
+void notify(NoticeKind kind, std::vector<NoticePart> parts, const std::vector<std::pair<std::string, std::string>>& details) noexcept
 {
-    if (memoryPtr && memoryPtr->conColorMsg)
-        memoryPtr->conColorMsg(color, "%s\n", text);
-    fileLog(text);
-    std::string brief = text;
-    if (brief.starts_with("[newerwin] "))
-        brief.erase(0, 11);
-    if (const auto bar = brief.find(" |"); bar != std::string::npos)
-        brief.resize(bar);
+    if (memoryPtr && memoryPtr->conColorMsg) {
+        static constexpr std::uint8_t brand[4]{ 160, 170, 255, 255 };
+        static constexpr std::uint8_t grey[4]{ 128, 128, 128, 255 };
+        static constexpr std::uint8_t white[4]{ 230, 230, 230, 255 };
+        static constexpr std::uint8_t key[4]{ 112, 112, 112, 255 };
+        static constexpr std::uint8_t val[4]{ 170, 170, 170, 255 };
+        static constexpr std::uint8_t orange[4]{ 213, 154, 77, 255 };
+        const auto tone = noticeColor(kind);
+        const std::uint8_t toneRaw[4]{ tone[0], tone[1], tone[2], tone[3] };
+        const auto print = memoryPtr->conColorMsg;
+        print(brand, "eclipse");
+        print(grey, " \xE2\x80\x94 ");
+        print(toneRaw, "\xC2\xB7 ");
+        for (const auto& part : parts)
+            print(part.warn ? orange : part.value ? white : grey, "%s", part.text.c_str());
+        if (!details.empty()) {
+            print(grey, "  ~  ");
+            for (std::size_t i = 0; i < details.size(); ++i) {
+                print(key, "%s: ", details[i].first.c_str());
+                print(val, "%s", details[i].second.c_str());
+                if (i + 1 < details.size())
+                    print(key, ", ");
+            }
+        }
+        print(white, "\n");
+    }
+    if (!parts.empty() && !parts[0].text.empty())
+        parts[0].text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(parts[0].text[0])));
     std::scoped_lock lock{ screenMutex };
-    screenLines[screenNext] = { std::move(brief), IM_COL32(color[0], color[1], color[2], 255), steadySeconds() };
-    screenNext = (screenNext + 1) % static_cast<int>(screenLines.size());
+    notices[noticeNext] = { kind, std::move(parts), steadySeconds() };
+    noticeNext = (noticeNext + 1) % static_cast<int>(notices.size());
+}
+
+// ник для ленты — не длиннее 20 символов (по UTF-8 не режем посреди буквы)
+[[nodiscard]] std::string shortName(std::string name) noexcept
+{
+    std::erase(name, '\n');
+    std::size_t chars = 0, i = 0;
+    for (; i < name.size(); ++i) {
+        if ((static_cast<unsigned char>(name[i]) & 0xC0) != 0x80 && ++chars > 20)
+            break;
+    }
+    if (i < name.size())
+        name = name.substr(0, i) + "...";
+    return name;
+}
+
+[[nodiscard]] const char* hitgroupName(int hitgroup) noexcept
+{
+    static constexpr const char* names[]{ "generic", "head", "chest", "stomach", "left arm", "right arm", "left leg", "right leg", "neck" };
+    return hitgroup >= 0 && hitgroup < 9 ? names[hitgroup] : "generic";
+}
+
+// Причина промаха по-английски, как в NL/hysteria
+[[nodiscard]] const char* missReasonEn(const char* reason) noexcept
+{
+    const std::string_view full{ reason };
+    if (full.starts_with("нас убили"))
+        return "death";
+    if (full.starts_with("сервер не засчитал"))
+        return "unregistered shot";
+    if (full.starts_with("пуля застряла"))
+        return "occlusion";
+    if (full.starts_with("разброс"))
+        return "spread";
+    if (full.starts_with("джиттер"))
+        return "jitter correction";
+    if (full.starts_with("прогноз"))
+        return "prediction error";
+    return "resolver";
+}
+
+// Выстрелы в нас: ждём ~0.35 с, не прилетел ли урон от этого стрелка, — если нет, «evaded»
+struct EnemyShot {
+    int shooter = 0;
+    double time = 0.0;
+    std::string name;
+    std::string state;
+};
+std::vector<EnemyShot> enemyShots;
+std::array<double, 65> hurtByAt{};
+
+void flushEvaded() noexcept
+{
+    std::vector<EnemyShot> ready;
+    {
+        std::scoped_lock lock{ screenMutex };
+        const double now = steadySeconds();
+        std::erase_if(enemyShots, [&](const EnemyShot& shot) {
+            if (now - shot.time < 0.35)
+                return false;
+            if (std::abs(hurtByAt[shot.shooter] - shot.time) > 0.35)
+                ready.push_back(shot);
+            return true;
+        });
+    }
+    for (const auto& shot : ready)
+        notify(NoticeKind::Evaded, { { "evaded " }, { shortName(shot.name), true }, { "'s shot" } }, { { "state", shot.state } });
 }
 
 [[nodiscard]] std::string playerName(int index) noexcept
@@ -643,7 +749,8 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
         // Но каждый кадр сервер удаляет записи старше curtime − sv_maxunlag; удалил голову — история пуста,
         // и следующая запись принимается с любым simtime (иначе после отката тикбейса держали бы старьё секундами).
         // Записи старше остаются: скорость и чок считаются по max(Δsimtime, Δприёма), бектрек — по simtime каждой.
-        if (list.at(0).simulationTime >= memory.globalVars->serverTime() - maxUnlag) {
+        // (порог у сервера целый: (int)(curtime − sv_maxunlag) — голова живёт до смены секунды)
+        if (list.at(0).simulationTime >= std::floor(memory.globalVars->serverTime() - maxUnlag)) {
             list.skippedSimulationTime = simulationTime;
             return;
         }
@@ -729,20 +836,33 @@ void updateRecords(PlayerRecords& list, const csgo::Entity& entity, const Memory
     return std::max(need, std::min(need + (1.0f - need) * 0.5f, 0.97f));
 }
 
-// Окно отката сервера: цель не дальше 0.2 с от «правильного» времени и не старше sv_maxunlag
-// (serverTime — наш тикбейс, то есть время выполнения команды на сервере)
-// margin — запас у края sv_maxunlag: логи 04–09.11, бектрек 12+ тиков — 4/13 (30%) против 84–100% у 9–11:
-// пока выстрел едет (чок + пинг), сервер успевает выкинуть запись с края окна
-[[nodiscard]] bool recordValid(float simulationTime, float serverTime, float latencyIn, float lerp, float maxUnlag, float interval, float margin = 0.0f) noexcept
+using hvh::backtrack::recordValid;  // окно отката — BacktrackWindow.h
+
+// lerp так, как его считает сервер (CBasePlayer: m_fLerpTime из cl_interp/cl_interp_ratio/cl_updaterate клиента
+// с серверными ограничениями). Osiris делил на sv_maxupdaterate: при cl_updaterate 64 и sv_maxupdaterate 128
+// выходило вдвое меньше серверного, tick_count уезжал на тик — сервер ставил врага на тик раньше записи.
+[[nodiscard]] float serverLerp(const csgo::Cvar& cvar) noexcept
 {
-    // сервер берёт lerp в целых тиках
-    const float lerpTicks = std::floor(0.5f + lerp / interval) * interval;
-    const float correct = std::clamp(latencyIn + lerpTicks, 0.0f, maxUnlag);
-    // запас 10 мс: задержка, которую меряет сервер, дрожит относительно нашей — запись на самом краю окна
-    // он сочтёт невалидной и откатит врага в другое время
-    if (std::abs(correct - (serverTime - simulationTime)) >= 0.19f)
-        return false;
-    return simulationTime >= serverTime - maxUnlag + margin;
+    static const auto updateRateVar = cvar.findVar("cl_updaterate");
+    static const auto minUpdateRateVar = cvar.findVar("sv_minupdaterate");
+    static const auto maxUpdateRateVar = cvar.findVar("sv_maxupdaterate");
+    static const auto interpVar = cvar.findVar("cl_interp");
+    static const auto interpRatioVar = cvar.findVar("cl_interp_ratio");
+    static const auto minRatioVar = cvar.findVar("sv_client_min_interp_ratio");
+    static const auto maxRatioVar = cvar.findVar("sv_client_max_interp_ratio");
+    const auto value = [](csgo::ConVarPOD* var, float fallback) {
+        return var ? csgo::ConVar::from(retSpoofGadgets->client, var).getFloat() : fallback;
+    };
+    float updateRate = static_cast<float>(static_cast<int>(value(updateRateVar, 64.0f)));
+    if (minUpdateRateVar && maxUpdateRateVar)
+        updateRate = std::clamp(updateRate, std::floor(value(minUpdateRateVar, 64.0f)), std::max(std::floor(value(maxUpdateRateVar, 64.0f)), std::floor(value(minUpdateRateVar, 64.0f))));
+    updateRate = std::max(updateRate, 1.0f);
+    float ratio = value(interpRatioVar, 2.0f);
+    if (ratio == 0.0f)
+        ratio = 1.0f;
+    if (minRatioVar && maxRatioVar && value(minRatioVar, 1.0f) != -1.0f)
+        ratio = std::clamp(ratio, value(minRatioVar, 1.0f), std::max(value(maxRatioVar, 2.0f), value(minRatioVar, 1.0f)));
+    return std::max(value(interpVar, 0.0f), ratio / updateRate);
 }
 
 // ---------- прогноз для врагов вне окна отката ----------
@@ -970,14 +1090,16 @@ MovementVars movementVars(const csgo::Cvar& cvar) noexcept
     return ticks;
 }
 
-void autoStop(csgo::UserCmd* cmd, AutoStop mode, float maxSpeed, float interval, const MovementVars& vars) noexcept
+// crawl: на точной скорости не обнулять ввод (стоп перед пиком) — иначе с места персонаж не трогался,
+// стоп продлевался каждый тик, и мы стояли у стены с зажатым WASD, пока нас не убьют (13.11: 28 смертей)
+void autoStop(csgo::UserCmd* cmd, AutoStop mode, float maxSpeed, float interval, const MovementVars& vars, bool crawl = false) noexcept
 {
     const auto velocity = localPlayer.get().velocity();
     const float speed = velocity.length2D();
     const float targetSpeed = autoStopTarget(mode, maxSpeed);
     const float nextSpeed = afterFriction(speed, vars, interval);
     if (nextSpeed <= targetSpeed + 1.0f) {
-        if (mode == AutoStop::Full || speed < 15.0f) {
+        if (mode == AutoStop::Full || (speed < 15.0f && !crawl)) {
             cmd->forwardmove = 0.0f;
             cmd->sidemove = 0.0f;
             return;
@@ -1130,9 +1252,24 @@ struct ShotRecord {
     Capsules plus, minus;           // крайние скелеты той же записи
     bool haveImpact = false;
     csgo::Vector impact{};
+    std::uint32_t serial = 0;       // порядковый номер выстрела — по нему импакты раздаются пулям по очереди
+    bool gotFire = false;           // сервер подтвердил этот выстрел (weapon_fire) — следующие импакты его
 };
 std::array<ShotRecord, 65> shots{};
+// Вторая пуля в ту же цель, пока первая ещё не разобрана (DT, автомат): первая переезжает сюда и ждёт
+// своего результата отдельно. Раньше вторая затирала первую — один из двух исходов пропадал, а импакты
+// обеих пуль смешивались в одну запись, и резольвер учился на чужом луче.
+std::array<ShotRecord, 65> olderShots{};
+ShotRecord* impactTarget = nullptr; // выстрел, которому сейчас идут импакты (ставит weapon_fire)
+std::uint32_t shotSerial = 0;
 int lastShotIndex = 0;
+
+constexpr float shotTimeout = 0.7f; // столько ждём player_hurt, потом выстрел — промах
+
+[[nodiscard]] bool pending(const ShotRecord& shot, float realtime) noexcept
+{
+    return shot.time > 0.0f && realtime - shot.time <= shotTimeout;
+}
 
 struct ImpactListener : csgo::GameEventListener {
     void fireGameEvent(csgo::GameEventPOD* eventPointer) override
@@ -1140,11 +1277,27 @@ struct ImpactListener : csgo::GameEventListener {
         const auto event = csgo::GameEvent::from(retSpoofGadgets->client, eventPointer);
         if (!engine || !localPlayer || !memoryPtr || engine->getPlayerForUserID(event.getInt("userid")) != localPlayer.get().getNetworkable().index())
             return;
-        if (lastShotIndex <= 0)
+        const float realtime = memoryPtr->globalVars->realtime;
+        if (const char* name = event.getName(); name && std::strcmp(name, "weapon_fire") == 0) {
+            // сервер выполнил наш очередной выстрел: дальше идут импакты именно этой пули —
+            // самой старой из ещё не подтверждённых
+            ShotRecord* oldest = nullptr;
+            for (auto* list : { &olderShots, &shots })
+                for (auto& candidate : *list)
+                    if (pending(candidate, realtime) && !candidate.gotFire && (!oldest || candidate.serial < oldest->serial))
+                        oldest = &candidate;
+            if (oldest) {
+                oldest->gotFire = true;
+                impactTarget = oldest;
+            }
             return;
-        auto& shot = shots[lastShotIndex];
-        if (shot.time <= 0.0f || memoryPtr->globalVars->realtime - shot.time > 0.5f)
+        }
+        ShotRecord* found = impactTarget && pending(*impactTarget, realtime) ? impactTarget : nullptr;
+        if (!found && lastShotIndex > 0)   // weapon_fire не дошёл — как раньше: последняя цель, сначала старая пуля
+            found = pending(olderShots[lastShotIndex], realtime) ? &olderShots[lastShotIndex] : &shots[lastShotIndex];
+        if (!found || !pending(*found, realtime))
             return;
+        auto& shot = *found;
         const csgo::Vector position{ event.getFloat("x"), event.getFloat("y"), event.getFloat("z") };
         // пробития дают несколько импактов — нужен самый дальний
         if (!shot.haveImpact || (position - shot.eye).squareLength() > (shot.impact - shot.eye).squareLength()) {
@@ -1215,9 +1368,8 @@ void scoreGuess(Brain& brain, float guess, float truth) noexcept
 }
 
 // Промах: причина по импакту пули и обучение резольвера
-void evaluateMiss(int index) noexcept
+void evaluateMiss(int index, ShotRecord& shot) noexcept
 {
-    auto& shot = shots[index];
     auto& brain = brains[index];
     const float realtime = memoryPtr->globalVars->realtime;
     if (index == lastShotIndex) {
@@ -1353,11 +1505,30 @@ void evaluateMiss(int index) noexcept
 
     char text[640];
     std::snprintf(text, sizeof(text), "[newerwin] промах по %s: %s%s | %s", playerName(index).c_str(), reason, detail, shotText(shot).c_str());
-    static constexpr std::uint8_t red[4]{ 255, 110, 110, 255 };
-    report(red, text);
+    fileLog(text);
+    {
+        // «missed Ник's head due to resolver  ~  Δ: 2t, ∠: 0.12º, hc: 85%»
+        std::vector<std::pair<std::string, std::string>> details;
+        if (shot.backtrackTicks != 0)
+            details.emplace_back("\xCE\x94", std::to_string(shot.backtrackTicks) + "t");
+        if (shot.haveImpact) {
+            const auto aim = normalized(shot.aimPoint - shot.eye);
+            const auto flew = normalized(shot.impact - shot.eye);
+            const float cosine = std::clamp(aim.x * flew.x + aim.y * flew.y + aim.z * flew.z, -1.0f, 1.0f);
+            char angle[24];
+            std::snprintf(angle, sizeof(angle), "%.2f\xC2\xBA", Helpers::rad2deg(std::acos(cosine)));
+            details.emplace_back("\xE2\x88\xA0", angle);
+        }
+        details.emplace_back("hc", std::to_string(shot.hitchance) + "%");
+        notify(NoticeKind::Miss, { { "missed " }, { shortName(playerName(index)), true }, { "'s " },
+                                   { shot.taser ? "body" : shot.isHead ? "head" : "body", true }, { " due to " },
+                                   { missReasonEn(reason), true } }, details);
+    }
     if (shot.haveImpact)
         extras::onShotResult(shot.impact, false);
     shot.time = 0.0f;
+    if (impactTarget == &shot)
+        impactTarget = nullptr;
 }
 
 // Слои дали ноги почти по взгляду и без уверенности — сторона там случайна (лог 31.10, новая сборка:
@@ -1466,6 +1637,19 @@ float resolverOffsetFor(int index) noexcept
     return std::clamp(evidence / 3.0f, -1.0f, 1.0f);
 }
 
+bool backtrackBones(int index, csgo::matrix3x4* out, float realtime) noexcept
+{
+    if (index <= 0 || index >= static_cast<int>(ghosts.size()) || !out)
+        return false;
+    std::scoped_lock lock{ ghostMutex };
+    const auto& ghost = ghosts[index];
+    // рейдж не обновлял запись — она уже могла выйти из окна, не врём
+    if (!ghost.valid || realtime - ghost.at > 0.25f || realtime < ghost.at)
+        return false;
+    std::copy(ghost.bones, ghost.bones + RECORD_BONES, out);
+    return true;
+}
+
 TargetView targetView(int index) noexcept
 {
     if (index <= 0 || index >= static_cast<int>(views.size()))
@@ -1501,13 +1685,32 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
             defensive::windowLeft(), tickbase::chargedTicks(), tickbase::threatened() ? "да" : "нет",
             hvh::antiaim::threatIndex() == attackerIndex ? "он" : hvh::antiaim::threatIndex() == 0 ? "нет" : "другой");
         fileLog(text);
+        {
+            // «hurt by Ник in head for 50 hp  ~  state: running» / «killed by Ник in head»
+            const bool killed = healthLeft <= 0;
+            std::vector<NoticePart> parts{ { killed ? "killed by " : "hurt by " }, { shortName(playerName(attackerIndex)), true } };
+            if (hitgroup > 0) {
+                parts.push_back({ " in " });
+                parts.push_back({ hitgroupName(hitgroup), true });
+            }
+            if (!killed) {
+                parts.push_back({ " for " });
+                parts.push_back({ std::to_string(damage) + " hp", true });
+            }
+            {
+                std::scoped_lock lock{ screenMutex };
+                hurtByAt[attackerIndex] = steadySeconds();
+            }
+            notify(NoticeKind::Hurt, std::move(parts), { { "state", hvh::antiaim::stateNameEn() } });
+        }
         if (memoryPtr)
             hvh::antiaim::onHurtByEnemy(attackerIndex, hitgroup, memoryPtr->globalVars->realtime);
         return;
     }
     if (attackerIndex != localIndex || victimIndex <= 0 || victimIndex >= 65 || !memoryPtr)
         return;
-    auto& shot = shots[victimIndex];
+    // две пули в полёте — урон относится к той, что выпущена раньше
+    auto& shot = olderShots[victimIndex].time > 0.0f ? olderShots[victimIndex] : shots[victimIndex];
     auto& brain = brains[victimIndex];
     brain.misses = 0;
     if (shot.time <= 0.0f)
@@ -1548,9 +1751,40 @@ void onPlayerHurt(int victimIndex, int attackerIndex, int localIndex, int hitgro
     char text[640];
     std::snprintf(text, sizeof(text), "[newerwin] попал в %s: %s −%d (осталось %d) | %s", playerName(victimIndex).c_str(),
         hitgroup >= 0 && hitgroup < 9 ? hitgroups[hitgroup] : "?", damage, healthLeft, shotText(shot).c_str());
-    static constexpr std::uint8_t green[4]{ 120, 230, 120, 255 };
-    report(green, text);
+    fileLog(text);
+    {
+        // «hit Ник's chest for 54 hp  ~  exp: head-120, bt: 2t, hc: 85%» / «killed Ник in head»
+        const bool killed = healthLeft <= 0;
+        const bool wantedHead = shot.isHead && !shot.taser;
+        const bool wrongGroup = !killed && hitgroup > 0 && ((hitgroup == 1) != wantedHead);
+        const bool lowDamage = !killed && shot.damage - damage > 10;
+        const char* verb = killed ? (shot.taser ? "tased " : "killed ") : "hit ";
+        std::vector<NoticePart> parts{ { verb }, { shortName(playerName(victimIndex)), true } };
+        if (hitgroup > 0) {
+            parts.push_back({ killed ? " in " : "'s " });
+            parts.push_back({ hitgroupName(hitgroup), true });
+        }
+        if (wrongGroup)
+            parts.push_back({ "!", false, true });
+        if (!killed) {
+            parts.push_back({ " for " });
+            parts.push_back({ std::to_string(damage) + " hp", true });
+        }
+        if (lowDamage)
+            parts.push_back({ "!", false, true });
+        std::vector<std::pair<std::string, std::string>> details;
+        if (wrongGroup || lowDamage)
+            details.emplace_back("exp", std::string{ wantedHead ? "head" : "body" } + "-" + std::to_string(shot.damage));
+        if (!killed)
+            details.emplace_back("left", std::to_string(healthLeft) + " hp");
+        if (shot.backtrackTicks != 0)
+            details.emplace_back("bt", std::to_string(shot.backtrackTicks) + "t");
+        details.emplace_back("hc", std::to_string(shot.hitchance) + "%");
+        notify(killed ? NoticeKind::Kill : NoticeKind::Hit, std::move(parts), details);
+    }
     shot.time = 0.0f;
+    if (impactTarget == &shot)
+        impactTarget = nullptr;
 }
 
 void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory& memory, bool forceRemove) noexcept
@@ -1558,6 +1792,7 @@ void updateEventListener(const EngineInterfaces& engineInterfaces, const Memory&
     const bool wanted = !forceRemove && config.rage.enabled;
     if (wanted && !impactRegistered) {
         engineInterfaces.getGameEventManager(memory.getEventDescriptor).addListener(&impactListener, csgo::bullet_impact);
+        engineInterfaces.getGameEventManager(memory.getEventDescriptor).addListener(&impactListener, csgo::weapon_fire);
         impactRegistered = true;
     } else if (!wanted && impactRegistered) {
         engineInterfaces.getGameEventManager(memory.getEventDescriptor).removeListener(&impactListener);
@@ -1588,32 +1823,46 @@ void captureNetworkAngles(const EngineInterfaces& engineInterfaces, const Client
     }
 }
 
-void drawLogs(ImDrawList* drawList) noexcept
+std::vector<NoticeView> recentNotices(float lifetime) noexcept
 {
-    if (!config.view.screenLogs || !drawList)
-        return;
-    constexpr double lifetime = 6.0, fade = 1.0;
+    flushEvaded();
+    std::vector<NoticeView> out;
     const double now = steadySeconds();
-    ImVec2 position{ 8.0f, 6.0f };
     std::scoped_lock lock{ screenMutex };
-    for (int k = 0; k < static_cast<int>(screenLines.size()); ++k) {
-        const auto& line = screenLines[(screenNext + k) % screenLines.size()];
-        const double age = now - line.time;
-        if (line.text.empty() || age > lifetime)
+    for (int k = 1; k <= static_cast<int>(notices.size()); ++k) {
+        const auto& notice = notices[(noticeNext - k + static_cast<int>(notices.size())) % static_cast<int>(notices.size())];
+        const double age = now - notice.time;
+        if (notice.parts.empty() || age > lifetime || age < 0.0)
             continue;
-        const float alpha = static_cast<float>(std::clamp((lifetime - age) / fade, 0.0, 1.0));
-        const auto withAlpha = [alpha](ImU32 color) {
-            return (color & 0x00FFFFFF) | (static_cast<ImU32>(((color >> 24) & 0xFF) * alpha) << 24);
-        };
-        drawList->AddText({ position.x + 1.0f, position.y + 1.0f }, withAlpha(IM_COL32(0, 0, 0, 200)), line.text.c_str());
-        drawList->AddText(position, withAlpha(line.color), line.text.c_str());
-        position.y += ImGui::GetTextLineHeight() + 2.0f;
+        out.push_back({ notice.kind, notice.parts, static_cast<float>(age) });
     }
+    return out;
+}
+
+// цвета событий — как в hysteria: попадание салатовый, промах сиреневый, по нам красный, увернулись голубой
+std::array<std::uint8_t, 4> noticeColor(NoticeKind kind) noexcept
+{
+    switch (kind) {
+    case NoticeKind::Hit:
+    case NoticeKind::Kill: return { 205, 237, 116, 255 };
+    case NoticeKind::Miss: return { 217, 176, 255, 255 };
+    case NoticeKind::Hurt: return { 255, 112, 112, 255 };
+    case NoticeKind::Evaded: return { 176, 226, 255, 255 };
+    }
+    return { 230, 230, 230, 255 };
 }
 
 void logToFile(const char* text) noexcept
 {
     fileLog(text);
+}
+
+void onShotAtUs(int shooterIndex, const char* name, const char* state) noexcept
+{
+    if (shooterIndex <= 0 || shooterIndex >= 65)
+        return;
+    std::scoped_lock lock{ screenMutex };
+    enemyShots.push_back({ shooterIndex, steadySeconds(), name ? name : "?", state ? state : "" });
 }
 
 void onPlayerDeath(int victimIndex, int localIndex) noexcept
@@ -1626,6 +1875,9 @@ void onRoundStart() noexcept
 {
     for (auto& shot : shots)
         shot.time = 0.0f;
+    for (auto& shot : olderShots)
+        shot.time = 0.0f;
+    impactTarget = nullptr;
     for (auto& brain : brains) {
         brain.misses = 0;
         brain.bruteSide = 0.0f;
@@ -1668,9 +1920,11 @@ bool knifeBot(csgo::UserCmd* cmd, const csgo::Entity& weapon, const EngineInterf
     if (!primaryReady && !secondaryReady)
         return false;
 
-    float latencyIn = 0.0f;
-    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel())
-        latencyIn = csgo::NetworkChannel::from(retSpoofGadgets->client, channel).getLatency(1);
+    float latency = 0.0f;
+    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel()) {
+        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
+        latency = net.getLatency(0) + net.getLatency(1) + tickbase::fakeLatencySeconds();
+    }
 
     constexpr float primaryRange = 48.0f, secondaryRange = 32.0f;
     const auto eye = localPlayer.get().getEyePosition();
@@ -1704,7 +1958,7 @@ bool knifeBot(csgo::UserCmd* cmd, const csgo::Entity& weapon, const EngineInterf
             const auto& record = list.at(age);
             if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
                 break;
-            if (!recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval))
+            if (!recordValid(record.simulationTime, serverTime, latency, lerpTime, maxUnlag, serverTime + 2.0f * interval))
                 continue;
             // ближайшая к глазам точка тела: по оси капсулы, расстояние — до её поверхности
             buildCapsules(*set, record.bones, caps);
@@ -1760,7 +2014,7 @@ bool knifeBot(csgo::UserCmd* cmd, const csgo::Entity& weapon, const EngineInterf
     cmd->viewangles = angle;
     cmd->buttons &= ~(csgo::UserCmd::IN_ATTACK | csgo::UserCmd::IN_ATTACK2);
     cmd->buttons |= best.secondary ? csgo::UserCmd::IN_ATTACK2 : csgo::UserCmd::IN_ATTACK;
-    cmd->tickCount = timeToTicks(best.record->simulationTime, interval) + timeToTicks(lerpTime, interval);
+    cmd->tickCount = timeToTicks(best.record->simulationTime + lerpTime, interval);
     if (!rage.silent)
         engineInterfaces.getEngine().setViewAngles(cmd->viewangles);
     target = best.index;
@@ -1902,6 +2156,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const auto& rage = config.rage;
     memoryPtr = &memory;
     engine.emplace(engineInterfaces.getEngine());
+    lerpTime = serverLerp(interfaces.getCvar());
     // Оверрайдов больше нет — всё через бинды на строки меню. «МД оверрайд» для индикатора —
     // держится бинд на «Мин. урон» (он сам пишет значение в настройку оружия)
     minDamageOverride = false;
@@ -1919,13 +2174,20 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
 
     // выстрелы без player_hurt за 0.7 с — промахи
     for (int i = 1; i < 65; ++i) {
-        if (shots[i].time > 0.0f && realtime - shots[i].time > 0.7f)
-            evaluateMiss(i);
+        if (olderShots[i].time > 0.0f && realtime - olderShots[i].time > shotTimeout)
+            evaluateMiss(i, olderShots[i]);
+        if (shots[i].time > 0.0f && realtime - shots[i].time > shotTimeout)
+            evaluateMiss(i, shots[i]);
     }
 
     if (!rage.enabled || !localPlayer || !localPlayer.get().isAlive()) {
         for (auto& list : records)
             list.clear();
+        {
+            std::scoped_lock lock{ ghostMutex };
+            for (auto& ghost : ghosts)
+                ghost.valid = false;
+        }
         hvh::resolver::clear();
         return false;
     }
@@ -1936,12 +2198,22 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const float maxUnlag = maxUnlagVar ? csgo::ConVar::from(retSpoofGadgets->client, maxUnlagVar).getFloat() : 0.2f;
 
     // ---- записи и резольвер — каждый тик, даже когда стрелять нечем ----
+    // окно отката для бектрек-чамсов: как у выстрела, только без поправок DT/чока (их знаем позже)
+    float ghostLatency = tickbase::fakeLatencySeconds();
+    if (const auto channel = engineInterfaces.getEngine().getNetworkChannel()) {
+        const auto net = csgo::NetworkChannel::from(retSpoofGadgets->client, channel);
+        ghostLatency += net.getLatency(0) + net.getLatency(1);
+    }
+    const float ghostServerTime = memory.globalVars->serverTime();
+    const float ghostArrival = ghostServerTime + 2.0f * interval;
     std::array<bool, 65> isBot{};
     for (int i = 1; i <= maxClients; ++i) {
         const auto entity = csgo::Entity::from(retSpoofGadgets->client, clientInterfaces.getEntityList().getEntity(i));
         if (entity.getPOD() == nullptr || entity.getPOD() == localPlayer.get().getPOD() || entity.getNetworkable().isDormant()
             || !entity.isAlive() || !entity.isOtherEnemy(memory, localPlayer.get())) {
             records[i].clear();
+            std::scoped_lock lock{ ghostMutex };
+            ghosts[i].valid = false;
             continue;
         }
         csgo::PlayerInfo info{};
@@ -1951,6 +2223,27 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         updateRecords(records[i], entity, memory, rage.resolver && !isBot[i], i, maxUnlag);
 
         const auto& list = records[i];
+        {
+            // самая старая запись в окне: от свежей к старым, на разрыве > 64 ед. сервер откат бросает
+            int oldest = -1;
+            for (int age = 0; age < list.count; ++age) {
+                const auto& record = list.at(age);
+                if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
+                    break;
+                if (record.animStale || !recordValid(record.simulationTime, ghostServerTime, ghostLatency, lerpTime, maxUnlag, ghostArrival))
+                    continue;
+                oldest = age;
+            }
+            std::scoped_lock lock{ ghostMutex };
+            auto& ghost = ghosts[i];
+            // стоит на месте — призрак совпал бы с моделью и только мерцал
+            ghost.valid = oldest > 0 && !list.at(0).breakingLagComp
+                && (list.at(oldest).origin - entity.getAbsOrigin()).squareLength() > 1.5f * 1.5f;
+            if (ghost.valid) {
+                std::copy(list.at(oldest).bones, list.at(oldest).bones + RECORD_BONES, ghost.bones);
+                ghost.at = realtime;
+            }
+        }
         std::scoped_lock lock{ viewMutex };
         auto& view = views[i];
         view.updatedAt = realtime;
@@ -2005,10 +2298,16 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     const auto& settings = taser ? zeusSettings : weaponSettings(groupOf(weapon));
     extras::setMinDamage(settings.minDamage, minDamageOverride);
     const float serverTime = memory.globalVars->serverTime();
-    // во время сдвига DT команды идут пачкой без предсказания между ними: nextPrimaryAttack ещё старый
+    // После выстрела оружие передёргивается cycletime — до этого второй выстрел невозможен. Раньше проверка была
+    // только во время сдвига DT (там nextPrimaryAttack ещё старый), но и вне сдвига предсказание обновляет
+    // nextPrimaryAttack не сразу (выстрел в чоке, фейклаг, ФД): рейдж «стрелял» второй раз, сервер такой
+    // команды не исполнял — в логе «сервер не засчитал выстрел» парой к попаданию (13.11 вечер: 66 штук,
+    // скаут, две «пули» за 0.7 с). Окно — от времени выстрела; откат тикбейса назад (дефенсив) его не открывает.
     static float firedAt = -1.0f;
     static float firedCycle = 0.0f;
-    const bool cycling = tickbase::isShifting() && firedAt >= 0.0f && serverTime >= firedAt && serverTime < firedAt + firedCycle;
+    if (firedAt >= 0.0f && (serverTime < firedAt - 2.0f || serverTime > firedAt + 10.0f))
+        firedAt = -1.0f;    // другая карта/раунд/реконнект
+    const bool cycling = firedAt >= 0.0f && serverTime < firedAt + firedCycle - 0.5f * memory.globalVars->intervalPerTick;
     const bool weaponReady = localPlayer.get().nextAttack() <= serverTime && weapon.nextPrimaryAttack() <= serverTime && !cycling;
     // R8 стреляет, только когда ЛКМ продержали 0.234 с (взвод), и сам — как только взвёлся. Взводим сами;
     // в тик готовности либо выстрел, либо ЛКМ отпускается (взвод начнётся заново)
@@ -2073,6 +2372,14 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         latencyOut = net.getLatency(0);
         latencyIn = net.getLatency(1);
     }
+    // когда сервер примет команду (для порога удаления записей): наш тикбейс и так «время выполнения», но при
+    // заряженном DT он отстаёт — тогда по часам клиента + дорога; плюс чок и два тика запаса
+    const float arrival = std::max(serverTime, static_cast<float>(memory.globalVars->tickCount) * interval + latencyOut) + sendDelay + 2.0f * interval;
+    // Быстрый DT: за выстрелом той же пачкой идёт сдвиг, и сервер откатывает наш тикбейс на его длину —
+    // выстрел выполняется на столько тиков «раньше». Окно отката врагов сервер считает от ЭТОГО времени:
+    // самая свежая запись для него слишком нова (он бы откатил врага по пингу, на ~0.2 с назад) — годятся
+    // записи на несколько тиков старше.
+    const float execTime = serverTime - interval * static_cast<float>(tickbase::shotRollbackTicks());
     static const auto gravityVar = interfaces.getCvar().findVar("sv_gravity");
     const float gravity = gravityVar ? csgo::ConVar::from(retSpoofGadgets->client, gravityVar).getFloat() : 800.0f;
 
@@ -2152,7 +2459,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                 // всё, что старше разрыва, недостижимо — выстрел уйдёт по текущей позиции
                 if (age > 0 && horizontalJump(record.origin, list.at(age - 1).origin))
                     break;
-                if (record.animStale || !recordValid(record.simulationTime, serverTime, latencyIn, lerpTime, maxUnlag, interval, sendDelay + 2.0f * interval))
+                if (record.animStale || !recordValid(record.simulationTime, execTime, latencyOut + latencyIn + tickbase::fakeLatencySeconds(), lerpTime, maxUnlag, arrival))
                     continue;
                 if (newest < 0)
                     newest = age;
@@ -2710,6 +3017,10 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     // Диагностика «держит цель и не стреляет»: цель есть дольше 0.3 с без выстрела — причина в лог (раз за эпизод)
     static float hesitateSince = -1.0f;
     static bool hesitateLogged = false;
+    // стоп перед пиком: когда начался заход и не исчерпан ли он (до отпускания WASD или появления цели)
+    static float peekEpisodeStart = -1.0f;
+    static float peekLast = -1.0f;
+    static bool peekSpent = false;
     // видимых целей нет — дормант-аимбот по слышимым врагам (зевс — только по видимым)
     if (topCount == 0 && !visualOnly && canShoot && rage.dormantAim && !taser
         && dormantShot(cmd, engineInterfaces, clientInterfaces, interfaces, memory, weaponData, settings, maxClients, eye, cone,
@@ -2752,7 +3063,15 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
         // горизонт — сколько тиков гасить полную скорость, + тик на скоп и отправку
         const int peekTicks = std::clamp(ticksToStop(std::max(flat.length(), speedNow), stopTarget, stopMaxSpeed, moveVars, interval) + 2, 3, 12);
         bool peekStop = false;
-        const bool peekAllowed = !visualOnly && settings.peekStop && stopMode != AutoStop::Off && !taser && groundNow
+        // карта/реконнект или пауза дольше 0.2 с (проверка по краю укрытия мигает) — заход закончился
+        if (realtime < peekEpisodeStart || (!peekSpent && peekEpisodeStart >= 0.0f && realtime - peekLast > 0.2f))
+            peekEpisodeStart = -1.0f;
+        // WASD отпущен — новый заход
+        if (std::abs(cmd->forwardmove) < 1.0f && std::abs(cmd->sidemove) < 1.0f) {
+            peekSpent = false;
+            peekEpisodeStart = -1.0f;
+        }
+        const bool peekAllowed = !visualOnly && !peekSpent && settings.peekStop && stopMode != AutoStop::Off && !taser && groundNow
             && localPlayer.get().moveType() != MoveType::LADDER
             && readyIn <= interval * static_cast<float>(peekTicks);
         if (!peekAllowed || flat.squareLength() < 1.0f) {
@@ -2808,14 +3127,35 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
                     peekStopUntil = realtime + interval * static_cast<float>(peekTicks);
             }
         }
+        // Заход не дольше kPeekHold: проверка «простреливается» грубее рейджа (голова/грудь без хитшанса,
+        // через стену автоволлом), и бывает, что тормозим, а цели так и нет. Дальше — идём сами,
+        // пока не отпустим WASD или не появится цель.
+        constexpr float kPeekHold = 0.35f;
+        if (peekStop) {
+            if (peekEpisodeStart < 0.0f)
+                peekEpisodeStart = realtime;
+            peekLast = realtime;
+            if (realtime - peekEpisodeStart > kPeekHold) {
+                peekStop = false;
+                peekSpent = true;
+                peekStopUntil = -1.0f;
+                char text[160];
+                std::snprintf(text, sizeof(text), "[рейдж] стоп перед пиком: %.2f с без цели — отпустил до отпускания WASD (скорость %.0f)",
+                    realtime - peekEpisodeStart, speedNow);
+                fileLog(text);
+            }
+        }
         if (peekStop) {
             if (needScope && scopeAllowed)
                 cmd->buttons |= csgo::UserCmd::IN_ATTACK2;
-            autoStop(cmd, peekMode, stopMaxSpeed, interval, moveVars);
+            autoStop(cmd, peekMode, stopMaxSpeed, interval, moveVars, true);
             statusText = "стоп перед пиком";
         }
         return false;
     }
+    // цель появилась — заход удался, следующий пик снова со стопом
+    peekSpent = false;
+    peekEpisodeStart = -1.0f;
     if (hesitateSince < 0.0f || realtime < hesitateSince)
         hesitateSince = realtime;
     const auto hesitate = [&](const char* reason) {
@@ -2913,7 +3253,7 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     // Фейкдак: стреляем только с последнего тика стоя (Movement.cpp: первая половина пачки — встаём,
     // вторая — садимся). Это самая высокая точка глаза за цикл — ради неё ФД и нужен. Раньше рейдж
     // стрелял на любом тике: с полуприседа (в укрытие) и форсил пакет — враги видели нас стоя.
-    if (movement::isFakeDucking() && tickbase::chokedCommands() != tickbase::fakeDuckChoke() / 2 - 1) {
+    if (!movement::fakeDuckShotTick()) {
         statusText = "фейкдак: ждём верхнюю точку";
         return false;
     }
@@ -2934,15 +3274,22 @@ bool runImpl(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const
     cmd->buttons |= csgo::UserCmd::IN_ATTACK;
     // сервер откатит цель ровно в эту запись; прогноз и живую модель — tickcount не трогаем
     if (best.kind != RecordKind::Live && best.kind != RecordKind::Extrapolated && best.kind != RecordKind::Ahead)
-        // как на сервере: targettick = tick_count − TIME_TO_TICKS(lerp), lerp округляется отдельно
-        cmd->tickCount = timeToTicks(best.simulationTime, interval) + timeToTicks(lerpTime, interval);
+        // сервер: target = tick_count · interval − m_fLerpTime (lerp не округляется) — одно округление, а не два
+        cmd->tickCount = timeToTicks(best.simulationTime + lerpTime, interval);
     firedAt = serverTime;
     firedCycle = weaponData->cycletime;
     hesitateSince = -1.0f;
     hesitateLogged = false;
 
     auto& shot = shots[best.index];
+    if (shot.time > 0.0f) {
+        // прошлая пуля по этой цели ещё не разобрана — пусть ждёт результата отдельно
+        olderShots[best.index] = shot;
+        if (impactTarget == &shot)
+            impactTarget = &olderShots[best.index];
+    }
     shot = {};
+    shot.serial = ++shotSerial;
     shot.time = realtime;
     shot.eye = eye;
     shot.aimPoint = best.point.position;

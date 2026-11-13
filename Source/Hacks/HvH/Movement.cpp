@@ -155,16 +155,51 @@ void autoStrafe(csgo::UserCmd* cmd, float viewYaw, const csgo::Cvar& cvar, float
 // приседе (IN_BULLRUSH снимает задержку приседа, 7 тиков хватает). Чок N — 14, но часть серверов
 // обрабатывает за раз меньше команд и выкидывает хвост пачки, то есть как раз присед: враг видит нас
 // стоящими через раз («то 100, то 0»). Тогда N уменьшаем, пока отправка не придётся на присед.
+namespace
+{
+float fdAmountNow = 1.0f;   // присед своей модели на этом тике (для выстрела под ФД)
+float lowSum = 0.0f;        // сумма «нижней точки» по тикам — средняя высота, с которой можно стрелять
+int fdTicks = 0;
+}
+
 void fakeDuck(csgo::UserCmd* cmd, float) noexcept
 {
     static int badSends = 0;
     static float cycleLow = 1.0f;
     static int prevChoked = -1;     // чок на прошлом тике: по нему видно, полной ли пачкой ушёл пакет
 
+    // сводка в лог за каждое нажатие: сколько пачек ушло, какой присед получил сервер, до какого чока урезали
+    static int packs = 0, lowPacks = 0, earlyPacks = 0;
+    static float duckSum = 0.0f;
+
     const auto& key = config.movement.fakeDuckKey;
     const bool was = fakeDucking;
-    fakeDucking = key.isSet() && key.isDown() && tickbase::isInstalled()
+    const bool keyDown = key.isSet() && key.isDown();
+    fakeDucking = keyDown && tickbase::isInstalled()
         && localPlayer && localPlayer.get().isAlive() && localPlayer.get().isOnGround();
+    if (keyDown && !fakeDucking && !was) {
+        static float lastWhy = -10.0f;
+        const float now = static_cast<float>(ImGui::GetTime());
+        if (now - lastWhy > 2.0f) {
+            lastWhy = now;
+            char text[160];
+            std::snprintf(text, sizeof(text), "[фейкдак] клавиша зажата, но ФД не включён: детур %s, жив %s, на земле %s",
+                tickbase::isInstalled() ? "да" : "НЕТ", localPlayer && localPlayer.get().isAlive() ? "да" : "нет",
+                localPlayer && localPlayer.get().isOnGround() ? "да" : "нет");
+            ragebot::logToFile(text);
+        }
+    }
+    if (was && !fakeDucking && packs > 0) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "[фейкдак] итог: пачек %d (ранних %d), присед на сервере в среднем %.0f%%, низких (<50%%) %d, верхняя точка (присед) %.0f%%, чок в конце %d, лимит сервера %d",
+            packs, earlyPacks, duckSum / static_cast<float>(packs) * 100.0f, lowPacks, fdTicks > 0 ? lowSum / static_cast<float>(fdTicks) * 100.0f : -1.0f,
+            tickbase::fakeDuckChoke(), tickbase::processLimitTicks());
+        ragebot::logToFile(text);
+    }
+    if (fakeDucking && !was)
+        packs = lowPacks = earlyPacks = fdTicks = 0, duckSum = lowSum = 0.0f;
+    if (fakeDucking)
+        ++fdTicks;
     // Урезанный чок раньше жил до перезапуска игры: каждый ранний пакет (выстрел, DT) считался
     // «сервер выкинул присед», лимит падал 14 → 13 → ... → 4 и не возвращался — модель на сервере
     // переставала садиться вовсе. Каждое нажатие ФД начинаем с полного чока.
@@ -199,8 +234,13 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
         fdSentDuck = amount;
         fdLowDuck = cycleLow;
         cycleLow = 1.0f;
+        ++packs;
+        duckSum += amount;
+        if (amount < 0.5f)
+            ++lowPacks;
         if (!fullPack) {
             // пакет ушёл раньше (первый цикл после нажатия, сдвиг) — не улика
+            ++earlyPacks;
         } else if (amount < 0.5f) {
             if (++badSends >= 2) {
                 tickbase::setFakeDuckChoke(limit - 1);
@@ -211,6 +251,8 @@ void fakeDuck(csgo::UserCmd* cmd, float) noexcept
         }
     }
     cycleLow = std::min(cycleLow, amount);
+    fdAmountNow = amount;
+    lowSum += cycleLow;
 }
 
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept
@@ -320,6 +362,18 @@ void fakeDuckStats(float& sent, float& low) noexcept
 bool isFakeDucking() noexcept
 {
     return fakeDucking;
+}
+
+bool fakeDuckShotTick() noexcept
+{
+    if (!fakeDucking)
+        return true;
+    // Стрелять можно в фазе «стоя» (первая половина пачки): на последнем её тике всегда, раньше — если модель
+    // уже встала (присед < 5%): глаза там на той же высоте. Раньше — только последний тик: не прошёл хитшанс
+    // ровно в нём — ждём весь цикл (0.22 с), и под ФД рейдж выглядел «не стреляющим».
+    const int half = tickbase::fakeDuckChoke() / 2;
+    const int choked = tickbase::chokedCommands();
+    return choked < half && (choked == half - 1 || fdAmountNow <= 0.05f);
 }
 
 void autoPeek(csgo::UserCmd* cmd, float viewYaw, bool shot, float interval) noexcept

@@ -1,3 +1,4 @@
+#include "HvH/HvhConfig.h"
 #include <algorithm>
 #include <array>
 #include <iomanip>
@@ -678,7 +679,9 @@ void Misc::nadePredict() noexcept
     static auto nadeVar{ interfaces.getCvar().findVar(csgo::cl_grenadepreview) };
 
     nadeVar->onChangeCallbacks.size = 0;
-    csgo::ConVar::from(retSpoofGadgets->client, nadeVar).setValue(miscConfig.nadePredict);
+    // Игровая зелёная линия (cl_grenadepreview) — только если своё предсказание ECLIPSE выключено: вместе они
+    // рисовали две траектории друг поверх друга
+    csgo::ConVar::from(retSpoofGadgets->client, nadeVar).setValue(miscConfig.nadePredict && !hvh::config.view.grenadePrediction);
 }
 
 void Misc::fixTabletSignal() noexcept

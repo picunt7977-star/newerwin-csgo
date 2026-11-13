@@ -274,6 +274,11 @@ struct DefensiveConfig {
     // Минимум тиков между рывками (у NL это `command_number % mode_duration`, по умолчанию 8).
     // Не даёт жечь заряд очередью рывков, когда триггер висит всё время
     int interval = 8;
+    // Рывок зарядом DT, когда враг нас только увидел (или вот-вот увидит). Нужен в связке «DT в режиме
+    // дефенсив + окна чоком»: там заряд DT (до 14 тиков) копился и лежал без дела — чоковая пачка лагкомп
+    // не ломает (за 12 тиков проходим < 64 ед.), а настоящего сдвига с откатом тикбейса не было вовсе.
+    // Лог 13.11: из 79 попаданий по нам 54 пришлись на «заряд есть, окна нет».
+    bool peekShift = false;
 };
 
 struct ExploitConfig {
@@ -291,6 +296,10 @@ struct ExploitConfig {
     // 0 — не ограничивать (как было до 11.11). Ставить, только если сервер правда режет: общий лимит
     // в 6 сломал фейкдак (ему нужен чок ~14) и дёргал модель — сервер такие пачки принимал
     int serverPackLimit = 0;
+    // Latency spoof (фейк-пинг): серверу подтверждаем его пакеты с опозданием — он считает наш пинг больше
+    // и откатывает врагов дальше (бектрек до ~0.4 с вместо 0.2). Свою картинку при этом видим свежей.
+    bool fakeLatency = false;
+    int fakeLatencyMs = 150;        // сколько добавить к пингу, мс (сервер всё равно режет откат по sv_maxunlag)
     // Нож в руках, в прыжке и включён DT — никаких лагов (фейклаг, лаг-пик, дефенсив): прыжки с ножом
     // идут ровно, без рывков модели
     bool knifeAirNoLag = true;
@@ -326,12 +335,17 @@ struct ViewConfig {
     bool showFakeAngles = true;     // в 3-м лице модель показывает то, что видит сервер
     bool serverModel = true;        // в 3-м лице поверх — модель, как её видит сервер (десинк, roll)
     float serverModelColor[4]{ 0.55f, 0.7f, 1.0f, 0.4f };
+    bool backtrackChams = false;    // на враге — призрак его прошлой позы, в которую рейдж ещё может попасть
+    bool backtrackChamsHidden = true;   // и сквозь стены
+    float backtrackChamsColor[4]{ 0.85f, 0.55f, 1.0f, 0.35f };
     bool serverBox = true;          // на чоке (лаг-пик, фейклаг) — хитбокс там, где модель стоит на сервере
     float serverBoxColor[4]{ 1.0f, 0.45f, 0.35f, 0.9f };
     bool grenadePrediction = true;  // траектория гранаты в руке
     float dormantTime = 6.0f;       // сколько секунд держать ESP игрока, пропавшего из PVS
     bool syncRender = true;         // mat_queue_mode 0: кадр и ESP из одного тика, без дёрганья
-    bool screenLogs = true;         // попадания/промахи коротко в левом верхнем углу
+    bool screenLogs = true;         // худ «Notifications»: попадания/промахи/урон по нам/evaded
+    float logsX = 0.5f;             // где худ уведомлений: x — центр (в долях экрана; левее трети — по левому краю)
+    float logsY = 0.68f;            // ...y — верх ленты; таскается мышью при открытом меню
     bool watermark = true;          // ватермарка NewerWin: пилюля сверху по центру
     bool hotkeys = true;            // панель «Hotkeys»: активные бинды (DT, хайдшоты, фейкдак...)
     float hotkeysX = 0.012f;        // позиция панели в долях экрана (таскается мышью при открытом меню)
@@ -350,6 +364,22 @@ struct ViewConfig {
     float sparkColor[4]{ 1.0f, 0.62f, 0.2f, 1.0f };
     int sparkCount = 18;            // искр на одно попадание пули
     float sparkSize = 1.0f;         // множитель скорости разлёта / длины хвостов
+    // 13.11 — новое (HvhVisuals.cpp, стиль Hud.h)
+    bool offscreenArrows = true;    // стрелки вокруг прицела на врагов, которых нет на экране
+    int arrowRadius = 190;          // радиус кольца стрелок, пиксели
+    bool hitMarker = true;          // хитмаркер у прицела при попадании (красный — в голову)
+    bool bulletTracers = true;      // линия своей пули до точки попадания
+    float tracerColor[4]{ 0.30f, 0.49f, 0.96f, 1.0f };
+    bool localTrail = false;        // светящийся след за собой
+    float trailColor[4]{ 0.30f, 0.49f, 0.96f, 1.0f };
+    bool grenadeWarning = true;     // метка на летящей вражеской гранате: тип, дистанция, красная — заденет
+    bool zeusRange = true;          // с зевсом в руках — круг его дальности на земле
+    bool seenWarning = true;        // «SEEN» под прицелом, когда нас видит враг
+    bool espSmoothHealth = true;    // полоска хп врага убывает плавно, снятый урон на миг остаётся белым
+    bool espAmmoBar = true;         // под рамкой врага — полоска патронов (при перезарядке — жёлтая)
+    bool espDistance = false;       // под рамкой — дистанция в метрах
+    bool espGlowBox = true;         // мягкое свечение вокруг рамки врага её же цветом
+    bool espSoftFill = true;        // рамка врага залита мягким градиентом её же цвета (снизу плотнее, сверху пусто)
     // из hysteria (Extras.cpp)
     bool aspectRatio = false;
     float aspectRatioValue = 1.5f;  // 1.25 — 5:4, 1.33 — 4:3, 1.5 — 3:2, 1.6 — 16:10, 1.78 — 16:9
@@ -360,6 +390,8 @@ struct ViewConfig {
     int scopeSize = 40;
     int scopeGap = 10;
     bool scopeT = false;            // без верхней линии
+    bool scopeInvert = false;       // «инвертор»: градиент наоборот — у центра прозрачно, к концу ярко
+    int scopeThickness = 4;         // не используется (был клин инвертора), оставлено ради старых конфигов
     bool damageIndicator = false;   // мин. урон у прицела
     bool shotMarkers = false;       // метки в мире: куда попал / где пуля прошла мимо
     bool missMarkers = false;
@@ -436,6 +468,23 @@ struct WorldConfig {
     float fogDensity = 0.5f;
     bool ambient = false;           // подсветка (mat_ambient_light_*)
     float ambientColor[3]{ 0.05f, 0.05f, 0.1f };
+
+    // погода: частицы вокруг камеры (рисуются оверлеем, под открытым небом)
+    int weather = 0;                // 0 выкл, 1 снег, 2 дождь, 3 светлячки, 4 пепел
+    int particles = 260;
+    float particleColor[4]{ 1.0f, 1.0f, 1.0f, 0.85f };
+    float particleSize = 1.0f;
+    float particleRadius = 750.0f;
+
+    // свет
+    bool tonemap = false;           // свой блум и экспозиция (env_tonemap_controller карты)
+    float bloom = 2.0f;
+    float exposure = 1.0f;
+    bool modelBrightness = false;   // r_modelAmbientMin — модели не тонут в темноте
+    float modelAmbient = 1.0f;
+    bool sunOverride = false;       // своё положение солнца: куда падают тени (cl_csm_rot_*)
+    float sunPitch = 50.0f;         // высота солнца, 90 — в зените
+    float sunYaw = 0.0f;            // сторона света
 };
 
 struct Config {

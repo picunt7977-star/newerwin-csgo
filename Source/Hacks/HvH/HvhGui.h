@@ -105,6 +105,8 @@ void drawIndicators(ImDrawList* drawList) noexcept;
 // HUD: ватермарка сверху справа и панель клавиш с активными биндами
 void drawWatermark(ImDrawList* drawList) noexcept;
 void drawHotkeys(ImDrawList* drawList, bool menuOpen) noexcept;
+// худ «Notifications»: лента попаданий/промахов (NL/hysteria), таскается мышью при открытом меню
+void drawNotifications(ImDrawList* drawList, bool menuOpen) noexcept;
 
 void drawRageTab() noexcept;
 // выбранная группа оружия рейджа (выпадашка в шапке) и страница AA (подпункты сайдбара)

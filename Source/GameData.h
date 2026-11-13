@@ -35,6 +35,9 @@ namespace GameData
     void clearProjectileList() noexcept;
     void clearTextures() noexcept;
     void clearUnusedAvatars() noexcept;
+    // иконка оружия по имени класса без "weapon_" (ak47, ssg08...): PNG из build/weapon_icons
+    // (tools/weapon_icons.py достаёт их из игры). nullptr — иконки нет. aspect = ширина / высота. Под Lock.
+    [[nodiscard]] void* weaponIcon(const std::string& name, float& aspect) noexcept;
 
     class Lock {
     public:
@@ -125,6 +128,7 @@ struct PlayerData : BaseData {
     void update(const EngineInterfaces& engineInterfaces, const OtherInterfaces& interfaces, const Memory& memory, const csgo::Entity& entity) noexcept;
     [[nodiscard]] ImTextureID getAvatarTexture() const noexcept;
     [[nodiscard]] float fadingAlpha(const Memory& memory) const noexcept;
+    [[nodiscard]] float fadingAlphaAt(float realtime) const noexcept;
 
     bool dormant;
     bool enemy = false;
@@ -143,6 +147,7 @@ struct PlayerData : BaseData {
     csgo::Vector headMins, headMaxs;
     csgo::Vector origin;
     std::string activeWeapon;
+    std::string weaponIcon;     // класс оружия без "weapon_" — имя иконки
     // для флагов ESP и снаряжения по Tab (у дорманта — последнее известное)
     int index = 0;
     int armor = 0;
@@ -152,6 +157,8 @@ struct PlayerData : BaseData {
     bool scoped = false;
     bool defusing = false;
     bool reloading = false;
+    int clip = -1;                  // патроны в магазине активного оружия (−1 — нож/граната/нет данных)
+    int maxClip = 0;
     bool hasBomb = false;
     std::vector<std::pair<csgo::Vector, csgo::Vector>> bones;
     // поза скелета относительно origin прошлого кадра — для сглаживания джиттера вражеского AA
@@ -167,6 +174,7 @@ struct WeaponData : BaseData {
     const char* group = "All";
     const char* name = "All";
     std::string displayName;
+    std::string icon;           // класс оружия без "weapon_" — имя иконки
 };
 
 struct LootCrateData : BaseData {

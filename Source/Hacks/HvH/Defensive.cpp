@@ -600,7 +600,11 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
     // только условие про полный заряд, и в режиме «чоком» триггер «пик» не срабатывал никогда:
     // заряда в нём нет по определению, так что дефенсив открывал окна только когда нас уже увидели.
     const bool canOpen = ownWindows && left == 0 && (chokeStyle || tickbase::chargedTicks() >= chargeTarget);
-    const bool wantPeek = (cfg.triggers & DefPeek) && canOpen;
+    // «Рывок зарядом DT на пике»: DT в режиме дефенсив, заряд набран, автопик не держит его под телепорт
+    const bool peekShiftReady = cfg.peekShift && chokeStyle && tickbase::doubleTapEnabled()
+        && tickbase::chargedTicks() >= chargeTarget && left == 0
+        && !(config.movement.autoPeekKey.isSet() && config.movement.autoPeekKey.isDown());
+    const bool wantPeek = ((cfg.triggers & DefPeek) && canOpen) || peekShiftReady;
     const Sight sight = look(cmd, engineInterfaces, clientInterfaces, memory, wantPeek);
     nearestEnemy = sight.nearest;
     tickbase::setThreat(sight.sees);
@@ -659,7 +663,18 @@ void update(csgo::UserCmd* cmd, const EngineInterfaces& engineInterfaces, const 
         // Отдельный «рывок» тут не нужен: каждая отправленная пачка и есть окно, а интервал между
         // окнами равен длине чока.
         tickbase::setDefensiveCharge(0, cfg.chargeSpread);
-        tickbase::setDefensiveChoke(trigger && probing ? chargeTarget : 0);
+        // Враг только что увидел нас (или увидит через пару тиков), а заряд DT лежит — тратим его на
+        // настоящий сдвиг: сервер откатит тикбейс, и записи лагкомпа по нам на это время не будет.
+        // Не когда рейдж целится (рывок перед выстрелом откатил бы наш тикбейс) и не чаще интервала.
+        const bool pulse = peekShiftReady && probing && !aiming && (sight.peeking || sight.justSeen)
+            && peekPhase != PeekPhase::Holding && !landingSoon && shiftWindow == 0
+            && sincePulse >= std::max(cfg.interval, 1) && !tickbase::knifeAirQuiet();
+        if (pulse) {
+            tickbase::requestShift(0, true);
+            sincePulse = 0;
+        }
+        // на тике рывка свой чок не копим: «чок + сдвиг» длиннее, чем сервер обработает за раз
+        tickbase::setDefensiveChoke(trigger && probing && !pulse ? chargeTarget : 0);
     } else {
         // ---- заряд пропуском тиков ----
         // Копим заранее: рывок делается только с полным зарядом (в NL force_defensive ставится лишь

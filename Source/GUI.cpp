@@ -757,7 +757,12 @@ void espPage(Config& config, float width) noexcept
             combo("Цвет полоски", &p.healthBar.type, hpTypes, IM_ARRAYSIZE(hpTypes));
             if (p.healthBar.type == HealthBar::Solid)
                 colorEdit("Цвет", p.healthBar.asColor4().color.data());
+            toggle("Плавная полоска хп", &hvh::config.view.espSmoothHealth);
         }
+        toggle("Мягкая заливка рамки", &hvh::config.view.espSoftFill);
+        toggle("Свечение рамки", &hvh::config.view.espGlowBox);
+        toggle("Полоска патронов", &hvh::config.view.espAmmoBar);
+        toggle("Дистанция", &hvh::config.view.espDistance);
     }
     endGroup();
     ImGui::Dummy({ 0.0f, 10.0f });
@@ -953,6 +958,18 @@ void simpleChams(Config& config, Advanced advancedUi) noexcept
     toggle("Свечение сквозь стены", &glowHidden.enabled);
     if (glowHidden.enabled)
         colorEdit("Цвет свечения за стеной", glowHidden.color.color.data());
+
+    // прошлая поза врага из записей рейджа: туда рейдж может выстрелить бектреком
+    if (target == 1) {
+        auto& view = hvh::config.view;
+        toggle("Бектрек (куда может стрелять рейдж)", &view.backtrackChams);
+        if (view.backtrackChams) {
+            toggle("Бектрек сквозь стены", &view.backtrackChamsHidden);
+            colorEdit("Цвет бектрека", view.backtrackChamsColor);
+            if (!hvh::config.rage.enabled)
+                ImGui::TextDisabled("Рисуется, только когда включён рейдж");
+        }
+    }
 
     ImGui::Dummy({ 0.0f, 6.0f });
     static bool advanced = false;

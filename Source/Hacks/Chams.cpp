@@ -73,7 +73,7 @@ bool Chams::render(Backtrack& backtrack, void* ctx, void* state, const csgo::Mod
     return appliedChams;
 }
 
-void Chams::drawGhost(void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones, const float rgba[4]) noexcept
+void Chams::drawGhost(void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* bones, const float rgba[4], bool ignoreZ) noexcept
 {
     if (!modelRenderHooks || !bones)
         return;
@@ -82,10 +82,11 @@ void Chams::drawGhost(void* ctx, void* state, const csgo::ModelRenderInfo& info,
         return;
     material.colorModulate(rgba[0], rgba[1], rgba[2]);
     material.alphaModulate(rgba[3]);
-    material.setMaterialVarFlag(MaterialVarFlag::IGNOREZ, false);
+    material.setMaterialVarFlag(MaterialVarFlag::IGNOREZ, ignoreZ);
     material.setMaterialVarFlag(MaterialVarFlag::WIREFRAME, false);
     interfaces.getStudioRender().forcedMaterialOverride(material.getPOD());
     modelRenderHooks->getOriginalDrawModelExecute()(std::get<csgo::ModelRenderPOD*>(engineInterfaces.getPODs()), ctx, state, &info, bones);
+    material.setMaterialVarFlag(MaterialVarFlag::IGNOREZ, false);
     interfaces.getStudioRender().forcedMaterialOverride(nullptr);
 }
 

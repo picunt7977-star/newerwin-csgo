@@ -9,12 +9,21 @@ namespace hvh::tickbase
 // Ставит детур на CL_Move в engine_client.so и делает bSendPacket управляемым.
 bool install(std::span<const std::byte> engineCode) noexcept;
 void uninstall() noexcept;
+// Latency spoof: раз в тик из CreateMove — ставит/снимает хук SendDatagram на текущий netchan и пишет
+// историю входящих номеров пакетов. networkChannel — engine->getNetworkChannel() (может быть nullptr)
+void updateFakeLatency(void* networkChannel, bool loopback) noexcept;
+// сколько секунд спуфа сервер сейчас видит сверху настоящего пинга (0 — выкл/не работает) — для окна бектрека
+[[nodiscard]] float fakeLatencySeconds() noexcept;
 [[nodiscard]] bool isInstalled() noexcept;
 
 // Решение на текущую команду: true — пакет уйдёт, false — команда чокается.
 // Принимается в начале CL_Move, до CreateMove, поэтому антиаим уже знает, какой это тик.
 [[nodiscard]] bool sendPacket() noexcept;
 [[nodiscard]] int chokedCommands() noexcept;
+// На сколько тиков сервер откатит наш тикбейс для выстрела ЭТОГО тика (быстрый DT: сдвиг идёт за
+// выстрелом той же пачкой). Выстрел выполнится на сервере на столько тиков «раньше» — от этого времени
+// сервер и считает окно отката врагов
+[[nodiscard]] int shotRollbackTicks() noexcept;
 
 // Рейджбот сообщает о выстреле — DT сдвигает заряженные тики сразу после него
 void onShot() noexcept;
@@ -90,6 +99,8 @@ void setProcessLimit(int ticks) noexcept;
 // тики, и пропущенный тик приземления съедает прыжок распрыжки
 // horizontalSpeed — для плавной перезарядки дефенсива в движении (заряд через тик, а не замирание на 13)
 void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float horizontalSpeed, float interval) noexcept;
+// зажат ли WASD (кнопки игрока, до автостопа/автопика): стоя с зажатым WASD — трогаемся, тики под заряд не рвём
+void setMoveInput(bool held) noexcept;
 // Дефенсив может тратить заряд: детур стоит, мы живы, не фейкдак и заряд не занят второй пулей DT
 // (быстрая стрельба). Сам DT для дефенсива не нужен — у него свой заряд
 [[nodiscard]] bool defensiveAllowed() noexcept;

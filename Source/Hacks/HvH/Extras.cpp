@@ -13,6 +13,7 @@
 #include "Extras.h"
 #include "HvhConfig.h"
 #include "HvhGui.h"
+#include "Hud.h"
 #include "Movement.h"
 #include "Ragebot.h"
 #include "Defensive.h"
@@ -89,29 +90,7 @@ bool minDamageOverridden = false;
 
 float lastTalk = -100.0f;
 
-void shadowText(ImDrawList* d, ImVec2 position, ImU32 color, const char* text) noexcept
-{
-    d->AddText({ position.x + 1.0f, position.y + 1.0f }, IM_COL32(0, 0, 0, 200), text);
-    d->AddText(position, color, text);
-}
-
-ImU32 withAlpha(ImU32 color, float alpha) noexcept
-{
-    const auto a = static_cast<int>(((color >> IM_COL32_A_SHIFT) & 0xFF) * std::clamp(alpha, 0.0f, 1.0f));
-    return (color & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a) << IM_COL32_A_SHIFT);
-}
-
-// рамка как у ватермарки
-void box(ImDrawList* d, ImVec2 pos, ImVec2 size) noexcept
-{
-    const ImVec2 max{ pos.x + size.x, pos.y + size.y };
-    d->AddRectFilled(pos, max, IM_COL32(0, 0, 0, 255));
-    d->AddRectFilled({ pos.x + 1.0f, pos.y + 1.0f }, { max.x - 1.0f, max.y - 1.0f }, IM_COL32(60, 60, 60, 255));
-    d->AddRectFilled({ pos.x + 2.0f, pos.y + 2.0f }, { max.x - 2.0f, max.y - 2.0f }, IM_COL32(19, 19, 19, 235));
-    const float mid = (pos.x + max.x) * 0.5f;
-    d->AddRectFilledMultiColor({ pos.x + 2.0f, pos.y + 2.0f }, { mid, pos.y + 3.0f }, IM_COL32(55, 177, 218, 255), IM_COL32(204, 70, 205, 255), IM_COL32(204, 70, 205, 255), IM_COL32(55, 177, 218, 255));
-    d->AddRectFilledMultiColor({ mid, pos.y + 2.0f }, { max.x - 2.0f, pos.y + 3.0f }, IM_COL32(204, 70, 205, 255), IM_COL32(204, 227, 54, 255), IM_COL32(204, 227, 54, 255), IM_COL32(204, 70, 205, 255));
-}
+using hud::withAlpha;
 
 void drawScope(ImDrawList* d, ImVec2 center) noexcept
 {
@@ -120,12 +99,14 @@ void drawScope(ImDrawList* d, ImVec2 center) noexcept
     const float size = static_cast<float>(v.scopeSize);
     const ImU32 solid = ui::color::accent;
     const ImU32 clear = withAlpha(ui::color::accent, 0.0f);
-    // от центра наружу гаснет
-    d->AddRectFilledMultiColor({ center.x + gap, center.y }, { center.x + gap + size, center.y + 1.0f }, solid, clear, clear, solid);
-    d->AddRectFilledMultiColor({ center.x - gap - size, center.y }, { center.x - gap, center.y + 1.0f }, clear, solid, solid, clear);
-    d->AddRectFilledMultiColor({ center.x, center.y + gap }, { center.x + 1.0f, center.y + gap + size }, solid, solid, clear, clear);
+    // обычный: от центра наружу гаснет; инвертор — то же самое наоборот: у центра прозрачно, к концу ярко
+    const ImU32 inner = v.scopeInvert ? clear : solid;
+    const ImU32 outer = v.scopeInvert ? solid : clear;
+    d->AddRectFilledMultiColor({ center.x + gap, center.y }, { center.x + gap + size, center.y + 1.0f }, inner, outer, outer, inner);
+    d->AddRectFilledMultiColor({ center.x - gap - size, center.y }, { center.x - gap, center.y + 1.0f }, outer, inner, inner, outer);
+    d->AddRectFilledMultiColor({ center.x, center.y + gap }, { center.x + 1.0f, center.y + gap + size }, inner, inner, outer, outer);
     if (!v.scopeT)
-        d->AddRectFilledMultiColor({ center.x, center.y - gap - size }, { center.x + 1.0f, center.y - gap }, clear, clear, solid, solid);
+        d->AddRectFilledMultiColor({ center.x, center.y - gap - size }, { center.x + 1.0f, center.y - gap }, outer, outer, inner, inner);
 }
 
 void drawMarkers(ImDrawList* d) noexcept
@@ -148,15 +129,13 @@ void drawMarkers(ImDrawList* d) noexcept
         const float alpha = 1.0f - t * t;
         constexpr float s = 4.0f;
         if (m.hit) {
-            const ImU32 col = withAlpha(ui::color::accent, alpha);
-            d->AddLine({ screen.x - s, screen.y }, { screen.x + s + 1.0f, screen.y }, withAlpha(IM_COL32(0, 0, 0, 255), alpha), 3.0f);
-            d->AddLine({ screen.x, screen.y - s }, { screen.x, screen.y + s + 1.0f }, withAlpha(IM_COL32(0, 0, 0, 255), alpha), 3.0f);
-            d->AddLine({ screen.x - s, screen.y }, { screen.x + s + 1.0f, screen.y }, col, 1.0f);
-            d->AddLine({ screen.x, screen.y - s }, { screen.x, screen.y + s + 1.0f }, col, 1.0f);
+            // попадание — зелёный плюс
+            hud::line(d, { screen.x - s, screen.y }, { screen.x + s + 1.0f, screen.y }, hud::color::good, alpha, 1.0f);
+            hud::line(d, { screen.x, screen.y - s }, { screen.x, screen.y + s + 1.0f }, hud::color::good, alpha, 1.0f);
         } else {
-            const ImU32 col = withAlpha(ui::color::bad, alpha);
-            d->AddLine({ screen.x - s, screen.y - s }, { screen.x + s, screen.y + s }, col, 1.5f);
-            d->AddLine({ screen.x - s, screen.y + s }, { screen.x + s, screen.y - s }, col, 1.5f);
+            // пуля прошла мимо — красный крестик
+            hud::line(d, { screen.x - s, screen.y - s }, { screen.x + s, screen.y + s }, hud::color::bad, alpha, 1.0f);
+            hud::line(d, { screen.x - s, screen.y + s }, { screen.x + s, screen.y - s }, hud::color::bad, alpha, 1.0f);
         }
     }
 }
@@ -312,41 +291,40 @@ void draw(ImDrawList* d) noexcept
     if (v.customScope && localPlayer.get().isScoped())
         drawScope(d, center);
 
+    // ---- индикаторы у прицела: один стиль (Hud.h), всё по центру, сверху вниз ----
+    ImFont* font = hud::smallFont();
+
+    // мин. урон — справа-сверху от прицела; цветом акцента, когда его держит бинд
     if (v.damageIndicator && config.rage.enabled && minDamage > 0) {
         char text[16];
         if (minDamage > 100)
             std::snprintf(text, sizeof(text), "HP+%d", minDamage - 100);
         else
             std::snprintf(text, sizeof(text), "%d", minDamage);
-        shadowText(d, { center.x + 8.0f, center.y - 8.0f - ImGui::GetFontSize() }, minDamageOverridden ? ui::color::accent : withAlpha(ui::color::text, 0.7f), text);
+        hud::text(d, font, { center.x + 8.0f, center.y - 8.0f - font->FontSize }, minDamageOverridden ? hud::accent() : hud::color::dim, text);
     }
 
+    // замедление после попадания по нам — над прицелом: подпись и полоска «сколько скорости осталось»
     if (v.slowdownWarning) {
         const float modifier = localPlayer.get().velocityModifier();
         if (modifier < 0.99f && modifier >= 0.0f) {
             char text[48];
-            std::snprintf(text, sizeof(text), "замедление %.0f%%", (1.0f - modifier) * 100.0f);
-            const float width = 120.0f;
-            const ImVec2 at{ center.x - width * 0.5f, center.y - display.y * 0.22f };
-            const auto size = ImGui::CalcTextSize(text);
-            shadowText(d, { center.x - size.x * 0.5f, at.y }, IM_COL32(255, 255, 255, 255), text);
-            const float barY = at.y + size.y + 3.0f;
-            d->AddRectFilled({ at.x - 1.0f, barY - 1.0f }, { at.x + width + 1.0f, barY + 4.0f }, IM_COL32(0, 0, 0, 200));
-            d->AddRectFilled({ at.x, barY }, { at.x + width * modifier, barY + 3.0f }, ui::lerpColor(ui::color::bad, ui::color::accent, modifier));
+            std::snprintf(text, sizeof(text), "SLOW %.0f%%", (1.0f - modifier) * 100.0f);
+            constexpr float width = 96.0f;
+            const float y = center.y - display.y * 0.22f;
+            hud::textCentered(d, font, { center.x, y }, hud::color::warn, text);
+            hud::bar(d, { center.x - width * 0.5f, y + font->FontSize + 4.0f }, width, 3.0f, modifier, ui::lerpColor(hud::color::bad, hud::color::good, modifier));
         }
     }
 
+    // окно дефенсива — под прицелом: «LC» зелёным и полоска, пока сервер не пишет по нам лагкомп
     if (v.lcIndicator) {
         const int left = defensive::windowLeft();
-        const char* text = "LC";
-        const auto size = ImGui::CalcTextSize(text);
-        const ImVec2 at{ center.x - size.x * 0.5f, center.y + display.y * 0.18f };
-        shadowText(d, at, left > 0 ? ui::color::good : withAlpha(ui::color::text, 0.35f), text);
+        const float y = center.y + display.y * 0.18f;
+        hud::textCentered(d, font, { center.x, y }, left > 0 ? hud::color::good : withAlpha(hud::color::dim, 0.5f), "LC");
         if (left > 0) {
-            const float width = 40.0f;
-            const float barY = at.y + size.y + 2.0f;
-            d->AddRectFilled({ center.x - width * 0.5f - 1.0f, barY - 1.0f }, { center.x + width * 0.5f + 1.0f, barY + 3.0f }, IM_COL32(0, 0, 0, 200));
-            d->AddRectFilled({ center.x - width * 0.5f, barY }, { center.x - width * 0.5f + width * std::min(left / 14.0f, 1.0f), barY + 2.0f }, ui::color::good);
+            constexpr float width = 40.0f;
+            hud::bar(d, { center.x - width * 0.5f, y + font->FontSize + 3.0f }, width, 3.0f, static_cast<float>(left) / 14.0f, hud::color::good);
         }
     }
 }

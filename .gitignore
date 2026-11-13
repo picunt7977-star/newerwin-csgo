@@ -336,3 +336,4 @@ ASALocalRun/
 /build/
 /logs/
 /rage-prompt.md
+/.claude/

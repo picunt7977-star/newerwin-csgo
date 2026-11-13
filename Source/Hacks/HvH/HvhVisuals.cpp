@@ -10,12 +10,14 @@
 #include <random>
 #include <string_view>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <imgui/imgui.h>
 
 #include "HvhConfig.h"
 #include "HvhGui.h"
+#include "Hud.h"
 #include "AntiAim.h"
 #include "HvhVisuals.h"
 #include "Ragebot.h"
@@ -28,6 +30,8 @@
 #include <fnv.h>
 #include <Netvars.h>
 #include <Interfaces/ClientInterfaces.h>
+#include <Interfaces/EngineInterfaces.h>
+#include <CSGO/EngineTrace.h>
 #include <Interfaces/OtherInterfaces.h>
 #include <CSGO/ConVar.h>
 #include <CSGO/Cvar.h>
@@ -114,38 +118,38 @@ std::vector<Spark> sparks;
 std::vector<ImpactFlash> impactFlashes;
 std::minstd_rand sparkRng{ 1337 };
 
-[[nodiscard]] ImU32 withAlpha(ImU32 color, float alpha) noexcept
-{
-    const auto a = static_cast<unsigned>(std::clamp(alpha, 0.0f, 1.0f) * static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFF));
-    return (color & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
-}
+// трассеры своих пуль (под impactMutex) и последнее попадание для хитмаркера (поток рендера)
+struct Tracer {
+    csgo::Vector from, to;
+    double at;      // < 0 — ещё не показан: время ставит поток рендера
+};
+std::vector<Tracer> tracers;
+struct HitMark {
+    double at = -10.0;
+    int damage = 0;
+    bool headshot = false;
+};
+HitMark lastHit;
+// след за собой
+struct TrailPoint {
+    csgo::Vector position;
+    double at;
+};
+std::vector<TrailPoint> trail;
+std::atomic<bool> holdingZeus = false;
+std::atomic<float> zeusReach = 0.0f;
 
-// текст с чёрной тенью — читается на любом фоне
-// мелкий Noto с контуром — как имена и оружие в ESP
-[[nodiscard]] ImFont* espFont() noexcept
-{
-    return ui::fonts.uiSmall ? ui::fonts.uiSmall : ui::fonts.menu;
-}
+// всё рисуется общим стилем из Hud.h; короткие имена — для этого файла
+using hud::withAlpha;
 
 void shadowText(ImDrawList* drawList, ImVec2 position, ImU32 color, const char* text) noexcept
 {
-    ImFont* font = espFont();
-    const float size = font ? font->FontSize : ImGui::GetFontSize();
-    const ImU32 outline = withAlpha(IM_COL32(0, 0, 0, 255), ((color >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f * 0.85f);
-    position = { std::floor(position.x), std::floor(position.y) };
-    drawList->AddText(font, size, { position.x + 1.0f, position.y }, outline, text);
-    drawList->AddText(font, size, { position.x - 1.0f, position.y }, outline, text);
-    drawList->AddText(font, size, { position.x, position.y + 1.0f }, outline, text);
-    drawList->AddText(font, size, { position.x, position.y - 1.0f }, outline, text);
-    drawList->AddText(font, size, position, color, text);
+    hud::text(drawList, hud::smallFont(), position, color, text);
 }
 
 [[nodiscard]] ImVec2 textSize(const char* text) noexcept
 {
-    ImFont* font = espFont();
-    if (!font)
-        return ImGui::CalcTextSize(text);
-    return font->CalcTextSizeA(font->FontSize, FLT_MAX, 0.0f, text);
+    return hud::measure(hud::smallFont(), text);
 }
 
 // экранная рамка игрока по его коробке (как у ESP)
@@ -164,6 +168,34 @@ void shadowText(ImDrawList* drawList, ImVec2 position, ImU32 color, const char* 
     return true;
 }
 
+// ---------- флаги справа от рамки игрока ----------
+// Столбик коротких меток. Цвет — по смыслу (см. Hud.h): белое — снаряжение, голубое — что враг делает,
+// жёлтое — «сейчас уязвим», красное — опасность, акцент — эксплойты, зелёное — «убиваем».
+
+struct FlagLine {
+    ImU32 color;
+    char text[32];
+};
+using FlagList = std::array<FlagLine, 12>;
+
+void addFlag(FlagList& list, int& count, ImU32 color, const char* text) noexcept
+{
+    if (count >= static_cast<int>(list.size()))
+        return;
+    list[count].color = color;
+    std::snprintf(list[count].text, sizeof(list[count].text), "%s", text);
+    ++count;
+}
+
+void drawFlagColumn(ImDrawList* drawList, ImVec2 position, const FlagList& list, int count) noexcept
+{
+    const float lineHeight = hud::smallFont()->FontSize + 1.0f;
+    for (int i = 0; i < count; ++i) {
+        shadowText(drawList, position, list[i].color, list[i].text);
+        position.y += lineHeight;
+    }
+}
+
 void drawFlags(ImDrawList* drawList, const PlayerData& player, float realtime) noexcept
 {
     const int flags = config.view.espFlags;
@@ -175,70 +207,71 @@ void drawFlags(ImDrawList* drawList, const PlayerData& player, float realtime) n
 
     const auto view = ragebot::targetView(player.index);
     const bool fresh = realtime - view.updatedAt < 0.5f;
-    float y = min.y;
-    const auto flag = [&](ImU32 color, const char* text) {
-        shadowText(drawList, { max.x + 4.0f, y }, color, text);
-        y += textSize(text).y;
-    };
+    FlagList list;
+    int count = 0;
     char buffer[32];
     if ((flags & FlagArmor) && player.armor > 0)
-        flag(IM_COL32(230, 230, 230, 255), player.helmet ? "HK" : "K");
+        addFlag(list, count, hud::color::text, player.helmet ? "HK" : "K");
     if (flags & FlagMoney) {
         std::snprintf(buffer, sizeof(buffer), "$%d", player.money);
-        flag(IM_COL32(150, 210, 90, 255), buffer);
+        addFlag(list, count, hud::color::dim, buffer);
     }
     if ((flags & FlagKit) && player.defuser)
-        flag(IM_COL32(90, 170, 255, 255), player.defusing ? "ДЕФЬЮЗ" : "KIT");
+        addFlag(list, count, player.defusing ? hud::color::bad : hud::color::info, player.defusing ? "DEFUSE" : "KIT");
     if ((flags & FlagScoped) && player.scoped)
-        flag(IM_COL32(120, 200, 255, 255), "ZOOM");
+        addFlag(list, count, hud::color::info, "ZOOM");
     if ((flags & FlagReload) && player.reloading)
-        flag(IM_COL32(255, 200, 90, 255), "RELOAD");
+        addFlag(list, count, hud::color::warn, "RELOAD");
     if ((flags & FlagFlashed) && player.flashDuration > 0.5f)
-        flag(IM_COL32(255, 255, 140, 255), "FLASH");
+        addFlag(list, count, hud::color::warn, "FLASH");
     if ((flags & FlagBomb) && player.hasBomb)
-        flag(IM_COL32(255, 90, 90, 255), "C4");
+        addFlag(list, count, hud::color::bad, "C4");
     if (fresh && (flags & FlagDoubleTap) && view.charged)
-        flag(IM_COL32(255, 120, 200, 255), "DT");
+        addFlag(list, count, hud::accent(), "DT");
     if (fresh && (flags & FlagLagComp) && view.breakingLagComp)
-        flag(IM_COL32(255, 80, 80, 255), "LC");
+        addFlag(list, count, hud::color::bad, "LC");
     if (fresh && (flags & FlagResolver) && view.resolver && view.resolver[0]) {
         std::snprintf(buffer, sizeof(buffer), "R: %s", view.resolver);
-        flag(IM_COL32(200, 200, 200, 220), buffer);
+        addFlag(list, count, hud::color::dim, buffer);
     }
     if (fresh && (flags & FlagLethal) && realtime - view.aimAt < 0.3f && view.aimLethal)
-        flag(IM_COL32(255, 60, 60, 255), "LETHAL");
+        addFlag(list, count, hud::color::good, "LETHAL");
+    drawFlagColumn(drawList, { max.x + 5.0f, min.y - 1.0f }, list, count);
 }
 
 // Флаги в предпросмотре меню: пример со всеми включёнными флагами (значения выдуманные)
 void drawPreviewFlagsImpl(ImDrawList* drawList, ImVec2 position) noexcept
 {
     const int flags = config.view.espFlags;
+    FlagList list;
+    int count = 0;
     const auto flag = [&](int bit, ImU32 color, const char* text) {
-        if (!(flags & bit))
-            return;
-        shadowText(drawList, position, color, text);
-        position.y += textSize(text).y;
+        if (flags & bit)
+            addFlag(list, count, color, text);
     };
-    flag(FlagArmor, IM_COL32(230, 230, 230, 255), "HK");
-    flag(FlagMoney, IM_COL32(150, 210, 90, 255), "$4750");
-    flag(FlagKit, IM_COL32(90, 170, 255, 255), "KIT");
-    flag(FlagScoped, IM_COL32(120, 200, 255, 255), "ZOOM");
-    flag(FlagReload, IM_COL32(255, 200, 90, 255), "RELOAD");
-    flag(FlagFlashed, IM_COL32(255, 255, 140, 255), "FLASH");
-    flag(FlagBomb, IM_COL32(255, 90, 90, 255), "C4");
-    flag(FlagDoubleTap, IM_COL32(255, 120, 200, 255), "DT");
-    flag(FlagLagComp, IM_COL32(255, 80, 80, 255), "LC");
-    flag(FlagResolver, IM_COL32(200, 200, 200, 220), "R: слои");
-    flag(FlagLethal, IM_COL32(255, 60, 60, 255), "LETHAL");
+    flag(FlagArmor, hud::color::text, "HK");
+    flag(FlagMoney, hud::color::dim, "$4750");
+    flag(FlagKit, hud::color::info, "KIT");
+    flag(FlagScoped, hud::color::info, "ZOOM");
+    flag(FlagReload, hud::color::warn, "RELOAD");
+    flag(FlagFlashed, hud::color::warn, "FLASH");
+    flag(FlagBomb, hud::color::bad, "C4");
+    flag(FlagDoubleTap, hud::accent(), "DT");
+    flag(FlagLagComp, hud::color::bad, "LC");
+    flag(FlagResolver, hud::color::dim, "R: слои");
+    flag(FlagLethal, hud::color::good, "LETHAL");
+    drawFlagColumn(drawList, position, list, count);
 }
 
+// ---------- куда целится рейдж ----------
+// Точки мультипоинта: зелёная — выстрел сюда убивает, жёлтая — набирает мин. урон.
+// Кольцо — точка, которую рейдж выбрал; красное — туда только что ушёл выстрел.
 void drawAimDot(ImDrawList* drawList, const PlayerData& player, float realtime) noexcept
 {
     if (!config.view.aimDot || !player.enemy || !player.alive || player.dormant)
         return;
     const auto view = ragebot::targetView(player.index);
 
-    // Точки мультипоинта, куда рейдж может выстрелить: зелёные убивают, жёлтые — урон не ниже мин.
     if (const float age = realtime - view.pointsAt; age >= 0.0f && age < 0.3f) {
         const float alpha = 1.0f - age / 0.3f * 0.5f;
         for (int k = 0; k < view.pointCount; ++k) {
@@ -248,14 +281,10 @@ void drawAimDot(ImDrawList* drawList, const PlayerData& player, float realtime) 
             ImVec2 screen;
             if (!Helpers::worldToScreen({ view.points[k][0], view.points[k][1], view.points[k][2] }, screen))
                 continue;
-            const ImU32 color = state == 2 ? IM_COL32(90, 255, 120, 255) : IM_COL32(255, 220, 80, 255);
-            drawList->AddCircleFilled(screen, 6.0f, withAlpha(color, alpha * 0.18f));   // свечение
-            drawList->AddCircleFilled(screen, 3.4f, withAlpha(IM_COL32(0, 0, 0, 255), alpha));
-            drawList->AddCircleFilled(screen, 2.5f, withAlpha(color, alpha));
+            hud::dot(drawList, screen, 2.5f, state == 2 ? hud::color::good : hud::color::warn, alpha);
         }
     }
 
-    // выбранная рейджем точка — кольцо; красное — сюда выстрелили
     const float age = realtime - view.aimAt;
     if (age > 0.25f)
         return;
@@ -263,11 +292,12 @@ void drawAimDot(ImDrawList* drawList, const PlayerData& player, float realtime) 
     if (!Helpers::worldToScreen({ view.aimPoint[0], view.aimPoint[1], view.aimPoint[2] }, screen))
         return;
     const float alpha = 1.0f - age / 0.25f * 0.6f;
-    const ImU32 color = view.aimedNow ? IM_COL32(255, 70, 70, 255) : view.aimLethal ? IM_COL32(90, 255, 120, 255) : IM_COL32(255, 220, 80, 255);
-    drawList->AddCircle(screen, 7.0f, withAlpha(IM_COL32(0, 0, 0, 255), alpha * 0.8f), 16, 3.0f);
-    drawList->AddCircle(screen, 7.0f, withAlpha(color, alpha), 16, 1.5f);
+    const ImU32 color = view.aimedNow ? hud::color::bad : view.aimLethal ? hud::color::good : hud::color::warn;
+    drawList->AddCircle(screen, 7.0f, withAlpha(IM_COL32(0, 0, 0, 255), alpha * 0.8f), 20, 3.0f);
+    drawList->AddCircle(screen, 7.0f, withAlpha(color, alpha), 20, 1.5f);
 }
 
+// Скелет, по которому ушёл выстрел: белый — ждём ответа сервера, зелёный — попал, красный — мимо
 void drawShotSkeleton(ImDrawList* drawList, float realtime) noexcept
 {
     if (!config.view.shotCapsules)
@@ -277,17 +307,17 @@ void drawShotSkeleton(ImDrawList* drawList, float realtime) noexcept
     if (shot.at <= 0.0f || age > 2.5f || age < 0.0f)
         return;
     const float alpha = 1.0f - age / 2.5f;
-    const ImU32 color = shot.result > 0 ? IM_COL32(90, 255, 120, 255) : shot.result < 0 ? IM_COL32(255, 80, 80, 255) : IM_COL32(230, 230, 230, 255);
+    const ImU32 color = shot.result > 0 ? hud::color::good : shot.result < 0 ? hud::color::bad : hud::color::text;
     for (int k = 0; k < shot.count; ++k) {
         ImVec2 sa, sb;
         if (!Helpers::worldToScreen({ shot.a[k][0], shot.a[k][1], shot.a[k][2] }, sa)
             || !Helpers::worldToScreen({ shot.b[k][0], shot.b[k][1], shot.b[k][2] }, sb))
             continue;
-        drawList->AddLine(sa, sb, withAlpha(IM_COL32(0, 0, 0, 255), alpha * 0.8f), 3.0f);
-        drawList->AddLine(sa, sb, withAlpha(color, alpha), 1.5f);
+        hud::line(drawList, sa, sb, color, alpha);
     }
 }
 
+// Цифры урона: выскакивают над врагом жирным, всплывают и гаснут. Красная — в голову.
 void drawDamageNumbers(ImDrawList* drawList) noexcept
 {
     const double now = ImGui::GetTime();
@@ -301,6 +331,7 @@ void drawDamageNumbers(ImDrawList* drawList) noexcept
                 damageNumbers.push_back({ position, event.damage, event.headshot, now });
                 break;
             }
+            lastHit = { now, event.damage, event.headshot };
         }
         pendingDamage.clear();
         if (pendingKill) {
@@ -308,20 +339,23 @@ void drawDamageNumbers(ImDrawList* drawList) noexcept
             killAt = now;
         }
     }
-    std::erase_if(damageNumbers, [now](const DamageNumber& number) { return now - number.at > 1.2; });
+    constexpr double lifetime = 1.2;
+    std::erase_if(damageNumbers, [now](const DamageNumber& number) { return now - number.at > lifetime; });
     if (!config.view.damageNumbers)
         return;
+    ImFont* font = hud::boldFont();
     for (const auto& number : damageNumbers) {
-        const float t = static_cast<float>(now - number.at) / 1.2f;
+        const float age = static_cast<float>(now - number.at);
+        const float t = age / static_cast<float>(lifetime);
         ImVec2 screen;
         if (!Helpers::worldToScreen(number.position, screen))
             continue;
-        screen.y -= t * 40.0f;   // всплывает вверх и гаснет
+        screen.y -= hud::easeOut(age, static_cast<float>(lifetime)) * 44.0f;
         char text[16];
-        std::snprintf(text, sizeof(text), "-%d", number.damage);
-        const ImU32 color = number.headshot ? IM_COL32(255, 70, 70, 255) : IM_COL32(255, 230, 120, 255);
-        const auto size = textSize(text);
-        shadowText(drawList, { screen.x - size.x * 0.5f, screen.y }, withAlpha(color, 1.0f - t * t), text);
+        std::snprintf(text, sizeof(text), "%d", number.damage);
+        const ImU32 color = number.headshot ? hud::color::bad : hud::color::text;
+        const float alpha = t < 0.6f ? 1.0f : 1.0f - (t - 0.6f) / 0.4f;
+        hud::textCentered(drawList, font, screen, withAlpha(color, alpha), text);
     }
 }
 
@@ -483,7 +517,7 @@ void drawFootsteps(ImDrawList* drawList) noexcept
             ++count;
         }
         if (count == segments)
-            drawList->AddPolyline(points, count, withAlpha(IM_COL32(255, 120, 120, 255), (1.0f - t) * 0.9f), ImDrawFlags_Closed, 1.5f);
+            drawList->AddPolyline(points, count, withAlpha(hud::color::bad, (1.0f - t) * 0.9f), ImDrawFlags_Closed, 1.5f);
     }
 }
 
@@ -614,6 +648,18 @@ void onCreateMove(const csgo::UserCmd* cmd) noexcept
         }
     }
     spreadCone = cone;
+
+    // зевс в руках — для круга дальности
+    bool zeus = false;
+    if (localPlayer && localPlayer.get().isAlive()) {
+        if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()
+            && weapon.itemDefinitionIndex() == WeaponId::Taser) {
+            zeus = true;
+            if (const auto data = weapon.getWeaponData())
+                zeusReach = data->range;
+        }
+    }
+    holdingZeus = zeus;
 }
 
 void onDamage(int victimIndex, int damage, bool headshot) noexcept
@@ -625,9 +671,11 @@ void onDamage(int victimIndex, int damage, bool headshot) noexcept
 
 void onImpact(float x, float y, float z, float fromX, float fromY, float fromZ) noexcept
 {
+    std::scoped_lock lock{ impactMutex };
+    if (config.view.bulletTracers && tracers.size() < 48)
+        tracers.push_back({ { fromX, fromY, fromZ }, { x, y, z }, -1.0 });
     if (!config.view.impactSparks)
         return;
-    std::scoped_lock lock{ impactMutex };
     if (pendingImpacts.size() < 32)
         pendingImpacts.push_back({ { x, y, z }, { fromX, fromY, fromZ } });
 }
@@ -733,9 +781,441 @@ void drawServerPosition(ImDrawList* drawList) noexcept
     }
 }
 
+namespace
+{
+
+[[nodiscard]] ImU32 toColor(const float rgba[4]) noexcept
+{
+    return IM_COL32(static_cast<int>(rgba[0] * 255.0f), static_cast<int>(rgba[1] * 255.0f), static_cast<int>(rgba[2] * 255.0f), static_cast<int>(rgba[3] * 255.0f));
+}
+
+// ---------- стрелки на врагов за экраном ----------
+// Вид — наш «наконечник» на кольце вокруг прицела; логика — как у старых стрелок Osiris: направление
+// «по радару» (вперёд — вверх, сзади — вниз, наклон камеры не влияет), стрелка есть, пока враг вне поля
+// зрения, дормант гаснет по таймеру ESP. Чем ближе враг, тем ярче и крупнее; красная — слышно/видно сейчас.
+void drawOffscreenArrows(ImDrawList* drawList, float realtime) noexcept
+{
+    if (!config.view.offscreenArrows || !GameData::local().exists || !GameData::local().alive)
+        return;
+    const auto& matrix = GameData::toScreenMatrix();
+    const auto display = ImGui::GetIO().DisplaySize;
+    const ImVec2 center{ display.x * 0.5f, display.y * 0.5f };
+    const float radius = static_cast<float>(config.view.arrowRadius);
+    const auto& me = GameData::local().origin;
+    // рыскание камеры из матрицы: строка w = глубина вдоль взгляда, т.е. направление вперёд
+    const float yaw = std::atan2(matrix._42, matrix._41);
+    for (const auto& player : GameData::players()) {
+        if (!player.enemy || !player.alive || player.inViewFrustum)
+            continue;
+        const float fade = player.fadingAlphaAt(realtime);
+        if (player.dormant && fade <= 0.0f)
+            continue;
+        const float dx = me.x - player.origin.x, dy = me.y - player.origin.y;
+        ImVec2 direction{ std::cos(yaw) * dy - std::sin(yaw) * dx, std::cos(yaw) * dx + std::sin(yaw) * dy };
+        const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y);
+        if (length < 0.001f)
+            continue;
+        direction = { direction.x / length, direction.y / length };
+
+        const float distance = std::sqrt((player.origin.x - me.x) * (player.origin.x - me.x) + (player.origin.y - me.y) * (player.origin.y - me.y));
+        const float nearness = 1.0f - std::clamp(distance / 2500.0f, 0.0f, 1.0f);
+        const float size = 9.0f + nearness * 7.0f;
+        const float pulse = 0.85f + 0.15f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f + static_cast<float>(player.index));
+        const float alpha = player.dormant ? 0.6f * fade : (0.45f + nearness * 0.55f) * pulse;
+        const ImU32 color = player.dormant ? hud::color::dim : (player.visible || player.audible) ? hud::color::bad : hud::color::text;
+
+        const ImVec2 tip{ center.x + direction.x * (radius + size), center.y + direction.y * (radius + size) };
+        const ImVec2 side{ -direction.y, direction.x };
+        const ImVec2 left{ center.x + direction.x * (radius - size * 0.5f) + side.x * size * 0.75f, center.y + direction.y * (radius - size * 0.5f) + side.y * size * 0.75f };
+        const ImVec2 right{ center.x + direction.x * (radius - size * 0.5f) - side.x * size * 0.75f, center.y + direction.y * (radius - size * 0.5f) - side.y * size * 0.75f };
+        const ImVec2 notch{ center.x + direction.x * radius, center.y + direction.y * radius };
+        // «наконечник»: два треугольника с вырезом сзади + тёмный контур
+        drawList->AddTriangleFilled(tip, left, notch, withAlpha(color, alpha));
+        drawList->AddTriangleFilled(tip, notch, right, withAlpha(color, alpha * 0.75f));
+        const ImVec2 outline[]{ tip, left, notch, right };
+        drawList->AddPolyline(outline, 4, withAlpha(IM_COL32(0, 0, 0, 255), alpha * 0.8f), ImDrawFlags_Closed, 1.0f);
+        if (!player.dormant && nearness > 0.2f) {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%.0fm", distance * 0.01905f);
+            const auto textSizeValue = textSize(text);
+            shadowText(drawList, { notch.x - direction.x * 14.0f - textSizeValue.x * 0.5f, notch.y - direction.y * 14.0f - textSizeValue.y * 0.5f }, withAlpha(hud::color::dim, alpha), text);
+        }
+    }
+}
+
+// ---------- хитмаркер у прицела ----------
+// Четыре штриха разлетаются от прицела и гаснут; рядом — урон. Белый — тело, красный — голова.
+void drawHitMarker(ImDrawList* drawList) noexcept
+{
+    if (!config.view.hitMarker)
+        return;
+    constexpr float lifetime = 0.45f;
+    const float age = static_cast<float>(ImGui::GetTime() - lastHit.at);
+    if (age < 0.0f || age > lifetime)
+        return;
+    const auto display = ImGui::GetIO().DisplaySize;
+    const ImVec2 center{ std::floor(display.x * 0.5f), std::floor(display.y * 0.5f) };
+    const float alpha = 1.0f - (age / lifetime) * (age / lifetime);
+    const float gap = 5.0f + hud::easeOut(age, 0.12f) * 4.0f;
+    constexpr float length = 7.0f;
+    const ImU32 color = lastHit.headshot ? hud::color::bad : hud::color::text;
+    for (const auto& [dx, dy] : { std::pair{ 1.0f, 1.0f }, std::pair{ -1.0f, 1.0f }, std::pair{ 1.0f, -1.0f }, std::pair{ -1.0f, -1.0f } })
+        hud::line(drawList, { center.x + dx * gap, center.y + dy * gap }, { center.x + dx * (gap + length), center.y + dy * (gap + length) }, color, alpha, 1.5f);
+    char text[16];
+    std::snprintf(text, sizeof(text), "%d", lastHit.damage);
+    hud::text(drawList, hud::boldFont(), { center.x + gap + length + 6.0f, center.y - gap - length - 8.0f }, withAlpha(color, alpha), text);
+}
+
+// ---------- трассеры своих пуль ----------
+void drawTracers(ImDrawList* drawList) noexcept
+{
+    const double now = ImGui::GetTime();
+    constexpr double lifetime = 1.4;
+    std::vector<Tracer> copy;
+    {
+        std::scoped_lock lock{ impactMutex };
+        for (auto& tracer : tracers) {
+            if (tracer.at < 0.0)
+                tracer.at = now;
+        }
+        std::erase_if(tracers, [now](const Tracer& tracer) { return now - tracer.at > lifetime; });
+        if (config.view.bulletTracers)
+            copy = tracers;
+    }
+    const ImU32 color = toColor(config.view.tracerColor);
+    for (const auto& tracer : copy) {
+        // начало — чуть впереди и ниже глаза: сам глаз в первом лице на экран не проецируется
+        auto direction = tracer.to - tracer.from;
+        const float length = direction.length();
+        if (length < 48.0f)
+            continue;
+        direction = direction / length;
+        const csgo::Vector start{ tracer.from.x + direction.x * 40.0f, tracer.from.y + direction.y * 40.0f, tracer.from.z + direction.z * 40.0f - 5.0f };
+        ImVec2 a, b;
+        if (!Helpers::worldToScreen(start, a) || !Helpers::worldToScreen(tracer.to, b))
+            continue;
+        const float t = static_cast<float>((now - tracer.at) / lifetime);
+        const float alpha = (1.0f - t * t);
+        drawList->AddLine(a, b, withAlpha(color, alpha * 0.18f), 5.0f);     // ореол
+        drawList->AddLine(a, b, withAlpha(color, alpha * 0.9f), 1.4f);
+        hud::dot(drawList, b, 2.0f, color, alpha);
+    }
+}
+
+// ---------- след за собой ----------
+void drawTrail(ImDrawList* drawList) noexcept
+{
+    const double now = ImGui::GetTime();
+    constexpr double lifetime = 1.6;
+    const auto& local = GameData::local();
+    if (!config.view.localTrail || !local.exists || !local.alive) {
+        trail.clear();
+        return;
+    }
+    if (trail.empty() || (trail.back().position - local.origin).squareLength() > 9.0f)
+        trail.push_back({ local.origin, now });
+    std::erase_if(trail, [now](const TrailPoint& point) { return now - point.at > lifetime; });
+    const ImU32 color = toColor(config.view.trailColor);
+    for (std::size_t i = 1; i < trail.size(); ++i) {
+        // разрыв (телепорт, респаун) не соединяем
+        if ((trail[i].position - trail[i - 1].position).squareLength() > 80.0f * 80.0f)
+            continue;
+        ImVec2 a, b;
+        const csgo::Vector lift{ 0.0f, 0.0f, 2.0f };
+        if (!Helpers::worldToScreen(trail[i - 1].position + lift, a) || !Helpers::worldToScreen(trail[i].position + lift, b))
+            continue;
+        const float alpha = 1.0f - static_cast<float>((now - trail[i].at) / lifetime);
+        drawList->AddLine(a, b, withAlpha(color, alpha * 0.2f), 6.0f);
+        drawList->AddLine(a, b, withAlpha(color, alpha), 2.0f);
+    }
+}
+
+// ---------- метки вражеских гранат ----------
+// На летящей гранате врага — плашка: тип и расстояние до нас. HE и молотов ближе ~350 ед. — красная.
+void drawGrenadeWarnings(ImDrawList* drawList) noexcept
+{
+    if (!config.view.grenadeWarning || !GameData::local().exists || !GameData::local().alive)
+        return;
+    const auto& me = GameData::local().origin;
+    for (const auto& projectile : GameData::projectiles()) {
+        if (!projectile.thrownByEnemy || projectile.exploded || projectile.trajectory.empty() || !projectile.name)
+            continue;
+        const char* label = nullptr;
+        bool dangerous = false;
+        const std::string_view name{ projectile.name };
+        if (name == "HE Grenade") {
+            label = "HE";
+            dangerous = true;
+        } else if (name == "Molotov") {
+            label = "FIRE";
+            dangerous = true;
+        } else if (name == "Flashbang") {
+            label = "FLASH";
+        } else if (name == "Smoke Grenade") {
+            label = "SMOKE";
+        } else {
+            continue;
+        }
+        const auto& position = projectile.trajectory.back().second;
+        const float distance = (position - me).length();
+        const bool close = dangerous && distance < 350.0f;
+        // хвост полёта
+        const std::size_t count = projectile.trajectory.size();
+        for (std::size_t i = count > 12 ? count - 12 : 1; i < count; ++i) {
+            ImVec2 a, b;
+            if (Helpers::worldToScreen(projectile.trajectory[i - 1].second, a) && Helpers::worldToScreen(projectile.trajectory[i].second, b))
+                drawList->AddLine(a, b, withAlpha(close ? hud::color::bad : hud::color::warn, 0.25f + 0.5f * static_cast<float>(i + 12 - count) / 12.0f), 1.5f);
+        }
+        ImVec2 screen;
+        if (!Helpers::worldToScreen(position, screen))
+            continue;
+        char text[32];
+        std::snprintf(text, sizeof(text), "%s  %.0fm", label, distance * 0.01905f);
+        const ImU32 color = close ? hud::color::bad : dangerous ? hud::color::warn : hud::color::dim;
+        const auto size = textSize(text);
+        hud::dot(drawList, screen, 3.0f, color);
+        hud::chip(drawList, { screen.x - size.x * 0.5f - 6.0f, screen.y - size.y - 14.0f }, color, text);
+    }
+}
+
+// ---------- круг дальности зевса ----------
+void drawZeusRange(ImDrawList* drawList) noexcept
+{
+    if (!config.view.zeusRange || !holdingZeus.load() || !GameData::local().exists || !GameData::local().alive)
+        return;
+    const float reach = std::clamp(zeusReach.load(), 100.0f, 400.0f);
+    const auto& origin = GameData::local().origin;
+    constexpr int segments = 64;
+    ImVec2 points[segments];
+    int count = 0;
+    for (int i = 0; i < segments; ++i) {
+        const float angle = 2.0f * 3.14159265f * static_cast<float>(i) / segments;
+        if (!Helpers::worldToScreen({ origin.x + std::cos(angle) * reach, origin.y + std::sin(angle) * reach, origin.z + 2.0f }, points[count]))
+            continue;
+        ++count;
+    }
+    // часть круга за камерой — рисуем то, что видно, отрезками между соседями
+    if (count == segments) {
+        drawList->AddPolyline(points, count, withAlpha(IM_COL32(0, 0, 0, 255), 0.5f), ImDrawFlags_Closed, 3.0f);
+        drawList->AddPolyline(points, count, withAlpha(hud::accent(), 0.9f), ImDrawFlags_Closed, 1.5f);
+    } else {
+        for (int i = 1; i < count; ++i) {
+            const float dx = points[i].x - points[i - 1].x, dy = points[i].y - points[i - 1].y;
+            if (dx * dx + dy * dy < 200.0f * 200.0f)
+                drawList->AddLine(points[i - 1], points[i], withAlpha(hud::accent(), 0.9f), 1.5f);
+        }
+    }
+}
+
+
+// ---------- погода: частицы вокруг камеры ----------
+// Симуляция и трассы — в игровом потоке (stepWeather), отрисовка — в потоке рендера (drawWeather).
+
+enum class Weather { Off, Snow, Rain, Fireflies, Ash };
+
+struct WeatherParticle {
+    csgo::Vector position;
+    csgo::Vector velocity;
+    float phase = 0.0f;
+    float scale = 1.0f;
+    bool checked = false;       // проверка «под открытым небом» уже была
+    bool outdoor = false;
+    bool visible = false;       // виден из глаз (не за стеной)
+};
+
+std::mutex weatherMutex;
+std::vector<WeatherParticle> weatherParticles;
+csgo::Vector weatherEye{};
+float weatherSimTime = 0.0f;    // realtime последнего шага
+int weatherKind = 0;
+std::mt19937 weatherRng{ std::random_device{}() };
+
+float weatherRandom(float min, float max) noexcept
+{
+    return std::uniform_real_distribution<float>{ min, max }(weatherRng);
+}
+
+csgo::Vector weatherVelocity(Weather kind, const WeatherParticle& p, float time) noexcept
+{
+    switch (kind) {
+    case Weather::Snow:
+        return { std::sin(time * 0.7f + p.phase) * 14.0f, std::cos(time * 0.5f + p.phase * 1.3f) * 14.0f, -55.0f * p.scale };
+    case Weather::Rain:
+        return { 40.0f, 12.0f, -950.0f * (0.85f + 0.3f * p.scale) };
+    case Weather::Ash:
+        return { std::sin(time * 0.4f + p.phase) * 9.0f, std::cos(time * 0.3f + p.phase) * 9.0f, -22.0f * p.scale };
+    case Weather::Fireflies:
+        return { std::sin(time * 0.9f + p.phase) * 22.0f, std::cos(time * 0.7f + p.phase * 1.7f) * 22.0f, std::sin(time * 1.3f + p.phase * 0.6f) * 9.0f };
+    default:
+        return {};
+    }
+}
+
+void spawnWeather(WeatherParticle& p, Weather kind, float radius, bool top) noexcept
+{
+    p.position.x = weatherEye.x + weatherRandom(-radius, radius);
+    p.position.y = weatherEye.y + weatherRandom(-radius, radius);
+    if (kind == Weather::Fireflies)
+        p.position.z = weatherEye.z + weatherRandom(-radius * 0.25f, radius * 0.2f);
+    else if (top)
+        p.position.z = weatherEye.z + radius * 0.5f + weatherRandom(0.0f, radius * 0.15f);
+    else
+        p.position.z = weatherEye.z + weatherRandom(-radius * 0.4f, radius * 0.6f);
+    p.phase = weatherRandom(0.0f, 6.2831f);
+    p.scale = weatherRandom(0.6f, 1.4f);
+    p.checked = false;
+    p.outdoor = false;
+    p.visible = false;
+}
+
+constexpr unsigned weatherSolidMask = 0x400B;   // MASK_SOLID_BRUSHONLY
+constexpr unsigned short weatherSurfSky = 0x4;  // SURF_SKY
+
+void drawWeather(ImDrawList* drawList, float realtime) noexcept
+{
+    std::scoped_lock lock{ weatherMutex };
+    const auto& w = config.world;
+    const auto kind = static_cast<Weather>(w.weather);
+    if (kind == Weather::Off || weatherParticles.empty())
+        return;
+    const auto tint = [&w](float alphaScale) {
+        return ImGui::ColorConvertFloat4ToU32({ w.particleColor[0], w.particleColor[1], w.particleColor[2], std::clamp(w.particleColor[3] * alphaScale, 0.0f, 1.0f) });
+    };
+    const float ahead = std::clamp(realtime - weatherSimTime, 0.0f, 0.1f);
+    const float radius = w.particleRadius;
+    for (const auto& p : weatherParticles) {
+        if (!p.visible)
+            continue;
+        const auto position = p.position + p.velocity * ahead;
+        const float distance = (position - weatherEye).length();
+        if (distance < 12.0f || distance > radius * 1.2f)
+            continue;
+        ImVec2 screen;
+        if (!Helpers::worldToScreen(position, screen))
+            continue;
+        // к краю облака тают, вблизи крупнее
+        const float edge = 1.0f - std::clamp((distance - radius * 0.7f) / (radius * 0.4f), 0.0f, 1.0f);
+        const float size = std::clamp(w.particleSize * 260.0f / distance, 0.5f, 7.0f) * p.scale;
+        switch (kind) {
+        case Weather::Snow:
+            drawList->AddCircleFilled(screen, size, tint(edge), 10);
+            break;
+        case Weather::Ash:
+            drawList->AddCircleFilled(screen, size * 0.8f, tint(edge * 0.8f), 6);
+            break;
+        case Weather::Rain: {
+            ImVec2 tail;
+            if (Helpers::worldToScreen(position - p.velocity * 0.02f, tail))
+                drawList->AddLine(tail, screen, tint(edge * 0.55f), std::max(1.0f, size * 0.35f));
+            break;
+        }
+        case Weather::Fireflies: {
+            const float flicker = 0.55f + 0.45f * std::sin(realtime * 3.0f + p.phase * 4.0f);
+            drawList->AddCircleFilled(screen, size * 3.2f, tint(edge * flicker * 0.12f), 16);
+            drawList->AddCircleFilled(screen, size * 0.9f, tint(edge * flicker), 8);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+}
+
+void stepWeather(const EngineInterfaces& engineInterfaces, const Memory& memory) noexcept
+{
+    std::scoped_lock lock{ weatherMutex };
+    const auto& w = config.world;
+    const auto kind = static_cast<Weather>(w.weather);
+    if (kind == Weather::Off || !localPlayer) {
+        weatherParticles.clear();
+        return;
+    }
+    const float realtime = memory.globalVars->realtime;
+    const float dt = memory.globalVars->intervalPerTick;
+    const auto& engineTrace = engineInterfaces.engineTrace();
+    weatherEye = localPlayer.get().getEyePosition();
+    const float radius = w.particleRadius;
+    const auto count = static_cast<std::size_t>(std::clamp(w.particles, 20, 800));
+    if (static_cast<int>(kind) != weatherKind) {
+        weatherParticles.clear();
+        weatherKind = static_cast<int>(kind);
+    }
+    while (weatherParticles.size() < count) {
+        weatherParticles.emplace_back();
+        spawnWeather(weatherParticles.back(), kind, radius, false);
+    }
+    weatherParticles.resize(count);
+
+    const bool needsSky = kind != Weather::Fireflies;
+    for (auto& p : weatherParticles) {
+        p.velocity = weatherVelocity(kind, p, realtime);
+        p.position += p.velocity * dt;
+
+        // держим облако вокруг камеры: ушла за край — переносим на другую сторону
+        bool moved = false;
+        for (int axis = 0; axis < 2; ++axis) {
+            float& c = axis == 0 ? p.position.x : p.position.y;
+            const float center = axis == 0 ? weatherEye.x : weatherEye.y;
+            if (c - center > radius) { c -= radius * 2.0f; moved = true; }
+            else if (center - c > radius) { c += radius * 2.0f; moved = true; }
+        }
+        if (kind == Weather::Fireflies) {
+            if (p.position.z - weatherEye.z > radius * 0.25f) { p.position.z -= radius * 0.45f; moved = true; }
+            else if (weatherEye.z - p.position.z > radius * 0.3f) { p.position.z += radius * 0.45f; moved = true; }
+        } else if (p.position.z < weatherEye.z - radius * 0.45f) {
+            spawnWeather(p, kind, radius, true);
+        } else if (p.position.z > weatherEye.z + radius * 0.75f) {
+            p.position.z -= radius * 1.1f;
+            moved = true;
+        }
+        if (moved)
+            p.checked = false;
+    }
+
+    // трассы порциями: каждый тик часть проверок «небо над головой» и «видно из глаз»
+    int skyBudget = 48;
+    for (auto& p : weatherParticles) {
+        if (skyBudget <= 0)
+            break;
+        if (p.checked)
+            continue;
+        if (needsSky) {
+            csgo::Trace trace;
+            engineTrace.traceRay({ p.position, { p.position.x, p.position.y, p.position.z + 4096.0f } }, weatherSolidMask, { localPlayer.get().getPOD() }, trace);
+            p.outdoor = !trace.startSolid && (trace.fraction >= 0.999f || (trace.surface.flags & weatherSurfSky));
+        } else {
+            p.outdoor = true;
+        }
+        p.checked = true;
+        --skyBudget;
+    }
+    static std::size_t cursor = 0;
+    const std::size_t visBudget = std::min<std::size_t>(64, weatherParticles.size());
+    for (std::size_t i = 0; i < visBudget; ++i) {
+        cursor = (cursor + 1) % weatherParticles.size();
+        auto& p = weatherParticles[cursor];
+        if (!p.checked || !p.outdoor) {
+            p.visible = false;
+            continue;
+        }
+        csgo::Trace trace;
+        engineTrace.traceRay({ weatherEye, p.position }, weatherSolidMask, { localPlayer.get().getPOD() }, trace);
+        p.visible = !trace.startSolid && trace.fraction >= 0.97f;
+    }
+    weatherSimTime = realtime;
+}
+
 void draw(ImDrawList* drawList, float realtime) noexcept
 {
     GameData::Lock lock;
+    drawWeather(drawList, realtime);
+    drawTrail(drawList);
+    drawZeusRange(drawList);
+    drawTracers(drawList);
+    drawGrenadeWarnings(drawList);
+    drawOffscreenArrows(drawList, realtime);
     drawServerPosition(drawList);
     for (const auto& player : GameData::players()) {
         drawFlags(drawList, player, realtime);
@@ -749,6 +1229,7 @@ void draw(ImDrawList* drawList, float realtime) noexcept
     drawExtendedYaw(drawList);
     drawSparks(drawList);
     drawKillFlash(drawList);
+    drawHitMarker(drawList);
 }
 
 }
@@ -880,6 +1361,148 @@ void apply(const OtherInterfaces& interfaces, bool inGame) noexcept
         materialsTouched = false;
     }
     lastKey = key;
+}
+
+// ---------- свет: блум/экспозиция, яркость моделей, солнце ----------
+namespace
+{
+
+struct TonemapOffsets {
+    std::uint32_t useMin = 0, useMax = 0, useBloom = 0, min = 0, max = 0, bloom = 0;
+    bool ok = false;
+};
+
+struct TonemapBackup {
+    bool useMin, useMax, useBloom;
+    float min, max, bloom;
+};
+
+std::unordered_map<csgo::EntityPOD*, TonemapBackup> tonemapBackups;
+
+const TonemapOffsets& tonemapOffsets() noexcept
+{
+    static TonemapOffsets o = [] {
+        TonemapOffsets t;
+        t.useMin = Netvars::get(fnv::hash("CEnvTonemapController->m_bUseCustomAutoExposureMin"));
+        t.useMax = Netvars::get(fnv::hash("CEnvTonemapController->m_bUseCustomAutoExposureMax"));
+        t.useBloom = Netvars::get(fnv::hash("CEnvTonemapController->m_bUseCustomBloomScale"));
+        t.min = Netvars::get(fnv::hash("CEnvTonemapController->m_flCustomAutoExposureMin"));
+        t.max = Netvars::get(fnv::hash("CEnvTonemapController->m_flCustomAutoExposureMax"));
+        t.bloom = Netvars::get(fnv::hash("CEnvTonemapController->m_flCustomBloomScale"));
+        t.ok = t.useMin && t.useMax && t.useBloom && t.min && t.max && t.bloom;
+        return t;
+    }();
+    return o;
+}
+
+template <typename T>
+T& tonemapField(csgo::EntityPOD* entity, std::uint32_t offset) noexcept
+{
+    return *reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(entity) + offset);
+}
+
+[[nodiscard]] bool isTonemapController(const ClientInterfaces& clientInterfaces, csgo::EntityPOD* pod) noexcept
+{
+    if (!pod)
+        return false;
+    const auto clientClass = csgo::Entity::from(retSpoofGadgets->client, pod).getNetworkable().getClientClass();
+    return clientClass && clientClass->networkName && std::strcmp(clientClass->networkName, "CEnvTonemapController") == 0;
+}
+
+}
+
+void applyLight(const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, bool inGame) noexcept
+{
+    const auto& w = config.world;
+    const auto cvar = interfaces.getCvar();
+
+    // яркость моделей: r_modelAmbientMin (выключили — 0, как у игры по умолчанию)
+    {
+        static bool forced = false;
+        if (const auto var = cvar.findVar("r_modelAmbientMin")) {
+            const auto cv = csgo::ConVar::from(retSpoofGadgets->client, var);
+            if (w.modelBrightness) {
+                if (std::abs(cv.getFloat() - w.modelAmbient) > 0.001f)
+                    cv.setValue(w.modelAmbient);
+                forced = true;
+            } else if (forced) {
+                cv.setValue(0.0f);
+                forced = false;
+            }
+        }
+    }
+
+    // солнце: динамические тени карты падают оттуда, куда скажем (cl_csm_rot_*)
+    {
+        static bool forced = false;
+        static float lastPitch = -1.0f, lastYaw = -1000.0f;
+        if (w.sunOverride) {
+            if (!forced || lastPitch != w.sunPitch || lastYaw != w.sunYaw) {
+                setCvar(cvar, "cl_csm_rot_override", 1.0f);
+                setCvar(cvar, "cl_csm_rot_x", w.sunPitch);
+                setCvar(cvar, "cl_csm_rot_y", w.sunYaw);
+                setCvar(cvar, "cl_csm_rot_z", 0.0f);
+                lastPitch = w.sunPitch;
+                lastYaw = w.sunYaw;
+                forced = true;
+            }
+        } else if (forced) {
+            setCvar(cvar, "cl_csm_rot_override", 0.0f);
+            forced = false;
+        }
+    }
+
+    const auto& o = tonemapOffsets();
+    if (!o.ok)
+        return;
+    if (!inGame) {
+        tonemapBackups.clear();
+        return;
+    }
+    // перебирать сущности есть смысл, только когда включено или надо вернуть как было
+    if (!w.tonemap && tonemapBackups.empty())
+        return;
+
+    // контроллер ищем раз в секунду, между поисками — по запомненным индексам
+    static std::vector<int> found;
+    static double nextScan = 0.0;
+    const double now = ImGui::GetTime();
+    const auto& entityList = clientInterfaces.getEntityList();
+    if (now >= nextScan || found.empty()) {
+        nextScan = now + 1.0;
+        found.clear();
+        const int highest = entityList.getHighestEntityIndex();
+        for (int i = 65; i <= highest; ++i) {
+            if (isTonemapController(clientInterfaces, entityList.getEntity(i)))
+                found.push_back(i);
+        }
+    }
+    for (const int i : found) {
+        const auto pod = entityList.getEntity(i);
+        if (!isTonemapController(clientInterfaces, pod))
+            continue;
+        if (w.tonemap) {
+            if (!tonemapBackups.contains(pod)) {
+                tonemapBackups[pod] = { tonemapField<bool>(pod, o.useMin), tonemapField<bool>(pod, o.useMax), tonemapField<bool>(pod, o.useBloom),
+                    tonemapField<float>(pod, o.min), tonemapField<float>(pod, o.max), tonemapField<float>(pod, o.bloom) };
+            }
+            tonemapField<bool>(pod, o.useMin) = true;
+            tonemapField<bool>(pod, o.useMax) = true;
+            tonemapField<bool>(pod, o.useBloom) = true;
+            tonemapField<float>(pod, o.min) = w.exposure;
+            tonemapField<float>(pod, o.max) = w.exposure;
+            tonemapField<float>(pod, o.bloom) = w.bloom;
+        } else if (const auto it = tonemapBackups.find(pod); it != tonemapBackups.end()) {
+            const auto& b = it->second;
+            tonemapField<bool>(pod, o.useMin) = b.useMin;
+            tonemapField<bool>(pod, o.useMax) = b.useMax;
+            tonemapField<bool>(pod, o.useBloom) = b.useBloom;
+            tonemapField<float>(pod, o.min) = b.min;
+            tonemapField<float>(pod, o.max) = b.max;
+            tonemapField<float>(pod, o.bloom) = b.bloom;
+            tonemapBackups.erase(it);
+        }
+    }
 }
 
 bool fogActive() noexcept

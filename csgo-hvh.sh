@@ -9,6 +9,8 @@ case "${1:-build}" in
     build)
         cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_COMPILER=clang++ -D CMAKE_C_COMPILER=clang -S "$ROOT" -B "$ROOT/build" -G Ninja >/dev/null
         cmake --build "$ROOT/build" -j"$(nproc)"
+        # иконки оружия для ESP — из файлов твоей игры (не в репозитории)
+        [ -d "$ROOT/build/weapon_icons" ] || python3 -I "$ROOT/tools/weapon_icons.py" || echo "иконки оружия не сгенерированы — в ESP будет текст"
         echo
         echo "Готово: $LIB"
         ;&

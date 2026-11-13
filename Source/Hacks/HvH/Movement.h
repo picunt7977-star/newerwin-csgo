@@ -28,6 +28,8 @@ void exploitTuning(const csgo::Cvar& cvar) noexcept;
 // телепорт по клавише и дефенсив (рывок, когда враг только что нас увидел)
 void exploits(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept;
 [[nodiscard]] bool isFakeDucking() noexcept;
+// под ФД: можно ли стрелять на этом тике (фаза «стоя», модель встала); без ФД — всегда да
+[[nodiscard]] bool fakeDuckShotTick() noexcept;
 // присед (0..1) на отправленном тике и минимальный за цикл — для индикатора FD
 void fakeDuckStats(float& sent, float& low) noexcept;
 

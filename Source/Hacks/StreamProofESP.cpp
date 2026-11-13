@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <forward_list>
 #include <limits>
 #include <numbers>
@@ -21,6 +22,7 @@
 #include "../Memory.h"
 
 #include "../imguiCustom.h"
+#include "HvH/HvhConfig.h"
 #include "HvH/HvhGui.h"
 
 static constexpr auto operator-(float sub, const std::array<float, 3>& a) noexcept
@@ -241,6 +243,27 @@ static ImVec2 renderText(const Memory& memory, float distance, float cullDistanc
     return textSize;
 }
 
+// иконка оружия: цвет как у текста, тёмный контур; top — верх иконки, по центру centerX. Возвращает высоту (0 — иконки нет)
+static float renderWeaponIcon(const Memory& memory, float distance, float cullDistance, const Color4& colorCfg, const std::string& iconName, float centerX, float top) noexcept
+{
+    if (cullDistance && Helpers::units2meters(distance) > cullDistance)
+        return 0.0f;
+    float aspect = 1.0f;
+    const auto icon = GameData::weaponIcon(iconName, aspect);
+    if (!icon)
+        return 0.0f;
+    const float height = std::round(ImGui::GetFont()->FontSize);
+    const float width = std::round(height * aspect);
+    const ImVec2 min{ std::floor(centerX - width * 0.5f), std::floor(top) };
+    const ImVec2 max{ min.x + width, min.y + height };
+    const auto color = Helpers::calculateColor(memory.globalVars->realtime, colorCfg);
+    const ImU32 shadow = IM_COL32(0, 0, 0, static_cast<int>(((color >> IM_COL32_A_SHIFT) & 0xFF) * 0.8f));
+    for (const auto& d : { ImVec2{ 1.0f, 0.0f }, ImVec2{ -1.0f, 0.0f }, ImVec2{ 0.0f, 1.0f }, ImVec2{ 0.0f, -1.0f } })
+        drawList->AddImage(icon, min + d, max + d, { 0.0f, 0.0f }, { 1.0f, 1.0f }, shadow);
+    drawList->AddImage(icon, min, max, { 0.0f, 0.0f }, { 1.0f, 1.0f }, color);
+    return height;
+}
+
 static void drawSnapline(const Memory& memory, const Snapline& config, const ImVec2& min, const ImVec2& max) noexcept
 {
     if (!config.asColorToggle().enabled)
@@ -300,13 +323,38 @@ struct FontPush {
 
 // Полоска хп: 2 px на чёрной подложке во всю высоту; цвет от зелёного к красному,
 // при неполном хп сверху заливки — число. Для «Сплошной» — цвет из настроек.
-static void drawHealthBar(const Memory& memory, const HealthBar& config, const ImVec2& pos, float height, int health) noexcept
+//
+// Плавная полоска (hvh::config.view.espSmoothHealth): показанное хп догоняет настоящее за долю секунды,
+// а только что снятый урон на миг остаётся белым куском над заливкой — видно, сколько сняли.
+struct ShownHealth {
+    float value = 100.0f;       // что сейчас нарисовано цветом
+    float ghost = 100.0f;       // белый «след» урона, сползает к value
+    double seenAt = -10.0;
+};
+static std::array<ShownHealth, 65> shownHealth;
+
+static void drawHealthBar(const Memory& memory, const HealthBar& config, const ImVec2& pos, float height, int health, int playerIndex = 0) noexcept
 {
     if (!config.enabled)
         return;
 
     constexpr float width = 2.0f;
-    const float fraction = std::clamp(health / 100.0f, 0.0f, 1.0f);
+    float shown = static_cast<float>(health);
+    float ghost = shown;
+    if (hvh::config.view.espSmoothHealth && playerIndex > 0 && playerIndex < static_cast<int>(shownHealth.size())) {
+        auto& state = shownHealth[playerIndex];
+        const double now = ImGui::GetTime();
+        const float dt = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+        // давно не рисовали (дормант, новый раунд) или хп выросло — без анимации
+        if (now - state.seenAt > 0.5 || static_cast<float>(health) > state.value)
+            state.value = state.ghost = static_cast<float>(health);
+        state.seenAt = now;
+        state.value += (static_cast<float>(health) - state.value) * std::min(dt * 14.0f, 1.0f);
+        state.ghost = std::max(state.ghost - dt * 55.0f, state.value);
+        shown = state.value;
+        ghost = state.ghost;
+    }
+    const float fraction = std::clamp(shown / 100.0f, 0.0f, 1.0f);
     const ImVec2 min = ImFloor(pos);
     const float bottom = std::floor(pos.y + height);
     const float top = std::floor(bottom - (bottom - min.y) * fraction);
@@ -322,6 +370,10 @@ static void drawHealthBar(const Memory& memory, const HealthBar& config, const I
         color = Helpers::calculateColor(std::clamp(r, 0, 255), std::clamp(g, 0, 255), 70, 255);
     }
     drawList->AddRectFilled({ min.x - 1.0f, min.y - 1.0f }, { min.x + width + 1.0f, bottom + 1.0f }, Helpers::calculateColor(0, 0, 0, 190));
+    if (ghost > shown + 0.5f) {
+        const float ghostTop = std::floor(bottom - (bottom - min.y) * std::clamp(ghost / 100.0f, 0.0f, 1.0f));
+        drawList->AddRectFilled({ min.x, ghostTop }, { min.x + width, top }, Helpers::calculateColor(255, 255, 255, 230));
+    }
     drawList->AddRectFilled({ min.x, top }, { min.x + width, bottom }, color);
 
     if (health < 100 && health > 0) {
@@ -342,11 +394,34 @@ static void renderPlayerBox(const Memory& memory, const Config& configGlobal, co
     if (!bbox)
         return;
 
+    // мягкая заливка: цвет рамки, прозрачный сверху и плотнее к ногам — силуэт читается, обзор не закрыт
+    if (hvh::config.view.espSoftFill && playerData.enemy && config.box.enabled && !config.box.fill.enabled
+        && (config.box.type == Box::_2d || config.box.type == Box::_2dCorners)) {
+        const ImU32 boxColor = Helpers::calculateColor(memory.globalVars->realtime, config.box.asColor4());
+        const ImU32 clear = boxColor & ~IM_COL32_A_MASK;
+        const ImU32 dense = clear | (static_cast<ImU32>(56) << IM_COL32_A_SHIFT);
+        const ImVec2 min = ImFloor(bbox.min) + ImVec2{ 1.0f, 1.0f }, max = ImFloor(bbox.max) - ImVec2{ 1.0f, 1.0f };
+        if (max.x > min.x && max.y > min.y)
+            drawList->AddRectFilledMultiColor(min, max, clear, clear, dense, dense);
+    }
+
+    // свечение: три расходящихся контура цвета рамки, каждый следующий прозрачнее
+    if (hvh::config.view.espGlowBox && playerData.enemy && config.box.enabled && config.box.type == Box::_2d) {
+        const ImU32 base = Helpers::calculateColor(memory.globalVars->realtime, config.box.asColor4()) & ~IM_COL32_A_MASK;
+        const ImVec2 min = ImFloor(bbox.min), max = ImFloor(bbox.max);
+        static constexpr int alphas[]{ 46, 24, 10 };
+        for (int i = 0; i < 3; ++i) {
+            const float grow = 2.0f + static_cast<float>(i);
+            drawList->AddRect(min - ImVec2{ grow, grow }, max + ImVec2{ grow, grow }, base | (static_cast<ImU32>(alphas[i]) << IM_COL32_A_SHIFT),
+                config.box.rounding + grow, ImDrawFlags_RoundCornersAll);
+        }
+    }
+
     renderBox(memory, bbox, config.box);
 
     ImVec2 offsetMins{}, offsetMaxs{};
 
-    drawHealthBar(memory, config.healthBar, bbox.min - ImVec2{ 6.0f, 0.0f }, (bbox.max.y - bbox.min.y), playerData.health);
+    drawHealthBar(memory, config.healthBar, bbox.min - ImVec2{ 6.0f, 0.0f }, (bbox.max.y - bbox.min.y), playerData.health, playerData.index);
 
     FontPush font{ configGlobal, config.font.name, playerData.distanceToLocal };
 
@@ -370,8 +445,32 @@ static void renderPlayerBox(const Memory& memory, const Config& configGlobal, co
         offsetMins.y -= radius * 2.5f;
     }
 
-    if (config.weapon.enabled && !playerData.activeWeapon.empty()) {
-        const auto weaponTextSize = renderText(memory, playerData.distanceToLocal, config.textCullDistance, config.weapon.asColor4(), playerData.activeWeapon.c_str(), { (bbox.min.x + bbox.max.x) / 2, bbox.max.y + 1 }, true, false);
+    // полоска патронов под рамкой: синяя — сколько осталось в магазине, жёлтая — перезаряжается
+    if (hvh::config.view.espAmmoBar && playerData.enemy && playerData.maxClip > 0 && playerData.clip >= 0) {
+        const float left = std::floor(bbox.min.x), right = std::floor(bbox.max.x);
+        const float y = std::floor(bbox.max.y) + 3.0f;
+        const float fraction = playerData.reloading ? 1.0f : static_cast<float>(playerData.clip) / static_cast<float>(playerData.maxClip);
+        drawList->AddRectFilled({ left - 1.0f, y - 1.0f }, { right + 1.0f, y + 3.0f }, Helpers::calculateColor(0, 0, 0, 190));
+        drawList->AddRectFilled({ left, y }, { left + (right - left) * fraction, y + 2.0f },
+            playerData.reloading ? Helpers::calculateColor(246, 202, 92, 255) : Helpers::calculateColor(90, 150, 255, 255));
+        offsetMaxs.y += 5.0f;
+    }
+
+    if (hvh::config.view.espDistance && playerData.enemy) {
+        char text[16];
+        std::snprintf(text, sizeof(text), "%.0fm", playerData.distanceToLocal * 0.01905f);
+        const auto distanceSize = renderText(memory, playerData.distanceToLocal, config.textCullDistance, config.weapon.asColor4(), text, { (bbox.min.x + bbox.max.x) / 2, bbox.max.y + 1 + offsetMaxs.y }, true, false);
+        offsetMaxs.y += distanceSize.y + 1.0f;
+    }
+
+    // иконка вместо названия (если сгенерирована tools/weapon_icons.py), иначе — текстом
+    const float iconHeight = config.weapon.enabled
+        ? renderWeaponIcon(memory, playerData.distanceToLocal, config.textCullDistance, config.weapon.asColor4(), playerData.weaponIcon, (bbox.min.x + bbox.max.x) * 0.5f, bbox.max.y + 2 + offsetMaxs.y)
+        : 0.0f;
+    if (iconHeight > 0.0f) {
+        offsetMaxs.y += iconHeight + 3.0f;
+    } else if (config.weapon.enabled && !playerData.activeWeapon.empty()) {
+        const auto weaponTextSize = renderText(memory, playerData.distanceToLocal, config.textCullDistance, config.weapon.asColor4(), playerData.activeWeapon.c_str(), { (bbox.min.x + bbox.max.x) / 2, bbox.max.y + 1 + offsetMaxs.y }, true, false);
         offsetMaxs.y += weaponTextSize.y + 2.0f;
     }
 
@@ -391,8 +490,12 @@ static void renderWeaponBox(const Memory& memory, const Config& configGlobal, co
 
     FontPush font{ configGlobal, config.font.name, weaponData.distanceToLocal };
 
-    if (config.name.enabled && !weaponData.displayName.empty()) {
-        renderText(memory, weaponData.distanceToLocal, config.textCullDistance, config.name.asColor4(), weaponData.displayName.c_str(), { (bbox.min.x + bbox.max.x) / 2, bbox.min.y - 2 });
+    if (config.name.enabled) {
+        // иконка над рамкой; нет иконки — название текстом
+        const float height = std::round(ImGui::GetFont()->FontSize);
+        if (renderWeaponIcon(memory, weaponData.distanceToLocal, config.textCullDistance, config.name.asColor4(), weaponData.icon, (bbox.min.x + bbox.max.x) * 0.5f, bbox.min.y - 3 - height) == 0.0f
+            && !weaponData.displayName.empty())
+            renderText(memory, weaponData.distanceToLocal, config.textCullDistance, config.name.asColor4(), weaponData.displayName.c_str(), { (bbox.min.x + bbox.max.x) / 2, bbox.min.y - 2 });
     }
 
     if (config.ammo.enabled && weaponData.clip != -1) {

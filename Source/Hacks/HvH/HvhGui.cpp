@@ -14,6 +14,7 @@
 #include "AntiAim.h"
 #include "HvhConfig.h"
 #include "HvhGui.h"
+#include "Hud.h"
 #include "Movement.h"
 #include "Ragebot.h"
 #include "Resolver.h"
@@ -1218,9 +1219,12 @@ void drawIndicators(ImDrawList* drawList) noexcept
     // стрелки ручного антиаима
     if (config.antiAim.enabled) {
         const auto manual = antiaim::manualDirection();
+        // выбранное направление — акцентом с тёмным контуром, остальные — еле заметные
         const auto arrow = [drawList](ImVec2 tip, float dir, bool active) {
-            const ImU32 col = active ? color::accent : IM_COL32(255, 255, 255, 40);
-            drawList->AddTriangleFilled(tip, { tip.x - dir * 12.0f, tip.y - 8.0f }, { tip.x - dir * 12.0f, tip.y + 8.0f }, col);
+            const ImVec2 top{ tip.x - dir * 12.0f, tip.y - 8.0f }, bottom{ tip.x - dir * 12.0f, tip.y + 8.0f };
+            drawList->AddTriangleFilled(tip, top, bottom, active ? color::accent : IM_COL32(255, 255, 255, 34));
+            if (active)
+                drawList->AddTriangle(tip, top, bottom, IM_COL32(0, 0, 0, 170), 1.0f);
         };
         arrow({ center.x - 50.0f, center.y }, -1.0f, manual == antiaim::Manual::Left);
         arrow({ center.x + 50.0f, center.y }, 1.0f, manual == antiaim::Manual::Right);
@@ -1232,13 +1236,22 @@ void drawIndicators(ImDrawList* drawList) noexcept
     }
 
     // список под прицелом
-    float y = center.y + 24.0f;
+    // Общий стиль HUD (Hud.h): мелкий шрифт с контуром, по центру, строка под строкой.
+    // Цвет: зелёный — готово/работает, красный — не готово, акцент — наш режим, серый — ждёт.
+    float y = center.y + 26.0f;
+    ImFont* indicatorFont = hud::smallFont();
     const auto line = [&](const char* text, ImU32 col) {
-        const auto size = ImGui::CalcTextSize(text);
-        drawList->AddText({ center.x - size.x * 0.5f + 1.0f, y + 1.0f }, IM_COL32(0, 0, 0, 160), text);
-        drawList->AddText({ center.x - size.x * 0.5f, y }, col, text);
-        y += size.y + 1.0f;
+        hud::textCentered(drawList, indicatorFont, { center.x, y }, col, text);
+        y += indicatorFont->FontSize + 2.0f;
     };
+    // полоска под последней строкой (заряд DT)
+    const auto meter = [&](float fraction, ImU32 col) {
+        constexpr float width = 34.0f;
+        hud::bar(drawList, { center.x - width * 0.5f, y }, width, 2.0f, fraction, col);
+        y += 6.0f;
+    };
+    if (config.view.seenWarning && tickbase::threatened())
+        line("SEEN", hud::color::warn);
 
     if (movement::isFakeDucking()) {
         // FD присед на отправке / высота выстрела: хорошо — ~100% / ниже 40%
@@ -1256,8 +1269,10 @@ void drawIndicators(ImDrawList* drawList) noexcept
         // В дефенсивном режиме DT заряд тратить некому, если дефенсив копит чоком, — показываем
         // тусклым, чтобы пустой заряд не читался как поломка
         const bool idle = tickbase::defensiveDoubleTap() && defensive::enabled() && defensive::chargeByChoke();
-        line(tickbase::defensiveDoubleTap() ? "DT · DEF" : "DT",
-            idle ? color::textDim : (tickbase::isCharged() || tickbase::isDefensiveRecharging() ? color::good : color::bad));
+        const ImU32 tone = idle ? color::textDim : (tickbase::isCharged() || tickbase::isDefensiveRecharging() ? color::good : color::bad);
+        line(tickbase::defensiveDoubleTap() ? "DT · DEF" : "DT", tone);
+        if (!idle)
+            meter(static_cast<float>(tickbase::chargedTicks()) / 14.0f, tone);
     }
     if (antiaim::isFreestanding())
         line("FS", color::accent);
@@ -1547,6 +1562,114 @@ void drawHotkeys(ImDrawList* d, bool menuOpen) noexcept
     d->PopClipRect();
 }
 
+// Худ «Notifications». Каждое событие — своя плашка в стиле панели Hotkeys (фон худа, скругление 8):
+// слева кружок цветом события, дальше фраза — связки серым, имена/цифры белым, «!» оранжевым.
+// Новая сверху, выезжает сбоку, живёт 4 с, видно до 7. При открытом меню — превью (если пусто),
+// рамка и перетаскивание мышью; левее трети экрана лента прижимается влево, правее двух третей — вправо.
+void drawNotifications(ImDrawList* d, bool menuOpen) noexcept
+{
+    constexpr float lifetime = 4.0f, fadeIn = 0.22f, fadeOut = 0.35f;
+    auto live = ragebot::recentNotices(lifetime);
+    if (!config.view.screenLogs)
+        return;
+    using ragebot::NoticeKind;
+    using ragebot::NoticePart;
+    const bool preview = menuOpen && live.empty();
+    if (preview) {
+        live = {
+            { NoticeKind::Kill, { { "Killed " }, { "enemy", true }, { " in " }, { "head", true } }, 1.0f },
+            { NoticeKind::Miss, { { "Missed " }, { "enemy", true }, { "'s " }, { "head", true }, { " due to " }, { "resolver", true } }, 1.0f },
+            { NoticeKind::Hurt, { { "Hurt by " }, { "enemy", true }, { " in " }, { "chest", true }, { " for " }, { "72 hp", true } }, 1.0f },
+            { NoticeKind::Evaded, { { "Evaded " }, { "enemy", true }, { "'s shot" } }, 1.0f },
+        };
+    }
+    if (live.empty())
+        return;
+
+    ImFont* font = hudFont();
+    const float fontSize = font->FontSize;
+    constexpr float rowH = 26.0f, gap = 4.0f, padX = 10.0f, dotArea = 22.0f;
+    static constexpr ImU32 orange = IM_COL32(213, 154, 77, 255);
+    static constexpr ImU32 connector = IM_COL32(230, 230, 230, 128);
+
+    const auto& io = ImGui::GetIO();
+    const auto& display = io.DisplaySize;
+    const float anchorX = config.view.logsX * display.x;
+    float top = std::floor(config.view.logsY * display.y);
+    const int align = config.view.logsX < 1.0f / 3.0f ? -1 : config.view.logsX > 2.0f / 3.0f ? 1 : 0;
+
+    // ширины плашек и общий прямоугольник ленты (за него и таскаем)
+    struct Item { const ragebot::NoticeView* notice; float width; float alpha; float appear; float vanish; };
+    std::vector<Item> items;
+    float widest = 0.0f, totalH = 0.0f;
+    for (const auto& notice : live) {
+        if (items.size() >= 7)
+            break;
+        float textW = 0.0f;
+        for (const auto& part : notice.parts)
+            textW += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, part.text.c_str()).x;
+        const float appear = preview ? 1.0f : std::clamp(notice.age / fadeIn, 0.0f, 1.0f);
+        const float vanish = preview ? 1.0f : std::clamp((lifetime - notice.age) / fadeOut, 0.0f, 1.0f);
+        const float alpha = std::min(1.0f - (1.0f - appear) * (1.0f - appear), vanish);
+        const float width = std::round(dotArea + textW + padX);
+        items.push_back({ &notice, width, alpha, appear, vanish });
+        widest = std::max(widest, width);
+        totalH += (rowH + gap) * std::min(vanish * 1.5f, 1.0f);
+    }
+    const auto leftOf = [&](float width) {
+        return align < 0 ? anchorX : align > 0 ? anchorX - width : anchorX - width * 0.5f;
+    };
+
+    // перетаскивание при открытом меню (не когда мышь над окном меню)
+    static bool dragging = false;
+    static ImVec2 grab{};
+    const ImVec2 boxMin{ std::floor(leftOf(widest)) - 4.0f, top - 4.0f };
+    const ImVec2 boxMax{ boxMin.x + widest + 8.0f, top + std::max(totalH, rowH) + 4.0f };
+    if (menuOpen) {
+        const bool over = io.MousePos.x >= boxMin.x && io.MousePos.x <= boxMax.x && io.MousePos.y >= boxMin.y && io.MousePos.y <= boxMax.y;
+        if (!dragging && over && io.MouseClicked[0] && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+            dragging = true;
+            grab = { io.MousePos.x - anchorX, io.MousePos.y - top };
+        }
+        if (dragging) {
+            if (io.MouseDown[0]) {
+                config.view.logsX = std::clamp((io.MousePos.x - grab.x) / display.x, 0.0f, 1.0f);
+                config.view.logsY = std::clamp((io.MousePos.y - grab.y) / display.y, 0.0f, 0.97f);
+            } else {
+                dragging = false;
+            }
+        }
+        d->AddRect(boxMin, boxMax, withAlpha(nwAccent2, dragging ? 0.7f : 0.25f), 8.0f);
+    } else {
+        dragging = false;
+    }
+
+    int index = 0;
+    for (const auto& item : items) {
+        const auto& notice = *item.notice;
+        // чётные выезжают слева, нечётные справа; у края экрана — от края
+        const float side = align != 0 ? static_cast<float>(align) : (index % 2 == 0 ? -1.0f : 1.0f);
+        const float slide = (1.0f - item.appear) * (1.0f - item.appear) * item.width * 0.5f * side;
+        const ImVec2 min{ std::floor(leftOf(item.width) + slide), top };
+        const ImVec2 max{ min.x + item.width, min.y + rowH };
+        const auto tone = ragebot::noticeColor(notice.kind);
+        const ImU32 toneColor = IM_COL32(tone[0], tone[1], tone[2], 255);
+        d->AddRectFilled(min, max, withAlpha(hudBg, item.alpha), 8.0f);
+        d->AddCircleFilled({ min.x + 12.0f, min.y + rowH * 0.5f }, 3.0f, withAlpha(toneColor, item.alpha), 16);
+        d->AddCircle({ min.x + 12.0f, min.y + rowH * 0.5f }, 5.5f, withAlpha(toneColor, item.alpha * 0.35f), 16, 1.0f);
+        float x = min.x + dotArea;
+        const float textY = std::floor(min.y + (rowH - fontSize) * 0.5f);
+        for (const NoticePart& part : notice.parts) {
+            const ImU32 color = part.warn ? orange : part.value ? IM_COL32(255, 255, 255, 255) : connector;
+            d->AddText(font, fontSize, { x, textY }, withAlpha(color, item.alpha), part.text.c_str());
+            x += font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, part.text.c_str()).x;
+        }
+        // уходящая — схлопывается по высоте, остальные плавно поднимаются
+        top += (rowH + gap) * std::min(item.vanish * 1.5f, 1.0f);
+        ++index;
+    }
+}
+
 static int selectedWeapon = 0;
 
 void drawRageTab() noexcept
@@ -1628,6 +1751,13 @@ void drawRageTab() noexcept
             ImGui::SetTooltip("Сколько команд удалённый сервер принимает за тик. Чок, фейклаг, лаг-пик и сдвиг DT\n"
                               "не длиннее этого: хвост длинной пачки сервер выкидывает, и выстрел уходит из старой\n"
                               "позиции (в стену). Мисы с «пуля застряла» на лаг-пике — уменьши. На своём сервере — не важно.");
+        toggle("Latency spoof (фейк-пинг)", &ex.fakeLatency);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Серверу подтверждаем его пакеты с опозданием: он считает наш пинг больше и разрешает\n"
+                              "стрелять по более старым позициям врага (бектрек до ~0.4 с вместо 0.2). Картинка у нас\n"
+                              "свежая. Рейдж сам расширяет окно на эту прибавку. Пинг в табе вырастет — это и есть спуф.");
+        if (ex.fakeLatency)
+            sliderInt("Добавить к пингу", &ex.fakeLatencyMs, 0, 200, "%d мс");
         toggle("Нож в прыжке с DT — без лагов", &ex.knifeAirNoLag);
         keybind("Телепорт", ex.teleportKey);
         toggle("Хайдшоты", &ex.hideShots);
@@ -2276,6 +2406,11 @@ static void drawAaDefensive(float width, float height) noexcept
                 "«Враг рядом» — даже когда не видит (живее, но заряд тратится впустую).\n"
                 "«После выстрела» — разрешить рывок сразу после своего выстрела.");
         toggle("В воздухе", &df.inAir);
+        toggle("Рывок зарядом DT на пике", &df.peekShift);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Для DT в режиме «дефенсив» с окнами чоком: когда враг нас только увидел,\n"
+                              "заряд DT уходит в рывок — сервер откатывает тикбейс, и бектрекнуть нас\n"
+                              "в этот момент нельзя. С зажатым автопиком не срабатывает (заряд — телепорту).");
         tooltip("В прыжке окна всегда: лагкомп по нам в воздухе не пишется.\n"
                 "С DT заряд под это уступает (вторая пуля в прыжке всё равно не попадает).");
         if (df.triggers & DefKey)
@@ -2579,6 +2714,7 @@ void drawWorldGroup() noexcept
             sliderInt("Длина линий", &view.scopeSize, 10, 300);
             sliderInt("Отступ от центра", &view.scopeGap, 0, 100);
             toggle("T-прицел (без верхней)", &view.scopeT);
+            toggle("Инвертор (ярче к концу)", &view.scopeInvert);
         }
         toggle("Круг разброса", &view.spreadCircle);
         toggle("Мин. урон у прицела", &view.damageIndicator);
@@ -2601,7 +2737,7 @@ void drawWorldGroup() noexcept
         toggle("Панель биндов (Hotkeys)", &view.hotkeys);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Активные бинды с клавишами, как HUD «Hotkeys» в NewerWin.\nПри открытом меню панель видна всегда — тащи за шапку.");
-        toggle("Логи выстрелов на экране", &view.screenLogs);
+        toggle("Уведомления (худ, таскается при открытом меню)", &view.screenLogs);
         toggle("Индикатор LC", &view.lcIndicator);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Зелёный — сейчас идёт дефенсив (лагкомп сломан), полоска — сколько тиков осталось.");
@@ -2663,6 +2799,20 @@ void drawVisualsTab() noexcept
         toggle("Цифры урона", &view.damageNumbers);
         toggle("Кольца шагов врагов", &view.footsteps);
         toggle("Вспышка при убийстве", &view.killFlash);
+        toggle("Хитмаркер у прицела", &view.hitMarker);
+        colorToggle("Трассеры своих пуль", &view.bulletTracers, view.tracerColor);
+        colorToggle("След за собой", &view.localTrail, view.trailColor);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Подсказки", { width, 0.0f })) {
+        toggle("Стрелки на врагов за экраном", &view.offscreenArrows);
+        if (view.offscreenArrows)
+            sliderInt("Радиус стрелок", &view.arrowRadius, 60, 500, "%d px");
+        toggle("Метки вражеских гранат", &view.grenadeWarning);
+        toggle("Круг дальности зевса", &view.zeusRange);
+        toggle("«SEEN», когда нас видят", &view.seenWarning);
     }
     endGroup();
     ImGui::Dummy({ 0.0f, gap });
@@ -2828,6 +2978,40 @@ void drawWorldLookTab(bool* skyboxEnabled, int* skybox, const char* const* skybo
         toggle("Подсветка", &w.ambient);
         if (w.ambient)
             colorEdit3("Цвет подсветки", w.ambientColor);
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Погода", { width, 0.0f })) {
+        static constexpr const char* kinds[]{ "Выкл", "Снег", "Дождь", "Светлячки", "Пепел" };
+        combo("Что падает", &w.weather, kinds, IM_ARRAYSIZE(kinds));
+        if (w.weather != 0) {
+            sliderInt("Частиц", &w.particles, 20, 800);
+            sliderFloat("Размер", &w.particleSize, 0.3f, 4.0f, "%.1f");
+            sliderFloat("Радиус", &w.particleRadius, 250.0f, 2000.0f, "%.0f ед.");
+            colorEdit("Цвет частиц", w.particleColor);
+            cardNote("Снег, дождь и пепел идут только под открытым небом и за стенами не видны. Светлячки — везде.");
+        }
+    }
+    endGroup();
+    ImGui::Dummy({ 0.0f, gap });
+
+    if (beginGroup("Свет", { width, 0.0f })) {
+        toggle("Свой блум и экспозиция", &w.tonemap);
+        if (w.tonemap) {
+            sliderFloat("Блум", &w.bloom, 0.0f, 10.0f, "%.1f");
+            sliderFloat("Экспозиция", &w.exposure, 0.1f, 4.0f, "%.2f");
+            cardNote("Блум виден только с включённой постобработкой игры.");
+        }
+        toggle("Яркие модели", &w.modelBrightness);
+        if (w.modelBrightness)
+            sliderFloat("Минимум света", &w.modelAmbient, 0.0f, 5.0f, "%.1f");
+        toggle("Своё солнце (тени)", &w.sunOverride);
+        if (w.sunOverride) {
+            sliderFloat("Высота солнца", &w.sunPitch, 5.0f, 90.0f, "%.0f°");
+            sliderFloat("Сторона", &w.sunYaw, -180.0f, 180.0f, "%.0f°");
+            cardNote("Низкое солнце — длинные тени, как на закате. Работает на картах с динамическими тенями.");
+        }
     }
     endGroup();
     ImGui::Dummy({ 0.0f, gap });

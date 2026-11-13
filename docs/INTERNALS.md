@@ -31,7 +31,7 @@ SDL_VIDEODRIVER=x11 LD_PRELOAD="$LD_PRELOAD:/путь/к/newerwin-csgo/build/Sou
 
 | Файл | Что |
 |---|---|
-| `Source/Hacks/HvH/Ragebot.cpp` | рейджбот: мультипоинт, хитшанс (128 сидов по капсулам хитбоксов), мин. урон, автостоп/автоскоуп, свой лагкомп |
+| `Source/Hacks/HvH/Ragebot.cpp` | рейджбот: мультипоинт, хитшанс (64 сида при выборе цели, 256 перед выстрелом, по капсулам хитбоксов), мин. урон, автостоп/автоскоуп, свой лагкомп |
 | `Source/Hacks/HvH/Resolver.cpp` | резольвер десинка по сравнению слоёв анимации (см. ниже) |
 | `Source/Hacks/HvH/Autowall.cpp` | пробитие стен (свой TraceToExit — в Osiris он был только под Windows) |
 | `Source/Hacks/HvH/Tickbase.cpp` | детур `CL_Move` (engine_client.so +0x284a40) и управление `bSendPacket`; DT = зарядка пропуском тиков + сдвиг |

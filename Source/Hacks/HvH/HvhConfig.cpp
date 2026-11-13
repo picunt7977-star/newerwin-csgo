@@ -226,12 +226,17 @@ json toJson() noexcept
     j["View"]["Show fake angles"] = config.view.showFakeAngles;
     j["View"]["Server model"] = config.view.serverModel;
     j["View"]["Server model color"] = { config.view.serverModelColor[0], config.view.serverModelColor[1], config.view.serverModelColor[2], config.view.serverModelColor[3] };
+    j["View"]["Backtrack chams"] = config.view.backtrackChams;
+    j["View"]["Backtrack chams hidden"] = config.view.backtrackChamsHidden;
+    j["View"]["Backtrack chams color"] = { config.view.backtrackChamsColor[0], config.view.backtrackChamsColor[1], config.view.backtrackChamsColor[2], config.view.backtrackChamsColor[3] };
     j["View"]["Server box"] = config.view.serverBox;
     j["View"]["Server box color"] = { config.view.serverBoxColor[0], config.view.serverBoxColor[1], config.view.serverBoxColor[2], config.view.serverBoxColor[3] };
     j["View"]["Grenade prediction"] = config.view.grenadePrediction;
     j["View"]["Dormant time"] = config.view.dormantTime;
     j["View"]["Sync render"] = config.view.syncRender;
     j["View"]["Screen logs"] = config.view.screenLogs;
+    j["View"]["Logs x"] = config.view.logsX;
+    j["View"]["Logs y"] = config.view.logsY;
     j["View"]["Watermark"] = config.view.watermark;
     j["View"]["Hotkeys"] = config.view.hotkeys;
     j["View"]["Hotkeys x"] = config.view.hotkeysX;
@@ -247,6 +252,8 @@ json toJson() noexcept
     j["View"]["Scope size"] = config.view.scopeSize;
     j["View"]["Scope gap"] = config.view.scopeGap;
     j["View"]["Scope T"] = config.view.scopeT;
+    j["View"]["Scope invert"] = config.view.scopeInvert;
+    j["View"]["Scope thickness"] = config.view.scopeThickness;
     j["View"]["Damage indicator"] = config.view.damageIndicator;
     j["View"]["Shot markers"] = config.view.shotMarkers;
     j["View"]["Miss markers"] = config.view.missMarkers;
@@ -268,6 +275,21 @@ json toJson() noexcept
     j["View"]["Impact sparks"] = config.view.impactSparks;
     j["View"]["Spark color"] = { config.view.sparkColor[0], config.view.sparkColor[1], config.view.sparkColor[2], config.view.sparkColor[3] };
     j["View"]["Spark count"] = config.view.sparkCount;
+    j["View"]["Offscreen arrows"] = config.view.offscreenArrows;
+    j["View"]["Arrow radius"] = config.view.arrowRadius;
+    j["View"]["Hit marker"] = config.view.hitMarker;
+    j["View"]["Bullet tracers"] = config.view.bulletTracers;
+    j["View"]["Tracer color"] = { config.view.tracerColor[0], config.view.tracerColor[1], config.view.tracerColor[2], config.view.tracerColor[3] };
+    j["View"]["Local trail"] = config.view.localTrail;
+    j["View"]["Trail color"] = { config.view.trailColor[0], config.view.trailColor[1], config.view.trailColor[2], config.view.trailColor[3] };
+    j["View"]["Grenade warning"] = config.view.grenadeWarning;
+    j["View"]["Zeus range"] = config.view.zeusRange;
+    j["View"]["Seen warning"] = config.view.seenWarning;
+    j["View"]["ESP smooth health"] = config.view.espSmoothHealth;
+    j["View"]["ESP ammo bar"] = config.view.espAmmoBar;
+    j["View"]["ESP distance"] = config.view.espDistance;
+    j["View"]["ESP soft fill"] = config.view.espSoftFill;
+    j["View"]["ESP glow box"] = config.view.espGlowBox;
     j["View"]["Spark size"] = config.view.sparkSize;
 
     {
@@ -288,6 +310,19 @@ json toJson() noexcept
         o["Fog density"] = w.fogDensity;
         o["Ambient"] = w.ambient;
         o["Ambient color"] = rgb(w.ambientColor);
+        o["Weather"] = w.weather;
+        o["Particles"] = w.particles;
+        o["Particle color"] = json::array({ w.particleColor[0], w.particleColor[1], w.particleColor[2], w.particleColor[3] });
+        o["Particle size"] = w.particleSize;
+        o["Particle radius"] = w.particleRadius;
+        o["Tonemap"] = w.tonemap;
+        o["Bloom"] = w.bloom;
+        o["Exposure"] = w.exposure;
+        o["Model brightness"] = w.modelBrightness;
+        o["Model ambient"] = w.modelAmbient;
+        o["Sun override"] = w.sunOverride;
+        o["Sun pitch"] = w.sunPitch;
+        o["Sun yaw"] = w.sunYaw;
     }
 
     auto& m = j["Movement"];
@@ -316,6 +351,8 @@ json toJson() noexcept
     writeKey(e, "Double tap key", ex.doubleTapKey);
     e["Shift ticks"] = ex.shiftTicks;
     e["Server pack limit"] = ex.serverPackLimit;
+    e["Fake latency"] = ex.fakeLatency;
+    e["Fake latency ms"] = ex.fakeLatencyMs;
     e["Knife air no lag"] = ex.knifeAirNoLag;
 
     auto& d = j["Defensive"];
@@ -323,6 +360,7 @@ json toJson() noexcept
     d["Enabled"] = df.enabled;
     d["Triggers"] = df.triggers;
     d["In air"] = df.inAir;
+    d["Peek shift"] = df.peekShift;
     writeKey(d, "Key", df.key);
     d["Peek ticks"] = df.peekTicks;
     d["Charge style"] = df.chargeStyle;
@@ -537,6 +575,14 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Second zoom factor", config.view.secondZoomFactor);
         read(j["View"], "Show fake angles", config.view.showFakeAngles);
         read(j["View"], "Server model", config.view.serverModel);
+        read(j["View"], "Backtrack chams", config.view.backtrackChams);
+        read(j["View"], "Backtrack chams hidden", config.view.backtrackChamsHidden);
+        if (const auto& color = j["View"]["Backtrack chams color"]; color.is_array() && color.size() == 4) {
+            for (std::size_t i = 0; i < 4; ++i) {
+                if (color[i].is_number())
+                    config.view.backtrackChamsColor[i] = std::clamp(color[i].get<float>(), 0.0f, 1.0f);
+            }
+        }
         read(j["View"], "Server box", config.view.serverBox);
         if (const auto& color = j["View"]["Server box color"]; color.is_array() && color.size() == 4) {
             for (std::size_t i = 0; i < 4; ++i) {
@@ -554,6 +600,10 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Dormant time", config.view.dormantTime);
         read(j["View"], "Sync render", config.view.syncRender);
         read(j["View"], "Screen logs", config.view.screenLogs);
+        read(j["View"], "Logs x", config.view.logsX);
+        read(j["View"], "Logs y", config.view.logsY);
+        config.view.logsX = std::clamp(config.view.logsX, 0.0f, 1.0f);
+        config.view.logsY = std::clamp(config.view.logsY, 0.0f, 0.97f);
         read(j["View"], "Watermark", config.view.watermark);
         read(j["View"], "Hotkeys", config.view.hotkeys);
         read(j["View"], "Hotkeys x", config.view.hotkeysX);
@@ -571,6 +621,9 @@ void fromJson(const json& j) noexcept
         read(j["View"], "Scope size", config.view.scopeSize);
         read(j["View"], "Scope gap", config.view.scopeGap);
         read(j["View"], "Scope T", config.view.scopeT);
+        read(j["View"], "Scope invert", config.view.scopeInvert);
+        read(j["View"], "Scope thickness", config.view.scopeThickness);
+        config.view.scopeThickness = std::clamp(config.view.scopeThickness, 1, 12);
         read(j["View"], "Damage indicator", config.view.damageIndicator);
         read(j["View"], "Shot markers", config.view.shotMarkers);
         read(j["View"], "Miss markers", config.view.missMarkers);
@@ -597,6 +650,28 @@ void fromJson(const json& j) noexcept
             }
         }
         read(j["View"], "Spark count", config.view.sparkCount);
+        read(j["View"], "Offscreen arrows", config.view.offscreenArrows);
+        read(j["View"], "Arrow radius", config.view.arrowRadius);
+        config.view.arrowRadius = std::clamp(config.view.arrowRadius, 60, 500);
+        read(j["View"], "Hit marker", config.view.hitMarker);
+        read(j["View"], "Bullet tracers", config.view.bulletTracers);
+        read(j["View"], "Local trail", config.view.localTrail);
+        for (const auto& [key, target] : { std::pair{ "Tracer color", config.view.tracerColor }, std::pair{ "Trail color", config.view.trailColor } }) {
+            if (const auto& color = j["View"][key]; color.is_array() && color.size() == 4) {
+                for (std::size_t i = 0; i < 4; ++i) {
+                    if (color[i].is_number())
+                        target[i] = std::clamp(color[i].get<float>(), 0.0f, 1.0f);
+                }
+            }
+        }
+        read(j["View"], "Grenade warning", config.view.grenadeWarning);
+        read(j["View"], "Zeus range", config.view.zeusRange);
+        read(j["View"], "Seen warning", config.view.seenWarning);
+        read(j["View"], "ESP smooth health", config.view.espSmoothHealth);
+        read(j["View"], "ESP ammo bar", config.view.espAmmoBar);
+        read(j["View"], "ESP distance", config.view.espDistance);
+        read(j["View"], "ESP soft fill", config.view.espSoftFill);
+        read(j["View"], "ESP glow box", config.view.espGlowBox);
         config.view.sparkCount = std::clamp(config.view.sparkCount, 4, 60);
         read(j["View"], "Spark size", config.view.sparkSize);
         config.view.sparkSize = std::clamp(config.view.sparkSize, 0.3f, 3.0f);
@@ -629,6 +704,33 @@ void fromJson(const json& j) noexcept
         w.fogDensity = std::clamp(w.fogDensity, 0.0f, 1.0f);
         read(o, "Ambient", w.ambient);
         rgb("Ambient color", w.ambientColor);
+        read(o, "Weather", w.weather);
+        w.weather = std::clamp(w.weather, 0, 4);
+        read(o, "Particles", w.particles);
+        w.particles = std::clamp(w.particles, 20, 800);
+        if (const auto it = o.find("Particle color"); it != o.end() && it->is_array() && it->size() == 4) {
+            for (std::size_t i = 0; i < 4; ++i) {
+                if ((*it)[i].is_number())
+                    w.particleColor[i] = std::clamp((*it)[i].get<float>(), 0.0f, 1.0f);
+            }
+        }
+        read(o, "Particle size", w.particleSize);
+        w.particleSize = std::clamp(w.particleSize, 0.3f, 4.0f);
+        read(o, "Particle radius", w.particleRadius);
+        w.particleRadius = std::clamp(w.particleRadius, 250.0f, 2000.0f);
+        read(o, "Tonemap", w.tonemap);
+        read(o, "Bloom", w.bloom);
+        w.bloom = std::clamp(w.bloom, 0.0f, 10.0f);
+        read(o, "Exposure", w.exposure);
+        w.exposure = std::clamp(w.exposure, 0.1f, 4.0f);
+        read(o, "Model brightness", w.modelBrightness);
+        read(o, "Model ambient", w.modelAmbient);
+        w.modelAmbient = std::clamp(w.modelAmbient, 0.0f, 5.0f);
+        read(o, "Sun override", w.sunOverride);
+        read(o, "Sun pitch", w.sunPitch);
+        w.sunPitch = std::clamp(w.sunPitch, 5.0f, 90.0f);
+        read(o, "Sun yaw", w.sunYaw);
+        w.sunYaw = std::clamp(w.sunYaw, -180.0f, 180.0f);
     }
 
     if (j.contains("Movement") && j["Movement"].is_object()) {
@@ -669,6 +771,9 @@ void fromJson(const json& j) noexcept
         read(e, "Double tap key", ex.doubleTapKey);
         read(e, "Shift ticks", ex.shiftTicks);
         read(e, "Server pack limit", ex.serverPackLimit);
+        read(e, "Fake latency", ex.fakeLatency);
+        read(e, "Fake latency ms", ex.fakeLatencyMs);
+        ex.fakeLatencyMs = std::clamp(ex.fakeLatencyMs, 0, 200);
         ex.serverPackLimit = ex.serverPackLimit <= 0 ? 0 : std::clamp(ex.serverPackLimit, 2, 16);
         read(e, "Knife air no lag", ex.knifeAirNoLag);
         read(e, "Double tap mode", ex.doubleTapMode);
@@ -693,6 +798,7 @@ void fromJson(const json& j) noexcept
         read(d, "Enabled", df.enabled);
         read(d, "Triggers", df.triggers);
         read(d, "In air", df.inAir);
+        read(d, "Peek shift", df.peekShift);
         read(d, "Key", df.key);
         read(d, "Peek ticks", df.peekTicks);
         df.peekTicks = std::clamp(df.peekTicks, 2, 16);

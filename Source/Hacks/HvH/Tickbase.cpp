@@ -5,6 +5,9 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <array>
+#include <chrono>
+#include <dlfcn.h>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -50,6 +53,8 @@ int requestedTicks = 0;          // сколько тиков сдвига пр�
 bool shifting = false;
 bool holdShot = false;
 bool sendNext = false;
+bool unsentShot = false;     // выстрел лежит в неотправленной пачке
+int shiftDeferred = 0;       // сколько тиков подряд сдвиг по запросу ждёт пачку с выстрелом
 int maxTickBase = 0;
 int deficit = 0;                // сырой откат тикбейса: максимум − текущий − 1
 int defensiveTarget = 0;        // цель заряда под дефенсив ПРОПУСКОМ тиков (0 — не нужен)
@@ -71,6 +76,7 @@ bool rising = false;            // летим вверх — до приземл
 bool airborne = false;
 bool movingFast = false;        // бежим/идём — перезарядку дефенсива растягиваем
 float horizontalSpeed = 0.0f;   // своя скорость по горизонтали, юнитов/с
+bool moveInput = false;         // в прошлой команде был зажат WASD
 float tickInterval = 1.0f / 64.0f;
 int randomChoke = 0;            // режим фейклага «Случайно»: лимит, выбранный на текущий чок
 // Чок фейкдака. Сервер обрабатывает за раз не больше sv_maxusrcmdprocessticks команд (по умолчанию 16,
@@ -167,7 +173,10 @@ int chargeTick = 0;
 {
     // Стоим — пропущенная команда не видна вовсе: идти всё равно некуда. Рвём подряд, заряд
     // набирается за свои 13 тиков.
-    if (horizontalSpeed < 5.0f)
+    // ...но только если WASD не зажат. Стоим и жмём — значит трогаемся: раньше тут пропускались
+    // все тики подряд, команды не было, скорость оставалась 0 — и персонаж стоял у стены, пока не
+    // наберётся весь заряд (после телепорта автопика — 14 тиков, на каждом пике)
+    if (horizontalSpeed < 5.0f && !moveInput)
         return true;
     // В движении пропущенный тик — это потерянный шаг. Подряд они дают ровно то самое «иду вперёд,
     // останавливаюсь, и чуть-чуть назад»: персонаж стоит всю зарядку, а потом предсказание догоняет
@@ -239,6 +248,11 @@ int chargeTick = 0;
     // Автопик выглядывает: заряд = пропуск команд, персонаж бы замер прямо под прицелом
     if (holdShot && threat)
         return false;
+    // Автопик зажат и мы идём (или жмём WASD) — это выглядывание: пропуск тика = шаг, которого нет,
+    // и выходили мы медленно, рывками, прямо к врагу (13.11: треть попаданий по нам на бегу —
+    // с неполным зарядом). Заряжаемся только стоя за укрытием, куда автопик и возвращает.
+    if (holdShot && (horizontalSpeed > 5.0f || moveInput))
+        return false;
     // Рейдж держит цель и оружие готово: пропущенный тик — это несозданная команда, то есть выстрел
     // на тик позже. Дефенсивному DT заряд не срочен — докопим после выстрела (пока оружие перезаряжается)
     if (!fastFire() && ragebot::aimingNow())
@@ -293,7 +307,12 @@ int chargeTick = 0;
     // Предел — только сколько сервер обработает за раз (иначе хвост выкинет и потянет назад).
     // С DT тоже: заряд под это место уступает (clMoveHook урезает его по бюджету сервера)
     if (lagPeekChoke > 0) {
-        const int ceiling = processLimit > 0 ? std::clamp(processLimit - 1, 1, 14) : 14;
+        int ceiling = processLimit > 0 ? std::clamp(processLimit - 1, 1, 14) : 14;
+        // Исключение — зажатый автопик с DT: там заряд нужен для телепорта назад, а пачка лаг-пика
+        // съедала его целиком (чок и заряд — один бюджет сервера). Логи 13.11: 7 возвратов из 54 шли
+        // ногами с «заряд 1–3» именно после лаг-пика. На автопике пачка — только то, что не трогает заряд.
+        if (holdShot && charged >= 6)
+            ceiling = std::clamp((processLimit > 0 ? processLimit : 16) - charged, 1, ceiling);
         return std::clamp(lagPeekChoke, 1, ceiling);
     }
     // Дефенсив в режиме «чоком»: его длина пачки главнее фейклага билдера — пачка и есть окно.
@@ -466,8 +485,20 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
     // «чок + сдвиг», 14 + 14 команд, а сервер обрабатывает за раз не больше sv_maxusrcmdprocessticks
     // и хвост выкидывает — телепорт автопика после выстрела с лаг-пика тянуло назад. Следующим тиком
     // пачка с выстрелом уходит (sendNext), чок обнуляется, и сдвиг идёт отдельной пачкой.
-    const bool shiftWaitsForPack = shiftRequested && !(shotPending && fastFire())
-        && choked > 0 && choked + std::min(requestedTicks > 0 ? requestedTicks : charged, charged) > 14;
+    //
+    // 13.11: и при выстреле сдвиг по запросу ждёт, пока пачка с выстрелом уйдёт. Сервер (AdjustPlayerTimeBase)
+    // на пачку длиннее 3 команд откатывает тикбейс на её длину — выстрел, за которым в той же пачке идёт
+    // телепорт на 14 тиков, выполняется «0.2 с назад». Лагкомп считает наш tick_count слишком свежим для такого
+    // времени (|target − curtime + correct| > 0.2, server_client.so) и откатывает врага по пингу — туда, где
+    // он был за ~0.2 с до записи, по которой мы стреляли. Запрос не теряется: уходит следующим тиком.
+    if (shotPending && !sendThis)
+        unsentShot = true;
+    const bool shotInPack = shotPending || unsentShot;
+    if (sendThis)
+        unsentShot = false;
+    const bool shiftWaitsForShot = shiftRequested && !(shotPending && fastFire()) && shotInPack && charged > 0;
+    const bool shiftWaitsForPack = shiftWaitsForShot || (shiftRequested && !(shotPending && fastFire())
+        && choked > 0 && choked + std::min(requestedTicks > 0 ? requestedTicks : charged, charged) > 14);
     if (shiftWaitsForPack)
         sendNext = true;
     // DT сдвигает сразу на выстреле — второй выстрел не ждёт (с автопиком возврат идёт в этих же командах)
@@ -511,6 +542,13 @@ void clMoveHook(float extraSamples, bool finalTick) noexcept
         rechargeDelay = 2;
     }
     shotPending = false;
+    // Сдвиг ждал, пока уйдёт пачка (с выстрелом или просто полный чок), — запрос остаётся на следующий тик.
+    // Раньше при ожидании из-за чока запрос сбрасывался сразу: автопик просит телепорт один раз, и тот
+    // просто не случался (логи 11.11: 19 из 94 телепортов без сдвига, 13.11: 6 из 47) — возврат шёл ногами
+    // под огнём. Телепорту ждём до 4 тиков, рывку дефенсива — до 2 (позже его окно уже не к месту).
+    if (shiftWaitsForPack && shiftRequested && ++shiftDeferred <= (lcShift ? 2 : 4))
+        return;
+    shiftDeferred = 0;
     shiftRequested = false;
     requestedTicks = 0;
     lcShift = false;
@@ -568,8 +606,14 @@ bool install(std::span<const std::byte> engineCode) noexcept
     return true;
 }
 
+namespace
+{
+void unhookChannel() noexcept;
+}
+
 void uninstall() noexcept
 {
+    unhookChannel();
     if (!clMove)
         return;
     std::memcpy(clMove, originalBytes, stolenBytes);
@@ -578,6 +622,170 @@ void uninstall() noexcept
     clMove = nullptr;
     sendPacketImm = nullptr;
     // трамплин не освобождаем: CL_Move может прямо сейчас быть на стеке
+}
+
+// ---------- latency spoof ----------
+// Заголовок каждого нашего пакета несёт номер последнего полученного от сервера пакета (m_nInSequenceNr) и его
+// reliable-состояние. Сервер считает наш пинг по тому, как быстро мы подтверждаем его пакеты. Подставляем
+// в SendDatagram номер, полученный fakeLatencyMs назад, — сервер видит пинг больше и откатывает лагкомп дальше.
+// CNetChan на Linux (engine_client.so, legacy, сверено по SendDatagram 0x4aa000 — запись заголовка):
+//   +0x2c m_nOutSequenceNr, +0x30 m_nInSequenceNr, +0x3c m_nInReliableState, +0x40 m_nChokedPackets.
+// SendDatagram — слот 47 таблицы CNetChan (таблица 0xd68978, слот 0xd68af0). Хук — своя копия таблицы на
+// объекте: netchan пересоздаётся на каждом подключении, ставим заново, оригинал таблицы не трогаем.
+namespace
+{
+constexpr std::size_t sendDatagramIndex = 47;
+constexpr std::uintptr_t sendDatagramOffset = 0x4aa000;   // от начала engine_client.so — проверка, что сборка та же
+constexpr std::ptrdiff_t inSequenceOffset = 0x30;
+constexpr std::ptrdiff_t inReliableOffset = 0x3c;
+
+using SendDatagramFn = int (*)(void* netchan, void* datagram);
+SendDatagramFn originalSendDatagram = nullptr;
+void* hookedChannel = nullptr;
+std::uintptr_t* originalVmt = nullptr;
+std::array<std::uintptr_t, 2 + 256> vmtCopy{};    // [-2] offset-to-top, [-1] typeinfo, дальше слоты
+bool spoofBroken = false;                         // таблица не та — спуф выключен до перезапуска
+float appliedSpoof = 0.0f;                        // какую прибавку сервер видит сейчас, с
+
+struct SequenceMark {
+    int inSequence = 0;
+    int inReliable = 0;
+    double time = 0.0;
+};
+std::array<SequenceMark, 256> marks{};
+int markHead = 0, markCount = 0;
+
+[[nodiscard]] double clockSeconds() noexcept
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+[[nodiscard]] int& field(void* channel, std::ptrdiff_t offset) noexcept
+{
+    return *reinterpret_cast<int*>(static_cast<char*>(channel) + offset);
+}
+
+int hookedSendDatagram(void* channel, void* datagram) noexcept
+{
+    const auto& ex = config.exploits;
+    if (channel != hookedChannel || !ex.fakeLatency || ex.fakeLatencyMs <= 0 || markCount == 0) {
+        if (channel == hookedChannel)
+            appliedSpoof = 0.0f;
+        return originalSendDatagram(channel, datagram);
+    }
+    // самая свежая отметка, которой уже не меньше fakeLatencyMs
+    const double wanted = ex.fakeLatencyMs * 0.001;
+    const double now = clockSeconds();
+    const SequenceMark* pick = nullptr;
+    for (int k = 0; k < markCount; ++k) {
+        const auto& mark = marks[(markHead - 1 - k + static_cast<int>(marks.size())) % static_cast<int>(marks.size())];
+        if (now - mark.time >= wanted) {
+            // свежих отметок давно нет (обновления встали) — не держим подтверждение на древнем номере
+            if (now - mark.time <= wanted + 0.1)
+                pick = &mark;
+            break;
+        }
+    }
+    if (!pick) {
+        appliedSpoof = 0.0f;
+        return originalSendDatagram(channel, datagram);
+    }
+    int& inSequence = field(channel, inSequenceOffset);
+    int& inReliable = field(channel, inReliableOffset);
+    const int savedSequence = inSequence, savedReliable = inReliable;
+    // назад во времени — только к меньшему номеру (на всякий случай: история могла остаться от прошлого сервера)
+    if (pick->inSequence <= savedSequence && savedSequence - pick->inSequence < 256) {
+        inSequence = pick->inSequence;
+        inReliable = pick->inReliable;
+        appliedSpoof = static_cast<float>(now - pick->time);
+    }
+    const int result = originalSendDatagram(channel, datagram);
+    inSequence = savedSequence;
+    inReliable = savedReliable;
+    return result;
+}
+
+void unhookChannel() noexcept
+{
+    if (hookedChannel && originalVmt && *reinterpret_cast<std::uintptr_t**>(hookedChannel) == vmtCopy.data() + 2)
+        *reinterpret_cast<std::uintptr_t**>(hookedChannel) = originalVmt;
+    hookedChannel = nullptr;
+    originalVmt = nullptr;
+    appliedSpoof = 0.0f;
+    markCount = markHead = 0;
+}
+
+[[nodiscard]] bool hookChannel(void* channel) noexcept
+{
+    auto* vmt = *reinterpret_cast<std::uintptr_t**>(channel);
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(vmt[sendDatagramIndex]), &info) || !info.dli_fname
+        || !std::strstr(info.dli_fname, "engine_client")
+        || vmt[sendDatagramIndex] - reinterpret_cast<std::uintptr_t>(info.dli_fbase) != sendDatagramOffset) {
+        ragebot::logToFile("[фейк-пинг] таблица CNetChan не та (игра обновилась?) — latency spoof выключен");
+        spoofBroken = true;
+        return false;
+    }
+    // длина таблицы — пока слоты указывают в тот же модуль
+    std::size_t length = 0;
+    while (length < vmtCopy.size() - 2) {
+        Dl_info slot{};
+        if (!dladdr(reinterpret_cast<void*>(vmt[length]), &slot) || slot.dli_fbase != info.dli_fbase)
+            break;
+        ++length;
+    }
+    if (length <= sendDatagramIndex) {
+        spoofBroken = true;
+        return false;
+    }
+    vmtCopy.fill(0);
+    std::memcpy(vmtCopy.data(), vmt - 2, (length + 2) * sizeof(std::uintptr_t));
+    originalSendDatagram = reinterpret_cast<SendDatagramFn>(vmt[sendDatagramIndex]);
+    vmtCopy[2 + sendDatagramIndex] = reinterpret_cast<std::uintptr_t>(&hookedSendDatagram);
+    originalVmt = vmt;
+    hookedChannel = channel;
+    *reinterpret_cast<std::uintptr_t**>(channel) = vmtCopy.data() + 2;
+    markCount = markHead = 0;
+    char text[96];
+    std::snprintf(text, sizeof(text), "[фейк-пинг] хук SendDatagram поставлен (слотов %zu)", length);
+    ragebot::logToFile(text);
+    return true;
+}
+}
+
+void updateFakeLatency(void* networkChannel, bool loopback) noexcept
+{
+    // хук держим, пока включено и есть netchan; иначе снимаем (netchan мог смениться — reconnect)
+    const bool want = config.exploits.fakeLatency && networkChannel && !loopback && !spoofBroken;
+    if (!want || networkChannel != hookedChannel) {
+        // старый netchan мог быть уже удалён движком — трогаем вптр, только если это всё ещё он
+        if (hookedChannel && hookedChannel == networkChannel)
+            unhookChannel();
+        else {
+            hookedChannel = nullptr;
+            originalVmt = nullptr;
+            appliedSpoof = 0.0f;
+            markCount = markHead = 0;
+        }
+        if (!want || !hookChannel(networkChannel))
+            return;
+    }
+    // история входящих номеров: каждый новый — с моментом получения (точнее, первого тика, когда увидели)
+    const int inSequence = field(networkChannel, inSequenceOffset);
+    const int inReliable = field(networkChannel, inReliableOffset);
+    const auto& last = marks[(markHead - 1 + static_cast<int>(marks.size())) % static_cast<int>(marks.size())];
+    if (markCount == 0 || inSequence > last.inSequence || inSequence < last.inSequence - 1000) {
+        if (markCount > 0 && inSequence < last.inSequence)
+            markCount = 0;      // номера пошли заново (новый сервер)
+        marks[markHead] = { inSequence, inReliable, clockSeconds() };
+        markHead = (markHead + 1) % static_cast<int>(marks.size());
+        markCount = std::min(markCount + 1, static_cast<int>(marks.size()));
+    }
+}
+
+float fakeLatencySeconds() noexcept
+{
+    return hookedChannel && config.exploits.fakeLatency ? appliedSpoof : 0.0f;
 }
 
 bool isInstalled() noexcept
@@ -598,6 +806,15 @@ void setFakeDuck(bool value) noexcept
 int chokedCommands() noexcept
 {
     return choked;
+}
+
+int shotRollbackTicks() noexcept
+{
+    // быстрый DT: сдвиг уходит сразу за выстрелом, той же пачкой; пачку до 3 команд сервер не откатывает
+    if (!clMove || shifting || !fastFire() || charged <= 0)
+        return 0;
+    const int shift = std::min(charged, shiftSize());
+    return choked + 1 + shift > 3 ? shift : 0;
 }
 
 void onShot() noexcept
@@ -777,6 +994,11 @@ void setProcessLimit(int ticks) noexcept
 int processLimitTicks() noexcept
 {
     return processLimit;
+}
+
+void setMoveInput(bool held) noexcept
+{
+    moveInput = held;
 }
 
 void setMovement(bool onGround, bool jumpHeld, float verticalSpeed, float speed2D, float interval) noexcept

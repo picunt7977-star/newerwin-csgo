@@ -1,3 +1,4 @@
+#include "Hacks/HvH/HvhConfig.h"
 #include "Hacks/HvH/GrenadePrediction.h"
 #include "Hacks/HvH/Movement.h"
 #include "Hacks/HvH/Ragebot.h"
@@ -130,7 +131,9 @@ void GlobalContext::renderFrame()
         features->misc.purchaseList();
         features->misc.noscopeCrosshair(ImGui::GetBackgroundDrawList());
         features->misc.recoilCrosshair(ImGui::GetBackgroundDrawList());
-        features->misc.drawOffscreenEnemies(ImGui::GetBackgroundDrawList());
+        // свои стрелки ECLIPSE на врагов за экраном главнее: со старыми из Osiris у каждого врага было по две
+        if (!hvh::config.view.offscreenArrows)
+            features->misc.drawOffscreenEnemies(ImGui::GetBackgroundDrawList());
         features->misc.drawBombTimer();
         features->misc.spectatorList();
         features->visuals.hitMarker(nullptr, ImGui::GetBackgroundDrawList());
@@ -141,7 +144,7 @@ void GlobalContext::renderFrame()
         hvh::extras::draw(ImGui::GetBackgroundDrawList());
         hvh::scoreboard::draw(ImGui::GetBackgroundDrawList());
         hvh::movement::draw(ImGui::GetBackgroundDrawList());
-        hvh::ragebot::drawLogs(ImGui::GetBackgroundDrawList());
+        hvh::gui::drawNotifications(ImGui::GetBackgroundDrawList(), gui->isOpen());
         hvh::grenade::draw(ImGui::GetBackgroundDrawList());
         hvh::visuals::draw(ImGui::GetBackgroundDrawList(), memory->globalVars->realtime);
 

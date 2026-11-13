@@ -22,7 +22,8 @@ enum class Manual { None, Left, Right, Back, Forward };
 [[nodiscard]] bool isFreestanding() noexcept;
 // индекс врага, от которого сейчас строится AA (0 — нет)
 [[nodiscard]] int threatIndex() noexcept;
-[[nodiscard]] const char* stateName() noexcept;   // состояние билдера, по которому сейчас AA
+[[nodiscard]] const char* stateName() noexcept;
+[[nodiscard]] const char* stateNameEn() noexcept; // то же по-английски — для логов в консоли   // состояние билдера, по которому сейчас AA
 [[nodiscard]] bool defensiveActive() noexcept;    // сейчас скрытые углы дефенсива
 // roll (наклон) этого тика: ставится в cmd->viewangles.z в самом конце CreateMove
 [[nodiscard]] float rollAngle() noexcept;

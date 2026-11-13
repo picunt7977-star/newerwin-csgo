@@ -13,6 +13,7 @@ GAMEEVENT_NAME(vote_cast);
 GAMEEVENT_NAME(round_mvp);
 GAMEEVENT_NAME(item_purchase);
 GAMEEVENT_NAME(bullet_impact);
+GAMEEVENT_NAME(weapon_fire);
 
 #undef GAMEEVENT_NAME
 

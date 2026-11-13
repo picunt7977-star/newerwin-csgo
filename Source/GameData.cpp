@@ -38,6 +38,9 @@
 #include "CSGO/UtlVector.h"
 #include "CSGO/WeaponId.h"
 #include "CSGO/WeaponData.h"
+#include "CSGO/ItemSchema.h"
+#include <dlfcn.h>
+#include <filesystem>
 
 #include <Interfaces/ClientInterfaces.h>
 #include <Interfaces/OtherInterfaces.h>
@@ -45,6 +48,17 @@
 auto operator<(const BaseData& a, const BaseData& b) noexcept
 {
     return a.distanceToLocal > b.distanceToLocal;
+}
+
+// имя иконки = класс оружия без "weapon_" (ak47, ssg08, knife_karambit)
+static std::string_view weaponIconName(const Memory& memory, const csgo::Entity& weapon) noexcept
+{
+    const auto def = csgo::ItemSchema::from(retSpoofGadgets->client, memory.itemSystem().getItemSchema()).getItemDefinitionInterface(weapon.itemDefinitionIndex());
+    if (!def)
+        return {};
+    const char* defName = csgo::EconItemDefinition::from(retSpoofGadgets->client, def).getDefinitionName();
+    const std::string_view view = defName ? std::string_view{ defName } : std::string_view{};
+    return view.starts_with("weapon_") ? view.substr(7) : view;
 }
 
 static csgo::Matrix4x4 viewMatrix;
@@ -154,8 +168,10 @@ void GameData::update(const ClientInterfaces& clientInterfaces, const EngineInte
                 continue;
 
             if (entity.isWeapon()) {
-                if (entity.ownerEntity() == -1)
+                if (entity.ownerEntity() == -1) {
                     weaponData.emplace_back(interfaces, entity);
+                    weaponData.back().icon = weaponIconName(memory, entity);
+                }
             } else {
                 switch (entity.getNetworkable().getClientClass()->classId) {
                 case ClassId::BaseCSGrenadeProjectile:
@@ -239,10 +255,67 @@ struct PlayerAvatar {
 
 static std::unordered_map<int, PlayerAvatar> playerAvatars;
 
+namespace
+{
+struct WeaponIcon {
+    Texture texture;
+    float aspect = 1.0f;
+    bool tried = false;
+};
+std::unordered_map<std::string, WeaponIcon> weaponIcons;
+
+// build/Source/libOsiris.so → build/weapon_icons
+const std::filesystem::path& weaponIconDir() noexcept
+{
+    static const std::filesystem::path dir = [] {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(&weaponIconDir), &info) && info.dli_fname)
+            return std::filesystem::path{ info.dli_fname }.parent_path().parent_path() / "weapon_icons";
+        return std::filesystem::path{};
+    }();
+    return dir;
+}
+}
+
+void* GameData::weaponIcon(const std::string& name, float& aspect) noexcept
+{
+    if (name.empty())
+        return nullptr;
+    auto& icon = weaponIcons[name];
+    if (!icon.tried) {
+        icon.tried = true;
+        const auto path = weaponIconDir() / (name + ".png");
+        int width = 0, height = 0;
+        stbi_set_flip_vertically_on_load_thread(false);
+        // stb собран без stdio — читаем файл сами
+        std::vector<char> png;
+        if (std::FILE* file = std::fopen(path.c_str(), "rb")) {
+            char buffer[4096];
+            for (std::size_t got; (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0;)
+                png.insert(png.end(), buffer, buffer + got);
+            std::fclose(file);
+        }
+        if (auto data = png.empty() ? nullptr : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(png.data()), static_cast<int>(png.size()), &width, &height, nullptr, STBI_rgb_alpha)) {
+            // белый силуэт: цвет задаёт ESP при отрисовке
+            for (int i = 0; i < width * height; ++i)
+                data[i * 4] = data[i * 4 + 1] = data[i * 4 + 2] = 255;
+            icon.texture.init(width, height, data);
+            icon.aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+            stbi_image_free(data);
+        }
+    }
+    aspect = icon.aspect;
+    return icon.texture.get();
+}
+
 void GameData::clearTextures() noexcept
 {
     Lock lock;
 
+    for (auto& [name, icon] : weaponIcons) {
+        icon.texture.clear();
+        icon.tried = false;
+    }
     clearAvatarTextures();
     for (const auto& [handle, avatar] : playerAvatars)
         avatar.texture.clear();
@@ -514,12 +587,19 @@ void PlayerData::update(const EngineInterfaces& engineInterfaces, const OtherInt
     scoped = entity.isScoped();
     defusing = entity.isDefusing();
     reloading = false;
+    clip = -1;
+    maxClip = 0;
 
     if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, entity.getActiveWeapon()); weapon.getPOD() != nullptr) {
         audible = audible || isEntityAudible(weapon.getNetworkable().index());
         reloading = weapon.isInReload();
+        const auto clipInfo = weapon.getWeaponData();
+        maxClip = clipInfo ? clipInfo->maxClip : 0;
+        clip = maxClip > 0 ? std::clamp(weapon.clip(), 0, maxClip) : -1;
         if (const auto weaponInfo = weapon.getWeaponData())
             activeWeapon = interfaces.getLocalize().findAsUTF8(weaponInfo->name);
+        if (const auto icon = weaponIconName(memory, weapon); icon != weaponIcon)
+            weaponIcon.assign(icon);
     }
 
     if (!alive || !inViewFrustum)
@@ -643,9 +723,14 @@ ImTextureID PlayerData::getAvatarTexture() const noexcept
 
 float PlayerData::fadingAlpha(const Memory& memory) const noexcept
 {
+    return fadingAlphaAt(memory.globalVars->realtime);
+}
+
+float PlayerData::fadingAlphaAt(float realtime) const noexcept
+{
     // игрок ушёл из PVS: держим ESP на последней известной позиции, гаснет за последнюю секунду
     const float hold = std::max(hvh::config.view.dormantTime - 1.0f, 0.0f);
-    const float alpha = std::clamp(1.0f - (memory.globalVars->realtime - lastContactTime - 0.25f - hold) / 1.0f, 0.0f, 1.0f);
+    const float alpha = std::clamp(1.0f - (realtime - lastContactTime - 0.25f - hold) / 1.0f, 0.0f, 1.0f);
     return dormant ? alpha * 0.6f : alpha;
 }
 

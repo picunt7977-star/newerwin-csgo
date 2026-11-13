@@ -293,6 +293,7 @@ void processImpacts(const EngineInterfaces& engineInterfaces, const ClientInterf
                     aimed == 2 ? "не в голову" : aimed == 0 ? "центр" : aimed > 0 ? "+" : "−",
                     counterPlan.active ? counterPlan.style : "нет");
                 ragebot::logToFile(text);
+                ragebot::onShotAtUs(shooterIndex, named ? info.name : "?", stateNameEn());
             }
         }
     }
@@ -1378,6 +1379,14 @@ const char* stateName() noexcept
 {
     const int index = static_cast<int>(activeState);
     return index >= 0 && index < static_cast<int>(aaStateNames.size()) ? aaStateNames[index] : "";
+}
+
+const char* stateNameEn() noexcept
+{
+    static constexpr std::array names{ "global", "standing", "running", "walking", "air", "air crouch", "crouching", "sneaking", "fakelag" };
+    static_assert(names.size() == aaStateNames.size());
+    const int index = static_cast<int>(activeState);
+    return index >= 0 && index < static_cast<int>(names.size()) ? names[index] : "unknown";
 }
 
 bool defensiveActive() noexcept

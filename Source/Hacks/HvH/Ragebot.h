@@ -1,10 +1,16 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
 struct ImDrawList;
 
 namespace csgo
 {
     struct UserCmd;
+    struct matrix3x4;
 }
 
 class EngineInterfaces;
@@ -49,6 +55,9 @@ struct TargetView {
     unsigned char pointState[64]{};
 };
 [[nodiscard]] TargetView targetView(int index) noexcept;
+// бектрек-чамсы: кости самой старой записи, по которой рейдж ещё может попасть (RECORD_BONES = 128 штук);
+// false — записи нет, враг стоит или ломает лагкомп
+[[nodiscard]] bool backtrackBones(int index, csgo::matrix3x4* out, float realtime) noexcept;
 
 // скелет цели в момент последнего выстрела (кости, по которым стреляли)
 struct ShotView {
@@ -67,8 +76,23 @@ void onRoundStart() noexcept;
 void onPlayerDeath(int victimIndex, int localIndex) noexcept;
 // строка только в ~/csgo-hvh/logs/ДАТА.log, без консоли
 void logToFile(const char* text) noexcept;
-// попадания/промахи коротко на экране (последние 8, гаснут через 6 с)
-void drawLogs(ImDrawList* drawList) noexcept;
+// в нас выстрелил враг (импакт рядом с нами): если урона от него не будет — уведомление «evaded»
+void onShotAtUs(int shooterIndex, const char* name, const char* state) noexcept;
+// ---- уведомления (худ «Notifications» рисует HvhGui.cpp) ----
+enum class NoticeKind { Hit, Kill, Miss, Hurt, Evaded };
+struct NoticePart {
+    std::string text;
+    bool value = false;     // белым (имя, куда, цифра); иначе — серая связка
+    bool warn = false;      // оранжевый «!»: попали не туда / меньше урона, чем ждали
+};
+struct NoticeView {
+    NoticeKind kind = NoticeKind::Hit;
+    std::vector<NoticePart> parts;   // первое слово уже с большой буквы
+    float age = 0.0f;                // секунд с появления
+};
+[[nodiscard]] std::array<std::uint8_t, 4> noticeColor(NoticeKind kind) noexcept;
+// живые уведомления, новые первыми; заодно решает «evaded» по выстрелам в нас (звать раз в кадр)
+[[nodiscard]] std::vector<NoticeView> recentNotices(float lifetime) noexcept;
 // NET_UPDATE_POSTDATAUPDATE_START: запомнить присланные сервером углы взгляда, пока их не перезаписала интерполяция
 void captureNetworkAngles(const EngineInterfaces& engineInterfaces, const ClientInterfaces& clientInterfaces) noexcept;
 

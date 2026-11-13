@@ -275,10 +275,17 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     hvh::movement::noFallDamage(cmd, EnginePrediction::getFlags());
 
     const ClientInterfaces clientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces };
+    // latency spoof: хук SendDatagram на текущем netchan + история входящих номеров пакетов
+    if (const auto channel = globalContext->getEngineInterfaces().getEngine().getNetworkChannel())
+        hvh::tickbase::updateFakeLatency(channel, csgo::NetworkChannel::from(retSpoofGadgets->client, channel).isLoopback());
+    else
+        hvh::tickbase::updateFakeLatency(nullptr, false);
+    // (и мёртвым: история номеров должна идти всегда, иначе подтверждения застынут на старом)
     hvh::tickbase::setActive(localPlayer && localPlayer.get().isAlive());
     if (localPlayer && localPlayer.get().isAlive()) {
         hvh::tickbase::updateLagComp(localPlayer.get().tickBase());
         hvh::tickbase::setMovement((localPlayer.get().flags() & 1) != 0, (cmd->buttons & csgo::UserCmd::IN_JUMP) != 0, localPlayer.get().velocity().z, localPlayer.get().velocity().length2D(), globalContext->memory->globalVars->intervalPerTick);   // 1 — FL_ONGROUND
+        hvh::tickbase::setMoveInput((cmd->buttons & (csgo::UserCmd::IN_FORWARD | csgo::UserCmd::IN_BACK | csgo::UserCmd::IN_MOVELEFT | csgo::UserCmd::IN_MOVERIGHT)) != 0);
         // второй пули DT нет у ножа, гранат и оружия с перезарядкой > 0.4 с (скаут, AWP) — там DT дефенсивный.
         // Раньше это ставил рейдж, а с ножом он до этого места не доходил: режим оставался от прошлого оружия
         if (const auto weapon = csgo::Entity::from(retSpoofGadgets->client, localPlayer.get().getActiveWeapon()); weapon.getPOD()) {
@@ -321,6 +328,7 @@ bool FASTCALL_CONV ClientModeHooks::createMove(FASTCALL_THIS(csgo::ClientMode* t
     hvh::grenade::update(globalContext->getEngineInterfaces(), *globalContext->memory);
     hvh::visuals::onCreateMove(cmd);
     hvh::visuals::collectGrenades(clientInterfaces, *globalContext->memory);
+    hvh::visuals::stepWeather(globalContext->getEngineInterfaces(), *globalContext->memory);
     hvh::scoreboard::update(*globalContext->memory, globalContext->getOtherInterfaces(), clientInterfaces, globalContext->getEngineInterfaces(),
         cmd->buttons & csgo::UserCmd::IN_SCORE, globalContext->memory->globalVars->realtime);
     hvh::extras::update(globalContext->getOtherInterfaces(), globalContext->memory->globalVars->intervalPerTick);
@@ -514,10 +522,24 @@ inline void drawServerModel(void* ctx, void* state, const csgo::ModelRenderInfo&
         globalContext->features->chams.drawGhost(ctx, state, info, ghost, hvh::config.view.serverModelColor);
 }
 
+// Бектрек-чамсы: прошлая поза врага из записей рейджа (самая старая, в которую ещё можно выстрелить).
+// Тоже до модели: где поза совпала с текущей, модель её перекроет
+inline void drawBacktrackModel(void* ctx, void* state, const csgo::ModelRenderInfo& info) noexcept
+{
+    if (!hvh::config.view.backtrackChams || !hvh::config.rage.enabled || !localPlayer || !localPlayer.get().isAlive()
+        || info.entityIndex <= 0 || info.entityIndex > 64 || !info.model || std::strncmp(info.model->name, "models/player/", 14) != 0
+        || globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())
+        return;
+    static csgo::matrix3x4 bones[128];   // RECORD_BONES
+    if (hvh::ragebot::backtrackBones(info.entityIndex, bones, globalContext->memory->globalVars->realtime))
+        globalContext->features->chams.drawGhost(ctx, state, info, bones, hvh::config.view.backtrackChamsColor, hvh::config.view.backtrackChamsHidden);
+}
+
 void FASTCALL_CONV ModelRenderHooks::drawModelExecute(FASTCALL_THIS(csgo::ModelRenderPOD* thisptr), void* ctx, void* state, const csgo::ModelRenderInfo& info, csgo::matrix3x4* customBoneToWorld) noexcept
 {
     customBoneToWorld = smoothedBones(info, customBoneToWorld);
     drawServerModel(ctx, state, info, customBoneToWorld);
+    drawBacktrackModel(ctx, state, info);
     if (globalContext->getOtherInterfaces().getStudioRender().isForcedMaterialOverride())
         return globalContext->hooks->modelRenderHooks.getOriginalDrawModelExecute()(thisptr, ctx, state, &info, customBoneToWorld);
 
@@ -598,6 +620,8 @@ void FASTCALL_CONV ClientHooks::frameStageNotify(FASTCALL_THIS(csgo::ClientPOD* 
         features->misc.disablePanoramablur();
         features->visuals.colorWorld();
         hvh::world::apply(globalContext->getOtherInterfaces(), globalContext->getEngineInterfaces().getEngine().isInGame());
+        hvh::world::applyLight(ClientInterfaces{ retSpoofGadgets->client, *globalContext->clientInterfaces }, globalContext->getOtherInterfaces(),
+            globalContext->getEngineInterfaces().getEngine().isInGame());
         features->misc.updateEventListeners();
         features->visuals.updateEventListeners();
         hvh::antiaim::updateEventListener(globalContext->getEngineInterfaces(), *globalContext->memory);

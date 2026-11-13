@@ -1,6 +1,7 @@
 #pragma once
 
 class ClientInterfaces;
+class EngineInterfaces;
 class OtherInterfaces;
 struct ImDrawList;
 struct Memory;
@@ -20,6 +21,8 @@ namespace hvh::visuals
 void onCreateMove(const csgo::UserCmd* cmd) noexcept;
 // из CreateMove: дым и огонь в мире для таймеров
 void collectGrenades(const ClientInterfaces& clientInterfaces, const Memory& memory) noexcept;
+// из CreateMove: шаг частиц погоды (нужны трассы: «под открытым небом» и «видно из глаз»)
+void stepWeather(const EngineInterfaces& engineInterfaces, const Memory& memory) noexcept;
 // события игры
 void onDamage(int victimIndex, int damage, bool headshot) noexcept;
 void onKill() noexcept;
@@ -39,6 +42,8 @@ namespace hvh::world
 {
 
 void apply(const OtherInterfaces& interfaces, bool inGame) noexcept;
+// свет: блум/экспозиция (env_tonemap_controller), яркость моделей, положение солнца. Тоже в RENDER_START.
+void applyLight(const ClientInterfaces& clientInterfaces, const OtherInterfaces& interfaces, bool inGame) noexcept;
 // свой туман включён — хук shouldDrawFog должен пускать туман, даже если в Osiris стоит «No fog»
 [[nodiscard]] bool fogActive() noexcept;
 
